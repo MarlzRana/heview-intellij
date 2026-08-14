@@ -2,6 +2,9 @@
 .gradle/
 build/
 
+# IntelliJ Platform Gradle Plugin cache
+.intellijPlatform/
+
 # IntelliJ IDE project files (generated when the repo is opened in an IDE)
 .idea/
 *.iml
