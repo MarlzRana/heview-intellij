@@ -1,0 +1,17 @@
+<idea-plugin>
+    <id>com.marlzrana.heview</id>
+    <name>heview</name>
+    <vendor url="https://github.com/MarlzRana">marlzrana</vendor>
+
+    <description><![CDATA[
+        Leave inline code-review comments on any file, automatically injected into
+        Claude Code and Codex via hooks to be resolved. JetBrains-IDE port of reviewa/heview.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Phase 0: smoke marker confirming the plugin loads. Real features land in later phases. -->
+        <postStartupActivity implementation="com.marlzrana.heview.HeviewStartupActivity"/>
+    </extensions>
+</idea-plugin>

@@ -1,0 +1,11 @@
+# Gradle
+.gradle/
+build/
+
+# IntelliJ IDE project files (generated when the repo is opened in an IDE)
+.idea/
+*.iml
+out/
+
+# OS
+.DS_Store
