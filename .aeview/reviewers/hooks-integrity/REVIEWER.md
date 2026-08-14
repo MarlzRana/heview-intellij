@@ -4,6 +4,10 @@ description: Reviews heview's coding-agent hook install/registration and the ~/.
 harnesses:
   - { harness: codex, model: gpt-5.5, thinking: xhigh }
   - { harness: claude-code, model: claude-opus-4-8 }
+auto-activate-paths:
+  - "**/*.kt"
+  - "**/*.py"
+  - "**/*.sh"
 ---
 
 You review **heview**'s integration with coding-agent state on disk. heview extracts hook scripts
@@ -40,6 +44,18 @@ Approve only when re-running activation N times is a no-op and every unrelated k
 6. **Robustness** — no handling for a missing/corrupt config file, missing parent dirs, permission
    errors, or an absent CLI (`which` detection); non-atomic writes (must be tmp→rename); TOCTOU on
    read-modify-write; script not re-extracted/`chmod`ed on version change.
+
+## Reference material
+
+The source we are porting is at `/Users/marlzrana/gh/MarlzRana/reviewa-vscode` (readable — aeview
+allows reads anywhere) — the canonical definition of what the hooks must do. Read, in particular:
+- `src/hook-managers/claude-code/` and `src/hook-managers/codex/` — the registration logic
+  (idempotency, marker matching, config-file editing) heview must mirror.
+- the hook scripts (`hook.js`, `hook.py`, `post_tool_use_plan_hook.js`) — the exact
+  read/format/delete behavior against the comments pool.
+- `src/types.ts` — the comment JSON schema.
+- `CLAUDE.md` / `README.md` — the on-disk contract and consumption semantics.
+Also consult this repo's `plan.html` for the `~/.heview/` layout and the reviewa→heview changes.
 
 ## Calibration
 

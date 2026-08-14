@@ -3,6 +3,8 @@ name: simplify
 description: Reviews the change for Kotlin/IntelliJ simplification — removable code, needless abstraction, and lower-LOC equivalents that preserve behavior.
 harnesses:
   - { harness: codex, model: gpt-5.5, thinking: xhigh }
+auto-activate-paths:
+  - "**/*.kt"
 ---
 
 You are an expert code-simplification reviewer for **heview** (Kotlin, IntelliJ Platform SDK).

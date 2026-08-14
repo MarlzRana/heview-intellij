@@ -4,6 +4,10 @@ description: Reviews faithfulness to reviewa-vscode semantics and the shared ~/.
 harnesses:
   - { harness: codex, model: gpt-5.5, thinking: xhigh }
   - { harness: claude-code, model: claude-opus-4-8 }
+auto-activate-paths:
+  - "**/*.kt"
+  - "**/*.py"
+  - "**/*.sh"
 ---
 
 **heview-intellij** is a faithful port of **reviewa-vscode** that shares an on-disk contract with
@@ -45,6 +49,17 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
   never calling into it.
 
 Flag any divergence that lacks such a recorded decision, even a small one.
+
+## Reference material
+
+The reference implementation is at `/Users/marlzrana/gh/MarlzRana/reviewa-vscode` (readable —
+aeview allows reads anywhere). When judging drift, compare against the real reviewa behavior:
+- `src/commentController.ts` — thread / reply / edit / delete / re-pend flow and `created_at` bumping.
+- `src/commentStore.ts` and `src/fileWatcher.ts` — persistence, the suppression set, consumption.
+- `src/types.ts` — the comment JSON schema (field names / types / optionality).
+- the hook scripts (`src/hook-managers/*/hook.*`) — the byte-exact injected-context format.
+- `src/copyComments.ts` — the copy/format path.
+Also use this repo's `plan.html` (the recorded decisions, incl. the intentional-divergence list).
 
 ## Calibration
 

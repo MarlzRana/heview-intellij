@@ -4,6 +4,10 @@ description: Reviews IntelliJ Platform correctness for heview — EDT threading,
 harnesses:
   - { harness: codex, model: gpt-5.5, thinking: xhigh }
   - { harness: claude-code, model: claude-opus-4-8 }
+auto-activate-paths:
+  - "**/*.kt"
+  - "**/plugin.xml"
+  - "**/*.gradle.kts"
 ---
 
 You are an IntelliJ Platform correctness reviewer for **heview**, a JetBrains-IDE plugin
@@ -43,6 +47,15 @@ that breaks it — not vibes. Approve only when you cannot construct one.
    disposal parent; `ProjectActivity` doing heavy synchronous work that blocks startup.
 7. **Cancellation & dumb mode** — long work ignoring `ProgressIndicator`/cancellation; index or
    PSI access during dumb mode.
+
+## Reference material
+
+Ground platform-contract claims in the SDK docs rather than guessing. The IntelliJ Platform SDK
+docs are checked out at `/Users/marlzrana/gh/JetBrains/intellij-sdk-docs` (readable — aeview allows
+reads anywhere). Search `topics/` for: general threading rules (EDT vs background, read/write
+actions), `custom_language_support/inlay_hints.md` (the inlay model), Disposer, plugin services
+(app vs project scope), and the plugin configuration file / extension points. When you flag a
+violation, cite the documented contract it breaks.
 
 ## Calibration
 
