@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>heview-intellij — Implementation Plan</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --ink: #e6e8ee;
+    --muted: #9aa4b2;
+    --line: #2a2f3a;
+    --accent: #7aa2f7;
+    --green: #79d17a;
+    --amber: #e0af68;
+    --red: #f7768e;
+    --code: #141821;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 40px 28px 120px; }
+  header.hero { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 8px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.4px; }
+  h1 .mono { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 15px; }
+  h2 { font-size: 21px; margin: 44px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); letter-spacing: -0.2px; }
+  h2:first-of-type { border-top: none; }
+  h3 { font-size: 16px; margin: 24px 0 8px; color: var(--ink); }
+  p { margin: 10px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, .mono { font-family: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 12.5px; color: #cdd6f4; }
+  pre {
+    background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; color: #cdd6f4;
+  }
+  pre code { background: none; padding: 0; }
+  ul, ol { margin: 10px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+  .lead { font-size: 16px; color: var(--ink); }
+  .callout {
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 16px; margin: 16px 0;
+  }
+  .callout.warn { border-left-color: var(--amber); }
+  .callout.note { border-left-color: var(--green); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:last-child td { border-bottom: none; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.v1 { color: var(--green); border-color: #2f5a35; background: #14241a; }
+  .pill.later { color: var(--amber); border-color: #5a4a2f; background: #241f14; }
+  .pill.out { color: var(--red); border-color: #5a2f38; background: #241418; }
+  .tag { font-size: 11px; color: var(--muted); }
+  .toc { columns: 2; column-gap: 28px; font-size: 14px; }
+  .toc a { display: block; padding: 3px 0; color: var(--ink); }
+  .kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; font-size: 12px; background: var(--panel2); }
+  .muted { color: var(--muted); }
+  .arrow { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--line); margin: 28px 0; }
+  .num { color: var(--muted); font-variant-numeric: tabular-nums; }
+  footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1><span class="mono">heview-intellij</span> — Implementation Plan</h1>
+  <div class="sub">A JetBrains-IDE port of <code>reviewa-vscode</code> (being renamed <b>heview</b>): leave inline code-review comments that are injected into Claude Code &amp; Codex via hooks.</div>
+  <div class="sub" style="margin-top:10px;">Status: <b>Draft for approval</b> · Stack: Kotlin + IntelliJ Platform Gradle Plugin 2.x · Target: all JetBrains IDEs, min <code>2024.2</code></div>
+</header>
+
+<div class="callout note">
+  <b>This document is the source of truth we align on before any code is written.</b> It captures (1) how reviewa-vscode works today, (2) every decision already made, (3) the target architecture and on-disk contract, and (4) the phased build. Anything marked <span class="pill later">Later</span> is deliberately deferred out of v1.
+</div>
+
+<nav class="toc">
+  <a href="#goal">1 · Goal &amp; scope</a>
+  <a href="#today">2 · How reviewa-vscode works today</a>
+  <a href="#decisions">3 · Decisions locked in</a>
+  <a href="#layout">4 · On-disk contract (<code>~/.heview/</code>)</a>
+  <a href="#schema">5 · Comment schema &amp; lifecycle</a>
+  <a href="#hooks">6 · Hook integration (Claude &amp; Codex)</a>
+  <a href="#mapping">7 · VS Code → IntelliJ mapping</a>
+  <a href="#components">8 · Component breakdown (Kotlin)</a>
+  <a href="#phases">9 · Phased build</a>
+  <a href="#nongoals">10 · Non-goals &amp; risks</a>
+  <a href="#testing">11 · Testing &amp; dogfooding</a>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="goal">1 · Goal &amp; scope</h2>
+<p class="lead">Recreate reviewa's core loop inside JetBrains IDEs, faithful to its semantics but native to the IntelliJ Platform.</p>
+<p>The core loop, unchanged in spirit:</p>
+<ol>
+  <li>Developer clicks a line and leaves an inline comment (GitHub-PR style).</li>
+  <li>The comment is written to disk as a JSON file under a shared root.</li>
+  <li>A coding-agent hook (Claude Code, Codex) reads all comments matching the agent's working directory on the next prompt, injects them as context, and <b>deletes the file</b> (single-use, first-come consumption).</li>
+  <li>heview watches the comments directory, sees the deletion, and flips the thread to <b>Seen</b> / collapses it.</li>
+</ol>
+<p><b>v1 delivers:</b> inline commenting on normal open files, Claude + Codex hook install/registration, consumption watcher, comment tool window, status-bar widget, and settings. <b>Gemini CLI support is removed</b> (deprecated). Diff-view commenting and the Claude plan feature are deferred to later phases.</p>
+
+<!-- ============================================================ -->
+<h2 id="today">2 · How reviewa-vscode works today</h2>
+<p>Understanding the existing semantics precisely is the whole point of this section — the port must preserve them.</p>
+
+<div class="grid2">
+  <div class="card">
+    <h3>Comment controller</h3>
+    <p>Uses VS Code's first-class <code>vscode.comments.createCommentController</code>. A <code>commentingRangeProvider</code> allows comments on every line of <code>file</code>- and <code>git</code>-scheme documents. Threads support multiple replies; each comment shows a <b>Pending / Seen</b> label; the thread shows <i>"Pending comments"</i> or <i>"All comments seen"</i>.</p>
+  </div>
+  <div class="card">
+    <h3>Storage</h3>
+    <p>One JSON file per thread at <code>~/.reviewa/v1/comments/&lt;uuid&gt;.json</code>. In-memory <code>Map&lt;uuid, TrackedComment&gt;</code> is the UI source of truth; the thread's <code>contextValue</code> stores the uuid for reverse lookup. Replies concatenate into a single file's <code>content</code> (joined by blank lines).</p>
+  </div>
+  <div class="card">
+    <h3>Diff-side detection</h3>
+    <p>In a diff, it finds the <code>TabInputTextDiff</code>, then compares the line's text on both sides to classify it as <code>addition</code> / <code>removal</code> / context (<code>file</code>). This drives the <code>+</code>/<code>-</code>/none prefix injected to the agent.</p>
+  </div>
+  <div class="card">
+    <h3>Consumption watcher</h3>
+    <p><code>fs.watch</code> on the comments dir. A deletion <i>not</i> initiated by the UI (a suppression set guards UI-driven deletes) means a hook consumed it → mark comments <b>Seen</b>, set thread resolved/collapsed if <code>autoCollapse</code> is on.</p>
+  </div>
+  <div class="card">
+    <h3>Hook install / registration</h3>
+    <p>Scripts ship in <code>dist/hook-scripts/&lt;agent&gt;/</code> and are copied to disk on activation. Registration edits each agent's own config (Claude <code>~/.claude/settings.json</code>, Codex <code>~/.codex/hooks.json</code> + <code>config.toml</code> feature flag). Only registers for CLIs found on <code>PATH</code>.</p>
+  </div>
+  <div class="card">
+    <h3>Plan feature (Claude/Gemini)</h3>
+    <p>A <code>PostToolUse:Write</code> hook detects <code>~/.claude/plans/*.md</code> and writes plan-metadata JSON. A watcher auto-opens the plan and lets you comment on it, routed to Claude via <code>intended_consumer</code> + a <code>logical_abs_path</code> remap. Shown in a Plans tree.</p>
+  </div>
+</div>
+
+<h3>Supporting UI &amp; lifecycle</h3>
+<ul>
+  <li><b>Sidebar</b> (activity bar) with a Comments tree (grouped by file) and a Plans tree.</li>
+  <li><b>Status-bar item</b> with a custom glasses icon showing the pending count.</li>
+  <li><b>Editor-title copy buttons</b> to copy pending comments (contextual on plan files, generic elsewhere via a setting).</li>
+  <li><b>GitHub identity</b>: pulls the signed-in GitHub user + a rounded avatar; falls back to <i>"You"</i>.</li>
+  <li><b>Cleanup</b>: on deactivate (workspace close) it deletes <i>all</i> pending comment files.</li>
+  <li><b>Platform</b>: Windows unsupported (bash wrappers + Unix paths).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="decisions">3 · Decisions locked in</h2>
+<table>
+  <thead><tr><th>Topic</th><th>Decision</th><th>Consequence</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>On-disk root</td>
+      <td><code>~/.heview/</code> — shared root, identical comment schema + identical hook scripts to the (future) renamed VS Code plugin.</td>
+      <td>heview-intellij is a peer that reads/writes the same pool. <b>The VS Code plugin is NOT touched yet</b> — see note below.</td>
+    </tr>
+    <tr>
+      <td>Inline UI fidelity</td>
+      <td>Faithful <b>inlay threads</b>: gutter affordance to add, comment cards rendered as editor block inlays under the line.</td>
+      <td>Highest-effort UI path; built on <code>Editor.addComponentInlay</code> block inlays + gutter renderers. Validated against JetBrains' own review UI (§10). Experimental API, isolated behind an adapter with a stable gutter+popup fallback.</td>
+    </tr>
+    <tr>
+      <td>Diff commenting</td>
+      <td><b>Normal files first</b>; diff-viewer commenting is a later phase.</td>
+      <td>v1 comments always carry <code>side: "file"</code>. Addition/removal detection lands in Phase 4.</td>
+    </tr>
+    <tr>
+      <td>Stack &amp; target</td>
+      <td>Kotlin + IntelliJ Platform Gradle Plugin 2.x, all JetBrains IDEs, min build <code>2024.2</code>.</td>
+      <td>Single plugin JAR usable across IDEA/PyCharm/WebStorm/GoLand/etc.</td>
+    </tr>
+    <tr>
+      <td>Plan feature</td>
+      <td><span class="pill later">Later</span> — not in v1.</td>
+      <td>The <code>claude-code/plan-metadata/</code> dir is reserved in the layout but only exercised when the plan feature lands.</td>
+    </tr>
+    <tr>
+      <td>Per-agent separation</td>
+      <td>Approved layout: <b>shared</b> <code>comments/</code> pool; <b>per-agent</b> hooks &amp; metadata. Codex now gets its own dir like Claude.</td>
+      <td>Keeps first-come cross-agent consumption while cleanly separating each agent's config.</td>
+    </tr>
+    <tr>
+      <td>Close cleanup</td>
+      <td><b>Scoped to this project</b>: on project close, delete only pending comments whose workspace/cwd belongs to the closing project.</td>
+      <td>Safe with a shared root + multiple open projects/IDEs. Diverges intentionally from reviewa's "delete all".</td>
+    </tr>
+    <tr>
+      <td>Gemini CLI</td>
+      <td><span class="pill out">Removed</span>.</td>
+      <td>No Gemini hooks, watchers, plan support, or tree grouping are ported.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <b>Interop caveat (explicit).</b> heview-intellij writes to <code>~/.heview/</code> while reviewa-vscode stays on <code>~/.reviewa/v1/</code> for now. The two <b>will not interoperate</b> until the VS Code plugin is separately renamed and repointed to <code>~/.heview/</code> — a distinct future task, out of scope here.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="layout">4 · On-disk contract (<code>~/.heview/</code>)</h2>
+<p>The directory heview-intellij owns. Comments are pooled (so whichever agent runs first consumes them); everything else is separated per coding agent.</p>
+<pre><code>~/.heview/
+├─ comments/                                          # SHARED pool — one &lt;uuid&gt;.json per thread
+│                                                     # first-come consumption across agents
+├─ claude-code/
+│  ├─ hooks/
+│  │  ├─ user_prompt_submit_insert_comments_hook.js   # comment injector (Node)
+│  │  ├─ user_prompt_submit_insert_comments_hook.sh   # bash wrapper → node
+│  │  ├─ post_tool_use_plan_hook.js                   # (Later) plan detection
+│  │  └─ post_tool_use_plan_hook.sh
+│  └─ plan-metadata/                                  # (Later) &lt;planName&gt;.json per detected plan
+└─ codex/
+   └─ hooks/
+      └─ user_prompt_submit_insert_comments_hook.py   # comment injector (Python stdlib)</code></pre>
+<p class="muted" style="margin-top:10px;">Naming convention: every hook file is <code>&lt;event&gt;_&lt;purpose&gt;_hook.&lt;ext&gt;</code> — no more bare <code>hook.js</code>. The comment injector fires on <code>UserPromptSubmit</code> and inserts pending comments, so it is <code>user_prompt_submit_insert_comments_hook</code>; the plan detector fires on <code>PostToolUse</code>, so it is <code>post_tool_use_plan_hook</code>.</p>
+
+<p><b>Registration lives outside <code>~/.heview/</code></b>, in each agent's own config home (heview only edits these files, it does not own them):</p>
+<table>
+  <thead><tr><th>Agent</th><th>Registered in</th><th>Event → command</th></tr></thead>
+  <tbody>
+    <tr><td>Claude Code</td><td><code>~/.claude/settings.json</code></td><td><code>UserPromptSubmit</code> → <code>bash ~/.heview/claude-code/hooks/user_prompt_submit_insert_comments_hook.sh</code></td></tr>
+    <tr><td>Codex</td><td><code>~/.codex/hooks.json</code> (+ <code>~/.codex/config.toml</code> flag <code>codex_hooks = true</code>)</td><td><code>UserPromptSubmit</code> → <code>python3 ~/.heview/codex/hooks/user_prompt_submit_insert_comments_hook.py</code></td></tr>
+  </tbody>
+</table>
+<p class="muted">Changes vs reviewa: the comment injectors are renamed from the generic <code>hook.js</code> / <code>hook.py</code> to descriptive, event-prefixed names (<code>user_prompt_submit_insert_comments_hook.*</code>), matching the <code>post_tool_use_plan_hook.*</code> convention; the injectors also move out of the loose <code>v1/</code> root into their own <code>&lt;agent&gt;/hooks/</code> dirs, and every path baked into the wrappers and registration commands is updated to <code>~/.heview/&lt;agent&gt;/hooks/…</code>. The scripts are otherwise functionally identical — same events, same read/format/delete logic (with <code>COMMENTS_DIR = ~/.heview/comments</code>).</p>
+
+<!-- ============================================================ -->
+<h2 id="schema">5 · Comment schema &amp; lifecycle</h2>
+<p>The JSON schema is preserved verbatim from reviewa (so the same hook scripts work unchanged). One file per thread:</p>
+<pre><code>{
+  "uuid":             "…",             // filename is &lt;uuid&gt;.json
+  "status":           "pending" | "processed",
+  "created_at":       "&lt;ISO-8601&gt;",     // bumped on reply / edit / re-pend
+  "workspace":        "/abs/project/root",
+  "abs_path":         "/abs/path/to/file",
+  "logical_abs_path": "/abs/path/to/file",  // remapped for plan files (Later)
+  "line_number":      42,
+  "line_content":     "const x = 1",
+  "side":             "file" | "addition" | "removal",  // v1 always "file"
+  "content":          "the review comment text",
+  "intended_consumer": "claude_code"    // optional; absent = any agent
+}</code></pre>
+
+<h3>State machine (UI-side, preserved)</h3>
+<pre><code>          create                     hook / copy consumes file
+ (none) ─────────▶ PENDING ───────────────────────────────▶ PROCESSED ("Seen")
+                     ▲  │ edit / re-pend                          │
+                     │  └──────────────────────────────────┐     │ re-pend
+                     └──────────── REPENDING ◀──────────────┴─────┘
+   • PENDING & REPENDING are "actionable" — written to disk, injected to agents.
+   • PROCESSED is not written to disk; only re-pending revives it.
+   • A thread is "Pending comments" if any comment is actionable, else "All comments seen".
+   • Deleting the last actionable comment removes the file from disk.
+   • created_at bumps on reply, edit, and re-pend (drives injection ordering).</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="hooks">6 · Hook integration (Claude &amp; Codex)</h2>
+<p>Scripts ship as plugin resources and are extracted on startup — the IntelliJ analogue of reviewa's esbuild copy step.</p>
+
+<h3>Injection semantics (unchanged from reviewa)</h3>
+<p>On its hook event each script:</p>
+<ol>
+  <li>Reads <code>cwd</code> from stdin JSON.</li>
+  <li>Scans <code>~/.heview/comments/*.json</code>.</li>
+  <li>Keeps a comment if its <code>intended_consumer</code> is absent or matches this agent, <b>and</b> its match-path (Claude: <code>logical_abs_path || abs_path</code>; Codex: <code>abs_path</code>) starts with <code>cwd</code>.</li>
+  <li>Sorts by <code>created_at</code>, formats each block, deletes the consumed files, emits <code>additionalContext</code>.</li>
+</ol>
+<p>Injected block format (byte-for-byte identical to reviewa):</p>
+<pre><code>In `src/foo.ts` at line 42:
+```
++const x = 1
+```
+Your comment here</code></pre>
+<p class="muted">Prefix is <code>+</code> for additions, <code>-</code> for removals, none for context/normal lines. In v1 (files only) this is always no-prefix.</p>
+
+<h3>Install &amp; registration (idempotent)</h3>
+<ul>
+  <li><b>Extraction</b>: copy bundled scripts → <code>~/.heview/&lt;agent&gt;/hooks/</code>, <code>chmod 0755</code>. Overwrite on every startup so upgrades take effect.</li>
+  <li><b>CLI detection</b>: register an agent's hook only if its CLI is on <code>PATH</code> (<code>which claude</code> / <code>which codex</code>).</li>
+  <li><b>Claude</b>: append a <code>UserPromptSubmit</code> entry to <code>~/.claude/settings.json</code> if no existing <code>heview</code> command is present (dedupe by command substring); strip any stale entries from prior registration slots.</li>
+  <li><b>Codex</b>: ensure <code>[features] codex_hooks = true</code> in <code>~/.codex/config.toml</code> (surface an IDE warning if explicitly <code>false</code>); append a <code>UserPromptSubmit</code> entry to <code>~/.codex/hooks.json</code>.</li>
+</ul>
+<div class="callout">The dedupe substring changes from <code>reviewa</code> to <code>heview</code>. Because the two products use different roots and different marker strings, a machine can run both side-by-side without their registrations colliding.</div>
+
+<!-- ============================================================ -->
+<h2 id="mapping">7 · VS Code → IntelliJ mapping</h2>
+<p>The load-bearing translation. Each VS Code primitive maps to a concrete IntelliJ Platform mechanism.</p>
+<table>
+  <thead><tr><th>reviewa (VS Code)</th><th>heview (IntelliJ)</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Comment Controller inline threads</td>
+      <td>Editor <b>block inlay</b> hosting a Swing card via <code>Editor.addComponentInlay(…)</code> <span class="muted">(older entry: <code>EditorEmbeddedComponentManager</code>)</span></td>
+      <td>Confirmed the only faithful path — the exact mechanism JetBrains' own GitHub-PR/GitLab/Space review comments use (<code>com.intellij.collaboration…CodeReviewComponentInlayRenderer</code>). Interactive card: author, Pending/Seen label, markdown text, Edit/Delete/Reply. API is <code>@ApiStatus.Experimental</code> — isolate behind a thin adapter (see §10).</td>
+    </tr>
+    <tr>
+      <td><code>commentingRangeProvider</code> + gutter click</td>
+      <td><code>GutterIconRenderer</code> / hover affordance + an <code>AnAction</code> ("Add heview comment") on the caret line</td>
+      <td>Bound to the editor context menu and a keymap shortcut; any line is commentable.</td>
+    </tr>
+    <tr>
+      <td><code>fs.watch(COMMENTS_DIR)</code></td>
+      <td>Java NIO <code>WatchService</code> on <code>~/.heview/comments/</code> (background coroutine → marshal to EDT)</td>
+      <td>Path is outside the project, so VFS isn't a fit. Polling <code>Alarm</code> fallback for platforms with flaky watches.</td>
+    </tr>
+    <tr>
+      <td>Activity-bar sidebar (Comments/Plans trees)</td>
+      <td><b>Tool Window</b> via <code>ToolWindowFactory</code> with a comments <code>Tree</code> grouped by file</td>
+      <td>Plans tab deferred with the plan feature.</td>
+    </tr>
+    <tr>
+      <td>Status-bar item</td>
+      <td><code>StatusBarWidget</code> + <code>StatusBarWidgetFactory</code></td>
+      <td>Pending count + glasses icon; click focuses the tool window.</td>
+    </tr>
+    <tr>
+      <td>Editor-title copy buttons</td>
+      <td><code>AnAction</code>s in an editor action group / context menu</td>
+      <td>"Copy pending comments in file" / "Copy all pending". Available via Find Action too.</td>
+    </tr>
+    <tr>
+      <td>GitHub author + avatar</td>
+      <td>v1: system user (<code>user.name</code>); GitHub account + avatar <span class="pill later">Later</span></td>
+      <td>Optional polish; not blocking.</td>
+    </tr>
+    <tr>
+      <td>Settings (<code>reviewa.*</code>)</td>
+      <td><code>PersistentStateComponent</code> + a <code>Configurable</code> settings page</td>
+      <td>autoCollapse, copy-buttons toggle, (later) autoOpenOnPlanCreation.</td>
+    </tr>
+    <tr>
+      <td>Activation (<code>onStartupFinished</code>) / deactivate</td>
+      <td>App-level service (hook install + shared watcher) + project-level service / <code>ProjectActivity</code>; <code>projectClosing</code> → scoped cleanup</td>
+      <td>App scope owns the shared root; project scope owns UI + scoped cleanup.</td>
+    </tr>
+    <tr>
+      <td>Bundled hook scripts (<code>dist/hook-scripts/</code>)</td>
+      <td>Plugin <code>resources/hook-scripts/&lt;agent&gt;/</code> extracted on startup</td>
+      <td>Scripts kept as plain files (not string literals), like reviewa 1.0.1.</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="components">8 · Component breakdown (Kotlin)</h2>
+<div class="grid2">
+  <div class="card">
+    <h3>Domain &amp; storage</h3>
+    <ul>
+      <li><code>HeviewComment</code> — data class mirroring the JSON schema.</li>
+      <li><code>CommentStore</code> (project service) — in-memory <code>Map&lt;uuid, Tracked&gt;</code>, JSON read/write, suppression set, change events, scoped cleanup.</li>
+      <li><code>HeviewPaths</code> — central resolver for <code>~/.heview/…</code>.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>Inline UI</h3>
+    <ul>
+      <li><code>InlayCardHost</code> — thin adapter wrapping the experimental <code>addComponentInlay</code> / <code>EditorEmbeddedComponentManager</code> call; the one-file swap point, with the gutter+popup fallback behind the same interface.</li>
+      <li><code>CommentInlayManager</code> — recreates/updates/disposes inlays per <code>Editor</code> via <code>FileEditorManagerListener</code> / <code>EditorFactoryListener</code>; <code>Disposer</code>-scoped cleanup; <code>EditorScrollingPositionKeeper</code> to avoid scroll jumps.</li>
+      <li><code>CommentCardPanel</code> — Swing card (author, label, markdown text, Edit/Delete/Reply).</li>
+      <li><code>AddCommentAction</code> + <code>GutterIconRenderer</code> — entry point to create a thread (also the fallback popup trigger).</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>Hooks</h3>
+    <ul>
+      <li><code>HookInstaller</code> — extract scripts, <code>chmod</code>.</li>
+      <li><code>ClaudeHookRegistrar</code> / <code>CodexHookRegistrar</code> — idempotent config edits + CLI detection.</li>
+      <li><code>resources/hook-scripts/{claude-code,codex}/…</code> — the shipped scripts.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>Watch &amp; surfaces</h3>
+    <ul>
+      <li><code>CommentsWatcher</code> — NIO WatchService → mark Seen/collapse.</li>
+      <li><code>HeviewToolWindowFactory</code> + tree model.</li>
+      <li><code>PendingCountWidget</code> (status bar).</li>
+      <li><code>HeviewSettings</code> + <code>HeviewConfigurable</code>.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="phases">9 · Phased build</h2>
+<table>
+  <thead><tr><th>Phase</th><th>Deliverable</th><th>Scope</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td>Scaffold: Gradle + IntelliJ Platform Gradle Plugin 2.x, Kotlin, <code>plugin.xml</code>, min 2024.2. <b>Done when</b> <code>./gradlew runIde</code> launches a sandbox IDE with heview loaded, and <code>buildPlugin</code> + <code>verifyPlugin</code> are wired (see §11).</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">1</td><td>Core file commenting: schema + JSON store, inlay thread UI, full pending/repending/processed state machine, in-memory store + events. <b>Starts with an inlay spike</b> behind the <code>InlayCardHost</code> adapter, validated on the 2024.2 baseline before building on it.</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">2</td><td>Hook install &amp; registration for Claude + Codex (extract scripts, edit config files, CLI detection, config.toml flag).</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">3</td><td>Consumption watcher (mark Seen/collapse), scoped project-close cleanup, comment tool window, status-bar widget, copy actions, settings page.</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">4</td><td>Diff-view commenting: addition/removal/context detection inside IntelliJ's diff viewer.</td><td><span class="pill later">Later</span></td></tr>
+    <tr><td class="num">5</td><td>Claude plan feature: <code>PostToolUse:Write</code> plan hook, plan-metadata watcher, auto-open, plan-file commenting, Plans view.</td><td><span class="pill later">Later</span></td></tr>
+    <tr><td class="num">6</td><td>Polish: GitHub identity + avatar, richer markdown rendering, Windows support investigation.</td><td><span class="pill later">Later</span></td></tr>
+  </tbody>
+</table>
+<p><b>v1 = Phases 0–3.</b> Each phase is independently testable in the sandbox IDE.</p>
+
+<!-- ============================================================ -->
+<h2 id="nongoals">10 · Non-goals &amp; risks</h2>
+<h3>Explicit non-goals for v1</h3>
+<ul>
+  <li>Gemini CLI (removed entirely).</li>
+  <li>Diff-viewer commenting (Phase 4).</li>
+  <li>Claude plan feature + Plans view (Phase 5).</li>
+  <li>Renaming/repointing the VS Code plugin (separate task).</li>
+  <li>Windows support (bash/python wrappers + Unix paths; macOS/Linux only, matching reviewa).</li>
+</ul>
+<h3>Known risks / things to validate early</h3>
+<ul>
+  <li><b>Interactive inlays are the right call — but on an experimental API.</b> Research (against the SDK docs + intellij-community source) confirmed a live-Swing block inlay (<code>Editor.addComponentInlay</code>; older entry <code>EditorEmbeddedComponentManager</code>) is the only path that meets the always-visible interactive-card bar, and it is exactly what JetBrains' own GitHub-PR/GitLab/Space review comments ship on — production-proven, not exotic. The genuine risk is that these APIs are <code>@ApiStatus.Experimental</code> / <code>platform-impl</code> and have drifted between versions (<code>EditorEmbeddedComponentManager.Properties</code> constructor changes have caused <code>NoSuchMethodError</code> in third-party plugins). <b>Mitigation:</b> isolate the call behind a one-file <code>InlayCardHost</code> adapter; confirm <code>addComponentInlay</code> exists on the 2024.2 baseline (use <code>EditorEmbeddedComponentManager</code> there if not); smoke-test across a couple of IDE builds; keep the fully-stable gutter + <code>JBPopup</code> component-popup as a drop-in fallback.</li>
+  <li><b>Don't depend on <code>com.intellij.collaboration</code> directly</b> — its editor-inlay utilities (<code>renderInlays</code>, <code>CodeReviewComponentInlayRenderer</code>) are Experimental/Deprecated and coupled to JetBrains' coroutine-ViewModel model. Copy the pattern (anchor at <code>getLineEndOffset(line)</code>, <code>relatesToPrecedingText(true)</code>, <code>FIT_VIEWPORT_WIDTH</code>, scroll-keeper) — do not call it.</li>
+  <li><b>Anchoring &amp; lifecycle</b> — inlays follow their document offset across edits automatically (like a <code>RangeMarker</code>), but are per-<code>Editor</code> and <b>not persisted</b>: recreate them on editor open/split via <code>FileEditorManagerListener</code> / <code>EditorFactoryListener</code>, translating the stored <code>line_number</code> → offset, and dispose per editor. The persisted line number stays the injection anchor (as in reviewa).</li>
+  <li><b>External-dir file watching</b> — WatchService reliability varies; keep a polling fallback.</li>
+  <li><b>Config-file edits</b> — must be idempotent and preserve unrelated user config in <code>settings.json</code> / <code>hooks.json</code> / <code>config.toml</code>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="testing">11 · Testing &amp; dogfooding</h2>
+<p class="lead">Three loops, fastest to most real. The load-bearing insight: the agent CLIs and the hooks live <b>outside</b> the IDE sandbox, so the entire pipeline is dogfoodable from day one — even from inside <code>runIde</code>.</p>
+
+<h3>Gradle tasks</h3>
+<table>
+  <thead><tr><th>Task</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>./gradlew runIde</code></td><td>Launch a sandboxed IDE with heview loaded — the VS Code "Extension Development Host" equivalent. Sandbox state under <code>build/idea-sandbox/</code>, isolated from your daily IDE. Runnable in debug for breakpoints.</td></tr>
+    <tr><td><code>./gradlew buildPlugin</code></td><td>Produce the installable <code>build/distributions/heview-*.zip</code>.</td></tr>
+    <tr><td><code>./gradlew test</code></td><td>JUnit unit tests over pure logic (store, hook install/registration, schema, watcher) against a temp <code>HOME</code> — no running IDE. Mirrors reviewa's vitest suite.</td></tr>
+    <tr><td><code>./gradlew verifyPlugin</code></td><td>JetBrains Plugin Verifier across the range of target IDE builds — the safety net for the experimental inlay APIs (§10). Catches <code>NoSuchMethodError</code>-class drift at build time, not at a user's desk.</td></tr>
+  </tbody>
+</table>
+
+<div class="grid2">
+  <div class="card">
+    <h3>Loop 1 · Inner loop (<code>runIde</code>)</h3>
+    <p>Edit Kotlin → stop → <code>runIde</code> again. A fresh sandbox IDE each time; nothing touches your real IDE config. Launch in debug from the Gradle tool window to hit breakpoints inside the plugin. This is the fast iteration loop.</p>
+  </div>
+  <div class="card">
+    <h3>Loop 3 · Daily dogfood (install-from-disk)</h3>
+    <p><code>buildPlugin</code> → <b>Settings → Plugins → ⚙ → Install Plugin from Disk</b> → point at the zip. heview now runs in the IDE you actually work in, against real projects and real agent sessions. This is how you live on it.</p>
+  </div>
+</div>
+
+<h3>Loop 2 · Full end-to-end, from the sandbox</h3>
+<p>Because heview writes to real <code>~/.heview/</code> and registers in real <code>~/.claude/settings.json</code> / <code>~/.codex/hooks.json</code> — and because <code>claude</code>/<code>codex</code> are terminal tools that run <b>outside</b> the IDE — the whole loop works without leaving <code>runIde</code>:</p>
+<ol>
+  <li><code>runIde</code> → open a project, leave a comment → JSON lands in real <code>~/.heview/comments/</code>.</li>
+  <li>In that project (easiest: the sandbox IDE's built-in <b>terminal</b>, so <code>cwd</code> == the comment's <code>workspace</code>) run <code>claude</code>/<code>codex</code> and submit a prompt.</li>
+  <li>The hook injects the comment as context and deletes the file.</li>
+  <li>heview's watcher sees the deletion → flips the thread to <b>Seen</b> (and collapses it if configured).</li>
+</ol>
+
+<div class="callout warn">
+  <b>Isolation knob.</b> Loop 2 touches your real agent config. For a throwaway environment, point <b>both</b> sides at the same disposable home — the IDE via <code>runIde { jvmArgs("-Duser.home=/tmp/heview-dev") }</code> and the CLI via <code>HOME=/tmp/heview-dev claude</code>. They must agree: the plugin resolves <code>user.home</code>, the hook scripts resolve <code>$HOME</code>. For everyday use, just use your real <code>$HOME</code> — registration is idempotent, <code>heview</code>-marker-scoped, and fully separate from reviewa's <code>~/.reviewa/</code> + <code>reviewa</code> markers, so the two coexist without collision.
+</div>
+
+<footer>
+  heview-intellij · plan.html · generated for review. Reference: <code>reviewa-vscode</code> (sibling repo) · IntelliJ SDK docs at <code>~/gh/JetBrains/intellij-sdk-docs</code>.
+</footer>
+
+</div>
+</body>
+</html>
