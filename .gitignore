@@ -13,3 +13,6 @@ bin/
 
 # OS
 .DS_Store
+
+# Local-only files (never committed) — anything with `.local` in the name
+*.local*

@@ -1,7 +1,10 @@
 package com.marlzrana.heview.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.fileTypes.PlainTextFileType
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.ui.EditorTextField
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextArea
@@ -9,6 +12,7 @@ import com.intellij.util.ui.JBUI
 import com.marlzrana.heview.model.HeviewComment
 import java.awt.BorderLayout
 import java.awt.Component
+import java.awt.Dimension
 import java.awt.FlowLayout
 import javax.swing.JButton
 import javax.swing.JPanel
@@ -24,6 +28,7 @@ import javax.swing.JPanel
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
 internal class CommentThread(
+    private val project: Project,
     private val host: InlayCardHost,
     private val lineEndOffset: Int,
     private val author: String,
@@ -47,13 +52,18 @@ internal class CommentThread(
     }
 
     private fun renderCompose() {
-        val area = JBTextArea(3, 60).apply {
-            lineWrap = true
-            wrapStyleWord = true
+        // A real embedded editor (not a JBTextArea): it owns editor actions — Backspace/Enter/arrows/
+        // undo edit the comment, instead of leaking to the underlying code editor.
+        val input = EditorTextField("", project, PlainTextFileType.INSTANCE).apply {
+            setOneLineMode(false)
+            setPlaceholder("Leave a comment…")
+            // Fixed initial height; BorderLayout.CENTER stretches the width to the inlay.
+            preferredSize = Dimension(1, JBUI.scale(64))
+            addSettingsProvider { it.settings.isUseSoftWraps = true }
         }
         val submit = JButton("Submit").apply {
             addActionListener {
-                val text = area.text.trim()
+                val text = input.text.trim()
                 if (text.isNotEmpty()) {
                     comment = onSubmit(text)
                     renderDisplay()
@@ -61,8 +71,8 @@ internal class CommentThread(
             }
         }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
-        setContent(area, buttonRow(cancel, submit))
-        area.requestFocusInWindow()
+        setContent(input, buttonRow(cancel, submit))
+        input.requestFocusInWindow()
     }
 
     private fun renderDisplay() {

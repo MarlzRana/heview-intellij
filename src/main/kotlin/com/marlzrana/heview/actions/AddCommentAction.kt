@@ -54,6 +54,7 @@ internal class AddCommentAction : AnAction() {
         val author = System.getProperty("user.name") ?: "You"
 
         val thread = CommentThread(
+            project = project,
             host = ComponentInlayCardHost(editor),
             lineEndOffset = lineEndOffset,
             author = author,
