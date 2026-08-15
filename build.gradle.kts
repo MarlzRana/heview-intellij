@@ -23,6 +23,13 @@ dependencies {
         pluginVerifier()
         zipSigner()
     }
+
+    // Bundled with the plugin: the IntelliJ Platform does not expose Gson on the plugin classpath,
+    // so we ship our own. Drives the byte-exact snake_case comment JSON contract (plan.html §5).
+    implementation("com.google.code.gson:gson:2.11.0")
+
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 kotlin {
@@ -50,4 +57,8 @@ intellijPlatform {
             recommended()
         }
     }
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
