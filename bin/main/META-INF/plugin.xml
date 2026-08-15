@@ -11,16 +11,17 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <!-- Phase 0: smoke marker confirming the plugin loads. Real features land in later phases. -->
+        <!-- Phase 0: smoke marker confirming the plugin loads. -->
         <postStartupActivity implementation="com.marlzrana.heview.HeviewStartupActivity"/>
+        <!-- Shared in-memory index + persistence over ~/.heview/comments. -->
+        <applicationService serviceImplementation="com.marlzrana.heview.storage.CommentStore"/>
     </extensions>
 
     <actions>
-        <!-- Phase 1 spike (temporary): validates the addComponentInlay card path in a real IDE. -->
-        <action id="heview.spike.AddCard"
-                class="com.marlzrana.heview.spike.AddSpikeCardAction"
-                text="heview: Add Spike Inlay Card"
-                description="Phase 1 spike — verify addComponentInlay renders an interactive inline card">
+        <action id="heview.AddComment"
+                class="com.marlzrana.heview.actions.AddCommentAction"
+                text="heview: Add Comment"
+                description="Leave an inline review comment on the current line">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <keyboard-shortcut keymap="$default" first-keystroke="control alt shift H"/>
         </action>

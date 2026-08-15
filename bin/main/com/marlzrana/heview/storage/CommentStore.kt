@@ -11,9 +11,16 @@ import java.nio.file.Path
  * one file per thread at `<commentsDir>/<uuid>.json`, with the in-memory map as the source of truth.
  *
  * Deliberately free of any IDE/editor dependency so it is unit-testable against a temp directory.
- * The editor/inlay binding and the shared-pool wiring (`~/.heview/comments`) live in higher layers.
+ * The editor/inlay binding lives in higher layers.
+ *
+ * Not thread-safe: in production this is an application service and all access is confined to the
+ * EDT (the same thread that drives the inlay UI), so no synchronization is needed.
  */
 class CommentStore(private val commentsDir: Path) {
+    /** Application-service constructor — binds to the shared `~/.heview/comments` pool. */
+    @Suppress("unused")
+    constructor() : this(HeviewPaths.commentsDir)
+
     private val index = LinkedHashMap<String, HeviewComment>()
     private val listeners = mutableListOf<() -> Unit>()
 
