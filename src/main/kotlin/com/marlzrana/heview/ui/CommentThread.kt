@@ -1,9 +1,11 @@
 package com.marlzrana.heview.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.wm.IdeFocusManager
 import com.intellij.ui.EditorTextField
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
@@ -41,8 +43,13 @@ internal class CommentThread(
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(): Boolean {
-        renderCompose()
+        val input = renderCompose()
         inlay = host.addCardBelow(lineEndOffset, panel) ?: return false
+        // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
+        // and realized (next EDT tick) — otherwise the user has to click the card before typing.
+        ApplicationManager.getApplication().invokeLater {
+            IdeFocusManager.getInstance(project).requestFocus(input, true)
+        }
         return true
     }
 
@@ -51,7 +58,7 @@ internal class CommentThread(
         inlay = null
     }
 
-    private fun renderCompose() {
+    private fun renderCompose(): EditorTextField {
         // A real embedded editor (not a JBTextArea): it owns editor actions — Backspace/Enter/arrows/
         // undo edit the comment, instead of leaking to the underlying code editor.
         val input = EditorTextField("", project, PlainTextFileType.INSTANCE).apply {
@@ -72,7 +79,7 @@ internal class CommentThread(
         }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
         setContent(input, buttonRow(cancel, submit))
-        input.requestFocusInWindow()
+        return input
     }
 
     private fun renderDisplay() {
