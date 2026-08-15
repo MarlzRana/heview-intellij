@@ -2,7 +2,8 @@
 name: hooks-integrity
 description: Reviews heview's coding-agent hook install/registration and the ~/.heview on-disk contract — idempotency, non-destructive edits to user config, marker scoping, and single-use consumption.
 harnesses:
-  - { harness: codex, model: gpt-5.5, thinking: xhigh }
+  - { harness: codex, model: gpt-5.6-sol, thinking: xhigh }
+  - { harness: pi, model: xai/grok-4.6 }
   - { harness: claude-code, model: claude-opus-4-8 }
 auto-activate-paths:
   - "**/*.kt"

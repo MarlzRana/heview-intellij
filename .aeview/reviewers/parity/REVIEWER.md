@@ -2,7 +2,8 @@
 name: parity
 description: Reviews faithfulness to reviewa-vscode semantics and the shared ~/.heview contract — comment lifecycle, injection format, and state transitions must match the source.
 harnesses:
-  - { harness: codex, model: gpt-5.5, thinking: xhigh }
+  - { harness: codex, model: gpt-5.6-sol, thinking: xhigh }
+  - { harness: pi, model: xai/grok-4.6 }
   - { harness: claude-code, model: claude-opus-4-8 }
 auto-activate-paths:
   - "**/*.kt"
