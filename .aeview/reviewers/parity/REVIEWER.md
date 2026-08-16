@@ -65,6 +65,10 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
   avatar is a deferred polish increment (plan.html §9).
 - The VS Code plugin is NOT being updated yet — parity means matching reviewa's *semantics/contract*,
   never calling into it.
+- The Codex injector emits **clean backticks** (`` `path` `` / ```` ``` ````), matching reviewa's *Claude*
+  hook and the plan §6 format. reviewa's *Codex* `hook.py` has a bug — JS-style `"\`"` escaping in Python
+  yields a literal backslash + backtick — so heview intentionally diverges from reviewa's Codex *bytes* to
+  match the documented contract. Do NOT flag the missing backslashes as drift.
 
 Flag any divergence that lacks such a recorded decision, even a small one.
 

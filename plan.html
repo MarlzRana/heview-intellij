@@ -351,13 +351,14 @@ created in one and resolved in the other stays consistent.</p>
   <li>Keeps a comment if its <code>intended_consumer</code> is absent or matches this agent, <b>and</b> its match-path (Claude: <code>logical_abs_path || abs_path</code>; Codex: <code>abs_path</code>) starts with <code>cwd</code>.</li>
   <li>Sorts by <code>created_at</code>, formats each block, deletes the consumed files, emits <code>additionalContext</code>.</li>
 </ol>
-<p>Injected block format (byte-for-byte identical to reviewa):</p>
+<p>Injected block format (byte-for-byte identical to reviewa's <em>Claude</em> hook):</p>
 <pre><code>In `src/foo.ts` at line 42:
 ```
 +const x = 1
 ```
 Your comment here</code></pre>
 <p class="muted">Prefix is <code>+</code> for additions, <code>-</code> for removals, none for context/normal lines. In v1 (files only) this is always no-prefix.</p>
+<div class="callout warn"><b>Sanctioned divergence — Codex backtick fix.</b> reviewa's <em>Codex</em> hook (<code>hook.py</code>) copies the JS single-quote escaping <code>'\`'</code> into Python, where <code>"\`"</code> is a backslash <em>plus</em> a backtick — so reviewa's Codex actually injects <code>\`path\`</code> / <code>\`\`\`</code> with literal backslashes, disagreeing with its own Claude hook and with the format above. heview emits <b>clean backticks</b> in both injectors (verified byte-identical between the Node and Python scripts), matching this documented contract. This is a bug in reviewa's <code>src/hook-managers/codex/hook.py</code> worth fixing upstream.</div>
 
 <h3>Install &amp; registration (idempotent)</h3>
 <ul>
