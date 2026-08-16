@@ -47,6 +47,8 @@ class CommentStore(
     // Iterate a copy so a listener may unregister itself (or another) during the callback.
     private fun fireChanged() = listeners.toList().forEach { it() }
 
+    // Safe by construction: uuids only enter the index from save() (a random UUID) or hydrate() (where
+    // the uuid must equal a single-component filename), so this never resolves outside commentsDir.
     private fun fileFor(uuid: String): Path = commentsDir.resolve("$uuid.json")
 
     /** Upsert: index + fire immediately (EDT), then persist atomically on a background thread. */
@@ -78,25 +80,55 @@ class CommentStore(
         }
     }
 
-    /** Read and decode every `<uuid>.json` in the pool, skipping any file that can't be parsed. */
+    /**
+     * Read, decode and validate every `<uuid>.json` in the pool. Because the pool is durable and shared
+     * with foreign writers (reviewa, coding agents), each file is treated as untrusted: anything
+     * unreadable, schema-incomplete, filename/uuid-mismatched, or already `processed` is skipped.
+     */
     private fun readAllFromDisk(): List<HeviewComment> {
         if (!Files.isDirectory(commentsDir)) return emptyList()
         return try {
             Files.newDirectoryStream(commentsDir, "*.json").use { stream ->
-                stream.mapNotNull { path ->
-                    try {
-                        CommentJson.decode(Files.readString(path))
-                    } catch (e: Exception) {
-                        LOG.warn("heview: skipping unreadable comment file $path", e)
-                        null
-                    }
-                }
+                stream.mapNotNull { path -> decodeIfValid(path) }
             }
         } catch (e: IOException) {
             LOG.warn("heview: failed to list the comments directory $commentsDir", e)
             emptyList()
         }
     }
+
+    private fun decodeIfValid(path: Path): HeviewComment? {
+        val expectedUuid = path.fileName.toString().removeSuffix(".json")
+        val comment = try {
+            CommentJson.decode(Files.readString(path))
+        } catch (e: Exception) {
+            LOG.warn("heview: skipping unreadable comment file $path", e)
+            return null
+        }
+        if (!isWellFormed(comment, expectedUuid)) {
+            // Rejects schema-incomplete JSON (Gson leaves absent required fields null) and files whose
+            // payload uuid doesn't match the filename — the latter both prevents `fileFor` path traversal
+            // (e.g. a uuid of "../../.codex/hooks") and stops a stale file resurrecting on every restart.
+            LOG.warn("heview: skipping malformed or unsafe comment file $path")
+            return null
+        }
+        if (comment.status == CommentStatus.PROCESSED) {
+            // plan.html §5: processed comments are not persisted/actionable — never hydrate one as pending.
+            return null
+        }
+        return comment
+    }
+
+    // Gson (via Unsafe) can leave a non-null Kotlin field null when its JSON key is absent, and returns
+    // null for an unknown enum value — so every required field is null-checked despite its declared type.
+    @Suppress("SENSELESS_COMPARISON")
+    private fun isWellFormed(c: HeviewComment, expectedUuid: String): Boolean =
+        c.uuid == expectedUuid &&
+            c.status != null && c.side != null &&
+            c.createdAt != null && c.workspace != null &&
+            c.absPath != null && c.logicalAbsPath != null &&
+            c.content != null && c.lineContent != null &&
+            c.lineNumber >= 1
 
     fun get(uuid: String): HeviewComment? = index[uuid]
 

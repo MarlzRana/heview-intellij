@@ -178,6 +178,91 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `hydrate fires no change when every on-disk record is already present`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1")) // also writes u1.json (sync IO)
+        var count = 0
+        store.addChangeListener { count++ }
+        store.hydrate()
+        assertEquals(0, count) // nothing new loaded ⇒ no reconcile churn on startup
+    }
+
+    @Test
+    fun `hydrate skips a file whose json uuid does not match its filename (path traversal)`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        // Filename is benign, but the payload uuid would escape commentsDir via fileFor on delete.
+        Files.writeString(dir.resolve("benign.json"), CommentJson.encode(sampleComment(uuid = "../../evil")))
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(0, store.all().size)
+        assertNull(store.get("../../evil"))
+        assertNull(store.get("benign"))
+    }
+
+    @Test
+    fun `hydrate skips schema-incomplete json`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        Files.writeString(dir.resolve("empty.json"), "{}")
+        Files.writeString(dir.resolve("partial.json"), """{"uuid":"partial","content":"hi"}""")
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(0, store.all().size) // null required fields would NPE reconcile if indexed
+    }
+
+    @Test
+    fun `hydrate does not load processed comments`(@TempDir dir: Path) {
+        seed(dir, sampleComment(uuid = "p", status = CommentStatus.PROCESSED))
+        seed(dir, sampleComment(uuid = "q", status = CommentStatus.PENDING))
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(listOf("q"), store.all().map { it.uuid }) // plan §5: processed never resurrects
+    }
+
+    @Test
+    fun `disposing a change-listener handle stops its callbacks but not the others`(@TempDir dir: Path) {
+        val store = store(dir)
+        var a = 0
+        var b = 0
+        val handleA = store.addChangeListener { a++ }
+        store.addChangeListener { b++ }
+        store.save(sampleComment(uuid = "u1"))
+        handleA.dispose()
+        store.save(sampleComment(uuid = "u2"))
+        assertEquals(1, a) // stopped after dispose
+        assertEquals(2, b) // still firing
+    }
+
+    @Test
+    fun `a listener may unregister itself during fireChanged without a CME`(@TempDir dir: Path) {
+        val store = store(dir)
+        var self = 0
+        var peer = 0
+        lateinit var handle: com.intellij.openapi.Disposable
+        handle = store.addChangeListener {
+            self++
+            handle.dispose() // reentrant removal during the fire
+        }
+        store.addChangeListener { peer++ }
+        store.save(sampleComment(uuid = "u1")) // must not throw ConcurrentModificationException
+        store.save(sampleComment(uuid = "u2"))
+        assertEquals(1, self) // fired once, then removed itself
+        assertEquals(2, peer) // untouched
+    }
+
+    @Test
+    fun `forAbsPath matches when the stored abs_path is non-canonical`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(
+            sampleComment(uuid = "c").copy(
+                absPath = "/repo/src/../src/Foo.kt",
+                logicalAbsPath = "/repo/src/../src/Foo.kt",
+            ),
+        )
+        // Both sides normalize, so a foreign writer's non-canonical spelling still matches.
+        assertEquals(listOf("c"), store.forAbsPath("/repo/src/Foo.kt").map { it.uuid })
+    }
+
+    @Test
     fun `forAbsPath returns only comments for that file, matched normalized`(@TempDir dir: Path) {
         val store = store(dir)
         store.save(sampleComment(uuid = "here")) // abs_path = /repo/src/Foo.kt
