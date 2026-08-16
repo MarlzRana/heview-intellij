@@ -50,11 +50,7 @@ class CommentStore(
         fireChanged()
         val uuid = comment.uuid
         val json = CommentJson.encode(comment)
-        runIo {
-            if (!writeAtomically(uuid, json)) {
-                runOnEdt { LOG.warn("heview: failed to persist comment $uuid") }
-            }
-        }
+        runIo { writeAtomically(uuid, json) }
     }
 
     fun get(uuid: String): HeviewComment? = index[uuid]
@@ -75,18 +71,14 @@ class CommentStore(
         if (!index.containsKey(uuid)) return
         runIo {
             val deleted = try {
+                // A file that is already absent (e.g. consumed by a hook) counts as success.
                 Files.deleteIfExists(fileFor(uuid))
                 true
             } catch (e: IOException) {
+                LOG.warn("heview: failed to delete comment $uuid; keeping it visible", e)
                 false
             }
-            runOnEdt {
-                if (deleted) {
-                    if (index.remove(uuid) != null) fireChanged()
-                } else {
-                    LOG.warn("heview: failed to delete comment $uuid; keeping it visible")
-                }
-            }
+            if (deleted) runOnEdt { if (index.remove(uuid) != null) fireChanged() }
         }
     }
 
@@ -94,14 +86,20 @@ class CommentStore(
     private fun writeAtomically(uuid: String, json: String): Boolean = try {
         Files.createDirectories(commentsDir)
         val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
-        Files.writeString(tmp, json)
         try {
-            Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
-        } catch (e: AtomicMoveNotSupportedException) {
-            Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
+            Files.writeString(tmp, json)
+            try {
+                Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
+            } catch (e: AtomicMoveNotSupportedException) {
+                Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } catch (e: IOException) {
+            Files.deleteIfExists(tmp) // don't leak a stray .json.tmp into the shared pool
+            throw e
         }
         true
     } catch (e: IOException) {
+        LOG.warn("heview: failed to persist comment $uuid", e)
         false
     }
 

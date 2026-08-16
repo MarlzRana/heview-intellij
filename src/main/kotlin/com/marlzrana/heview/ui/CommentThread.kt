@@ -24,9 +24,10 @@ import javax.swing.JPanel
  *
  * Phase 1 covers the create → display → delete loop: [startCompose] shows an empty compose card;
  * Submit calls [onSubmit] (which persists and returns the stored record) and flips to display mode;
- * Delete calls [onDelete] and removes the inlay; Cancel discards. [onDispose] runs whenever the card
- * is torn down (Cancel/Delete), letting the caller release any resources it owns. Replies / edit /
- * re-pend and the consumption watcher arrive in later increments.
+ * Delete calls [onDelete] and removes the inlay; Cancel discards. [onDispose] is registered on the
+ * inlay, so it runs on *any* teardown — Cancel/Delete or the platform disposing the inlay when the
+ * editor closes — letting the caller release resources it owns (e.g. the line anchor). Replies /
+ * edit / re-pend and the consumption watcher arrive in later increments.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -41,24 +42,28 @@ internal class CommentThread(
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
     private var inlay: Disposable? = null
+    private var disposed = false
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(): Boolean {
         val input = renderCompose()
-        inlay = host.addCardBelow(lineEndOffset, panel) ?: return false
+        val placed = host.addCardBelow(lineEndOffset, panel) ?: return false
+        inlay = placed
+        // Run onDispose on any teardown, including the platform disposing the inlay on editor close.
+        Disposer.register(placed, Disposable { onDispose() })
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
-        // and realized (next EDT tick). The expiry guard prevents focusing a disposed component if
-        // the project closes or the card is torn down before the tick runs.
+        // and realized (next EDT tick), guarded so we never focus a torn-down card or closed project.
         ApplicationManager.getApplication().invokeLater(
-            { IdeFocusManager.getInstance(project).requestFocus(input, true) },
+            { if (!disposed) IdeFocusManager.getInstance(project).requestFocus(input, true) },
             project.disposed,
         )
         return true
     }
 
     private fun dispose() {
-        onDispose()
-        inlay?.let { Disposer.dispose(it) }
+        if (disposed) return
+        disposed = true
+        inlay?.let { Disposer.dispose(it) } // triggers the registered onDispose
         inlay = null
     }
 
@@ -74,8 +79,9 @@ internal class CommentThread(
         }
         val submit = JButton("Submit").apply {
             addActionListener {
-                val text = input.text.trim()
-                if (text.isNotEmpty()) renderDisplay(onSubmit(text))
+                val text = input.text
+                // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
+                if (text.isNotBlank()) renderDisplay(onSubmit(text))
             }
         }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
@@ -98,12 +104,16 @@ internal class CommentThread(
             border = null
         }
         val delete = JButton("Delete").apply {
+            // Start disabled so a double-click on Submit doesn't land on the relocated Delete button;
+            // re-enabled after the current event burst.
+            isEnabled = false
             addActionListener {
                 onDelete(current)
                 dispose()
             }
         }
         setContent(center = body, south = buttonRow(delete), north = header)
+        ApplicationManager.getApplication().invokeLater({ delete.isEnabled = true }, project.disposed)
     }
 
     private fun buttonRow(vararg buttons: JButton): JPanel =

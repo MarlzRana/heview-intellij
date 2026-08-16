@@ -48,6 +48,11 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
 - Root is `~/.heview/` (not `~/.reviewa/v1/`); per-agent hook dirs; `heview` marker.
 - `workspace` is the IntelliJ project base path — a v1 approximation of reviewa's git-repo root.
   Hooks match by `abs_path`/`logical_abs_path` prefix (not `workspace`), so injection is unaffected.
+- Persistence is **asynchronous / off the EDT** (the IntelliJ platform forbids blocking I/O on the
+  EDT); reviewa writes synchronously. Writes are atomic (tmp→rename) and complete in ms, so the
+  file is on disk long before a human can switch to a terminal and prompt an agent.
+- `line_content` is captured from the editor buffer at submit (what the user sees); reviewa reads
+  it from disk for `file://` URIs.
 - The VS Code plugin is NOT being updated yet — parity means matching reviewa's *semantics/contract*,
   never calling into it.
 

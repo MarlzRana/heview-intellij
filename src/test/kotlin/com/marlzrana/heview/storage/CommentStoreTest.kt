@@ -69,6 +69,24 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `delete of an already-consumed (absent) file still drops the record`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        Files.delete(dir.resolve("u1.json")) // simulate a coding-agent hook consuming it
+        store.delete("u1")
+        assertNull(store.get("u1"))
+    }
+
+    @Test
+    fun `upsert replaces the on-disk file`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", status = CommentStatus.PENDING))
+        store.save(sampleComment(uuid = "u1", status = CommentStatus.PROCESSED))
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(CommentStatus.PROCESSED, onDisk.status)
+    }
+
+    @Test
     fun `delete of an unknown uuid is a no-op and fires no change`(@TempDir dir: Path) {
         val store = store(dir)
         var count = 0
