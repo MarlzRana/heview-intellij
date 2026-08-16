@@ -20,6 +20,14 @@ object HeviewPaths {
     /** The shared comment pool — one `<uuid>.json` per thread, consumed first-come across agents. */
     val commentsDir: Path = root.resolve("comments")
 
+    /**
+     * Where an agent hook MOVES a comment file when it consumes it (Phase 3), instead of unlinking it —
+     * the intent signal the consumption watcher reads to mark a thread *Seen* (a bare vanish from
+     * [commentsDir] is a peer/user delete instead). Nested under [commentsDir]; the pool's `*.json` glob
+     * skips this subdirectory so hydration and the injectors never treat consumed files as pending.
+     */
+    val consumedDir: Path = commentsDir.resolve("consumed")
+
     /** Per-agent hook script dirs heview owns and extracts into (plan.html §4). */
     val claudeCodeHooksDir: Path = root.resolve("claude-code").resolve("hooks")
     val codexHooksDir: Path = root.resolve("codex").resolve("hooks")

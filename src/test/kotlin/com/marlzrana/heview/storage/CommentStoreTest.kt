@@ -344,4 +344,61 @@ class CommentStoreTest {
             dir.toFile().setWritable(true)
         }
     }
+
+    @Test
+    fun `markProcessed flips status in memory, fires, and does not rewrite the pool file`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1")) // persists status=pending
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.markProcessed("u1")
+
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status) // Seen, still indexed
+        assertEquals(1, fires)
+        // The consumption watcher marks Seen AFTER the hook already moved the file out of the pool; a
+        // rewrite here would resurrect an injectable duplicate. The on-disk file is left untouched.
+        assertEquals(CommentStatus.PENDING, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).status)
+    }
+
+    @Test
+    fun `markProcessed is a no-op for an unknown or already-processed comment`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        store.markProcessed("u1")
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.markProcessed("u1")     // already processed
+        store.markProcessed("ghost")  // never existed
+
+        assertEquals(0, fires)
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
+    }
+
+    @Test
+    fun `evict drops the record and fires without unlinking the file`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.evict("u1")
+
+        assertNull(store.get("u1"))
+        assertEquals(1, fires)
+        // A peer/user already removed the pool file; evict must not schedule its own delete (unlike delete()).
+        assertTrue(Files.exists(dir.resolve("u1.json")))
+    }
+
+    @Test
+    fun `evict is a no-op for an unknown uuid so a self-delete stays idempotent`(@TempDir dir: Path) {
+        val store = store(dir)
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.evict("ghost")
+
+        assertEquals(0, fires)
+    }
 }

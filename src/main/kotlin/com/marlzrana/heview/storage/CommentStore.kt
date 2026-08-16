@@ -151,6 +151,31 @@ class CommentStore(
 
     fun processedCount(): Int = index.values.count { it.status == CommentStatus.PROCESSED }
 
+    /**
+     * Flip a comment to [CommentStatus.PROCESSED] in memory (the "Seen" state) and fire — for the
+     * consumption watcher, when an agent hook has consumed the file (moved it into `consumed/`).
+     *
+     * Deliberately does NOT persist: a processed comment is not written to the pool (plan.html §5), and
+     * its file has already left `comments/`, so re-saving here would resurrect an injectable duplicate.
+     * No-op if the uuid is unknown or already processed.
+     */
+    fun markProcessed(uuid: String) {
+        val current = index[uuid] ?: return
+        if (current.status == CommentStatus.PROCESSED) return
+        index[uuid] = current.copy(status = CommentStatus.PROCESSED)
+        fireChanged()
+    }
+
+    /**
+     * Drop a record from the index and fire, WITHOUT touching disk — for the watcher when a comment's
+     * file simply vanished from the pool (a peer/user delete), where there is nothing left to unlink.
+     * No-op if the uuid is unknown (so a self-[delete] the watcher later observes is idempotent).
+     */
+    fun evict(uuid: String) {
+        if (index.remove(uuid) == null) return
+        fireChanged()
+    }
+
     /** Drop the record and fire immediately; unlink the file best-effort in the background. */
     fun delete(uuid: String) {
         if (index.remove(uuid) == null) return

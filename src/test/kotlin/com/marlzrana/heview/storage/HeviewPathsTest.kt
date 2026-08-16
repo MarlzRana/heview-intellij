@@ -11,4 +11,11 @@ class HeviewPathsTest {
         assertEquals(expectedRoot, HeviewPaths.root)
         assertEquals(expectedRoot.resolve("comments"), HeviewPaths.commentsDir)
     }
+
+    @Test
+    fun `consumed dir is nested under the comments pool`() {
+        // Nesting matters: the pool's `*.json` glob skips this subdir, so hydration and the injectors
+        // never treat a consumed file as pending (plan.html §4).
+        assertEquals(HeviewPaths.commentsDir.resolve("consumed"), HeviewPaths.consumedDir)
+    }
 }
