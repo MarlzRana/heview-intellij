@@ -27,4 +27,11 @@ class NewCommentTest {
         assertEquals("2026-08-16T00:00:00.000Z", c.createdAt)
         assertNull(c.intendedConsumer)
     }
+
+    @Test
+    fun `line_number is the 0-based editor line plus one`() {
+        assertEquals(1, newFileComment("/w", "/w/a.kt", 0, "", "c", "t").lineNumber)
+        assertEquals(6, newFileComment("/w", "/w/a.kt", 5, "", "c", "t").lineNumber)
+        assertEquals(100, newFileComment("/w", "/w/a.kt", 99, "", "c", "t").lineNumber)
+    }
 }

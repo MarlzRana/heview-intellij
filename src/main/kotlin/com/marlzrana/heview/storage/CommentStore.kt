@@ -70,37 +70,35 @@ class CommentStore(
     fun delete(uuid: String) {
         if (!index.containsKey(uuid)) return
         runIo {
-            val deleted = try {
+            try {
                 // A file that is already absent (e.g. consumed by a hook) counts as success.
                 Files.deleteIfExists(fileFor(uuid))
-                true
+                runOnEdt { if (index.remove(uuid) != null) fireChanged() }
             } catch (e: IOException) {
                 LOG.warn("heview: failed to delete comment $uuid; keeping it visible", e)
-                false
             }
-            if (deleted) runOnEdt { if (index.remove(uuid) != null) fireChanged() }
         }
     }
 
     /** Write to a temp file in the same directory, then atomically move it over the target. */
-    private fun writeAtomically(uuid: String, json: String): Boolean = try {
-        Files.createDirectories(commentsDir)
-        val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
+    private fun writeAtomically(uuid: String, json: String) {
         try {
-            Files.writeString(tmp, json)
+            Files.createDirectories(commentsDir)
+            val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
             try {
-                Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
-            } catch (e: AtomicMoveNotSupportedException) {
-                Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
+                Files.writeString(tmp, json)
+                try {
+                    Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
+                } catch (e: AtomicMoveNotSupportedException) {
+                    Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
+                }
+            } catch (e: IOException) {
+                Files.deleteIfExists(tmp) // don't leak a stray .json.tmp into the shared pool
+                throw e
             }
         } catch (e: IOException) {
-            Files.deleteIfExists(tmp) // don't leak a stray .json.tmp into the shared pool
-            throw e
+            LOG.warn("heview: failed to persist comment $uuid", e)
         }
-        true
-    } catch (e: IOException) {
-        LOG.warn("heview: failed to persist comment $uuid", e)
-        false
     }
 
     companion object {

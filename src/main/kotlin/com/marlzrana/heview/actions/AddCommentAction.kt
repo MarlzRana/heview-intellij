@@ -79,6 +79,8 @@ internal class AddCommentAction : AnAction() {
         )
 
         if (!thread.startCompose()) {
+            // No inlay was placed, so onDispose never runs — release the anchor here.
+            if (anchor.isValid) anchor.dispose()
             thisLogger().warn("heview: inline comments are not available in this editor")
         }
     }

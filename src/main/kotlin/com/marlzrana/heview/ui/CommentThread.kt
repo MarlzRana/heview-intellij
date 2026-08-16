@@ -113,7 +113,10 @@ internal class CommentThread(
             }
         }
         setContent(center = body, south = buttonRow(delete), north = header)
-        ApplicationManager.getApplication().invokeLater({ delete.isEnabled = true }, project.disposed)
+        ApplicationManager.getApplication().invokeLater(
+            { if (!disposed) delete.isEnabled = true },
+            project.disposed,
+        )
     }
 
     private fun buttonRow(vararg buttons: JButton): JPanel =

@@ -5,16 +5,32 @@ import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.sampleComment
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 
 class CommentStoreTest {
     // Synchronous executors so the async disk path runs inline and deterministically in tests.
     private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runOnEdt = { it.run() })
+
+    /** Make [dir] non-writable; skip the test if the platform doesn't enforce it (e.g. running as root). */
+    private fun makeReadOnlyOrSkip(dir: Path) {
+        dir.toFile().setWritable(false)
+        val enforced = try {
+            Files.createFile(dir.resolve(".probe"))
+            Files.deleteIfExists(dir.resolve(".probe"))
+            false
+        } catch (e: IOException) {
+            true
+        }
+        assumeTrue(enforced, "read-only directory not enforced (running as root?)")
+    }
 
     @Test
     fun `save writes a file and indexes the record`(@TempDir dir: Path) {
@@ -103,5 +119,33 @@ class CommentStoreTest {
         store.save(sampleComment(uuid = "u1"))
         store.delete("u1")
         assertEquals(2, count)
+    }
+
+    @Test
+    fun `save retains the record and writes nothing when the directory is not writable`(@TempDir dir: Path) {
+        val ro = Files.createDirectories(dir.resolve("ro"))
+        makeReadOnlyOrSkip(ro)
+        try {
+            val store = store(ro)
+            store.save(sampleComment(uuid = "u1"))
+            assertNotNull(store.get("u1"))                       // record retained in memory
+            assertFalse(Files.exists(ro.resolve("u1.json")))     // nothing persisted
+            Files.list(ro).use { assertEquals(0L, it.count()) }  // no stray .json.tmp left behind
+        } finally {
+            ro.toFile().setWritable(true)
+        }
+    }
+
+    @Test
+    fun `delete keeps the record visible when the file cannot be deleted`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        makeReadOnlyOrSkip(dir)
+        try {
+            store.delete("u1")
+            assertNotNull(store.get("u1"))
+        } finally {
+            dir.toFile().setWritable(true)
+        }
     }
 }
