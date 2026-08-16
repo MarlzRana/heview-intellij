@@ -44,8 +44,13 @@ class HookInstaller(
     fun installAll() {
         val claudeExtracted = extractClaudeCodeScripts()
         val codexExtracted = extractCodexScripts()
-        if (claudeExtracted && hasCli("claude")) registerClaudeCode()
-        if (codexExtracted && hasCli("codex")) registerCodex()
+        // Isolate each agent so one's registration failure can't skip the other.
+        if (claudeExtracted && hasCli("claude")) {
+            runCatching { registerClaudeCode() }.onFailure { LOG.warn("heview: Claude Code hook registration failed", it) }
+        }
+        if (codexExtracted && hasCli("codex")) {
+            runCatching { registerCodex() }.onFailure { LOG.warn("heview: Codex hook registration failed", it) }
+        }
     }
 
     /** True if [name] resolves to an executable on `PATH` (a `which`-equivalent, no subprocess). */
@@ -86,10 +91,20 @@ class HookInstaller(
      */
     private fun registerUserPromptSubmit(configPath: Path, command: String, marker: String) {
         val root = loadConfigForEdit(configPath) ?: return // present-but-unparseable → leave it untouched
-        val hooks = root.get("hooks")?.takeIf { it.isJsonObject }?.asJsonObject
-            ?: JsonObject().also { root.add("hooks", it) }
-        val entries = hooks.get("UserPromptSubmit")?.takeIf { it.isJsonArray }?.asJsonArray
-            ?: JsonArray().also { hooks.add("UserPromptSubmit", it) }
+
+        // Only create MISSING members; if an existing member has an unexpected type, leave the file
+        // untouched rather than overwriting the user's data.
+        val hooksElem = root.get("hooks")
+        if (hooksElem != null && !hooksElem.isJsonObject) {
+            warn("heview: ${configPath} has a non-object 'hooks'; leaving it untouched."); return
+        }
+        val hooks = hooksElem?.asJsonObject ?: JsonObject().also { root.add("hooks", it) }
+
+        val entriesElem = hooks.get("UserPromptSubmit")
+        if (entriesElem != null && !entriesElem.isJsonArray) {
+            warn("heview: ${configPath} has a non-array 'hooks.UserPromptSubmit'; leaving it untouched."); return
+        }
+        val entries = entriesElem?.asJsonArray ?: JsonArray().also { hooks.add("UserPromptSubmit", it) }
 
         val alreadyRegistered = entries.any { entry ->
             val inner = entry.takeIf { it.isJsonObject }?.asJsonObject
@@ -112,20 +127,30 @@ class HookInstaller(
     }
 
     /**
-     * Ensure `[features] codex_hooks = true` in `~/.codex/config.toml`, preserving the rest of the
-     * file via string edits (no TOML library). Warns if the user has it explicitly `false`.
+     * Ensure `[features] hooks = true` in `~/.codex/config.toml` (the canonical key; `codex_hooks` is a
+     * deprecated alias Codex still honors), preserving the rest of the file via string edits — no TOML
+     * library. Warns if the user has hooks explicitly `false`. On a read failure other than "absent"
+     * (permissions, non-UTF-8) it leaves the file untouched; if `features` exists only as an inline/dotted
+     * key it can't safely edit, it warns rather than appending a conflicting table.
      */
     private fun ensureCodexHooksEnabled() {
         val content = try {
             Files.readString(codexConfigToml)
+        } catch (e: NoSuchFileException) {
+            writeAtomically(codexConfigToml, "[features]\nhooks = true\n")
+            return
         } catch (e: IOException) {
-            writeAtomically(codexConfigToml, "[features]\ncodex_hooks = true\n")
+            warn("heview: could not read ~/.codex/config.toml; leaving it untouched. Set [features].hooks = true for Codex hooks.")
             return
         }
 
         val features = FEATURES_HEADER.find(content)
         if (features == null) {
-            writeAtomically(codexConfigToml, content.trimEnd() + "\n\n[features]\ncodex_hooks = true\n")
+            if (FEATURES_INLINE_KEY.containsMatchIn(content)) {
+                warn("heview: ~/.codex/config.toml defines `features` inline; set [features].hooks = true manually for Codex hooks.")
+                return
+            }
+            writeAtomically(codexConfigToml, content.trimEnd() + "\n\n[features]\nhooks = true\n")
             return
         }
 
@@ -139,10 +164,10 @@ class HookInstaller(
         when {
             hooksFlag == null ->
                 // Insert right after the matched header, preserving the user's exact header text.
-                writeAtomically(codexConfigToml, content.substring(0, headerEnd) + "\ncodex_hooks = true" + content.substring(headerEnd))
-            hooksFlag.groupValues[1] == "false" ->
-                warn("Codex hooks are disabled (codex_hooks = false in ~/.codex/config.toml); heview's Codex integration won't run until it's true.")
-            // already true → nothing to do
+                writeAtomically(codexConfigToml, content.substring(0, headerEnd) + "\nhooks = true" + content.substring(headerEnd))
+            hooksFlag.groupValues[2] == "false" ->
+                warn("heview: Codex hooks are disabled (${hooksFlag.groupValues[1]} = false in ~/.codex/config.toml); set it true for heview's Codex integration.")
+            // already true (via `hooks` or the deprecated `codex_hooks`) → nothing to do
         }
     }
 
@@ -203,8 +228,19 @@ class HookInstaller(
      * that, leaving the symlink itself in place rather than replacing it with a regular file.
      */
     private fun writeAtomically(path: Path, text: String) {
-        Files.createDirectories(path.parent)
-        val target = if (Files.exists(path)) path.toRealPath() else path
+        val target = try {
+            when {
+                // A live symlink (dotfiles) → write through to its real target, preserving the link.
+                Files.isSymbolicLink(path) -> path.toRealPath()
+                Files.exists(path) -> path.toRealPath()
+                else -> path
+            }
+        } catch (e: IOException) {
+            // A dangling symlink: toRealPath throws → don't replace the link with a regular file.
+            warn("heview: ${path} is a broken symlink; leaving it untouched.")
+            return
+        }
+        Files.createDirectories(target.parent)
         val tmp = Files.createTempFile(target.parent, target.fileName.toString(), ".tmp")
         try {
             Files.writeString(tmp, text)
@@ -231,6 +267,11 @@ class HookInstaller(
         // appending a duplicate one (which would make config.toml invalid).
         private val FEATURES_HEADER = Regex("^\\s*\\[\\s*features\\s*\\]", RegexOption.MULTILINE)
         private val SECTION_HEADER = Regex("^\\s*\\[", RegexOption.MULTILINE)
-        private val CODEX_HOOKS_FLAG = Regex("^\\s*codex_hooks\\s*=\\s*(true|false)", RegexOption.MULTILINE)
+        // A `features` inline table / dotted key (no [features] header) we cannot safely edit by hand.
+        private val FEATURES_INLINE_KEY = Regex("^\\s*\"?features\"?\\s*[.=]", RegexOption.MULTILINE)
+        // group(1) = the key (canonical `hooks` or deprecated `codex_hooks`, optionally quoted);
+        // group(2) = its boolean value. Matches either key so an explicit `false` is detected.
+        private val CODEX_HOOKS_FLAG =
+            Regex("^\\s*\"?(codex_hooks|hooks)\"?\\s*=\\s*(true|false)", RegexOption.MULTILINE)
     }
 }

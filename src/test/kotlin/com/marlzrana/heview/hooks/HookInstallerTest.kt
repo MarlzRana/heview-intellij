@@ -136,15 +136,16 @@ class HookInstallerTest {
     }
 
     @Test
-    fun `registerCodex enables codex_hooks and registers a python3 hook, idempotently`(@TempDir dir: Path) {
+    fun `registerCodex enables the canonical hooks flag and registers a python3 hook, idempotently`(@TempDir dir: Path) {
         val inst = installer(dir)
         inst.registerCodex()
         inst.registerCodex() // second call must not duplicate anything
         val toml = Files.readString(dir.resolve("dot-codex/config.toml"))
         assertTrue(toml.contains("[features]"))
-        assertTrue(toml.contains("codex_hooks = true"))
+        assertTrue(Regex("(?m)^hooks = true$").containsMatchIn(toml)) // canonical key, not codex_hooks
+        assertFalse(toml.contains("codex_hooks")) // deprecated alias is not written
         assertEquals(1, Regex("\\[features\\]").findAll(toml).count()) // no duplicate section
-        assertEquals(1, Regex("codex_hooks").findAll(toml).count()) // no duplicate flag
+        assertEquals(1, Regex("(?m)^\\s*hooks\\s*=").findAll(toml).count()) // no duplicate flag
         val hooksJson = dir.resolve("dot-codex/hooks.json")
         assertEquals(1, userPromptSubmitSize(hooksJson)) // no double-register
         val cmd = soleCommand(hooksJson)
@@ -172,29 +173,44 @@ class HookInstallerTest {
         installer(dir).registerCodex()
         val out = Files.readString(toml)
         assertTrue(out.contains("[model]") && out.contains("name = \"gpt\"")) // preserved
-        assertTrue(out.contains("[features]") && out.contains("codex_hooks = true"))
+        assertTrue(out.contains("[features]") && Regex("(?m)^hooks = true$").containsMatchIn(out))
     }
 
     @Test
-    fun `registerCodex inserts codex_hooks into an existing features section`(@TempDir dir: Path) {
+    fun `registerCodex inserts the hooks flag into an existing features section`(@TempDir dir: Path) {
         val toml = dir.resolve("dot-codex/config.toml")
         Files.createDirectories(toml.parent)
         Files.writeString(toml, "[features]\nother_flag = true\n")
         installer(dir).registerCodex()
         val out = Files.readString(toml)
         assertTrue(out.contains("other_flag = true")) // preserved
-        assertTrue(out.contains("codex_hooks = true"))
+        assertTrue(Regex("(?m)^hooks = true$").containsMatchIn(out))
     }
 
     @Test
-    fun `registerCodex warns and does not flip an explicit codex_hooks false`(@TempDir dir: Path) {
+    fun `registerCodex warns and does not flip an explicit hooks false (and the deprecated codex_hooks false)`(@TempDir dir: Path) {
+        for (line in listOf("hooks = false", "codex_hooks = false")) {
+            val toml = dir.resolve("dot-codex/config.toml")
+            Files.createDirectories(toml.parent)
+            Files.writeString(toml, "[features]\n$line\n")
+            val warnings = mutableListOf<String>()
+            installer(dir, warn = { warnings.add(it) }).registerCodex()
+            assertEquals(1, warnings.size, "expected a warning for $line")
+            assertTrue(Files.readString(toml).contains(line)) // left as the user set it
+            Files.deleteIfExists(dir.resolve("dot-codex/hooks.json")) // reset for the next iteration
+        }
+    }
+
+    @Test
+    fun `registerCodex refuses to append when features exists only as an inline table`(@TempDir dir: Path) {
         val toml = dir.resolve("dot-codex/config.toml")
         Files.createDirectories(toml.parent)
-        Files.writeString(toml, "[features]\ncodex_hooks = false\n")
+        val original = "features = { other = 1 }\n"
+        Files.writeString(toml, original)
         val warnings = mutableListOf<String>()
         installer(dir, warn = { warnings.add(it) }).registerCodex()
+        assertEquals(original, Files.readString(toml)) // not corrupted with a duplicate [features] table
         assertEquals(1, warnings.size)
-        assertTrue(Files.readString(toml).contains("codex_hooks = false")) // left as the user set it
     }
 
     @Test
@@ -212,15 +228,15 @@ class HookInstallerTest {
     }
 
     @Test
-    fun `registerCodex inserts codex_hooks in features, not fooled by a false flag in another section`(@TempDir dir: Path) {
+    fun `registerCodex inserts the hooks flag in features, not fooled by a false flag in another section`(@TempDir dir: Path) {
         val toml = dir.resolve("dot-codex/config.toml")
         Files.createDirectories(toml.parent)
-        Files.writeString(toml, "[features]\nother = 1\n\n[sandbox]\ncodex_hooks = false\n")
+        Files.writeString(toml, "[features]\nother = 1\n\n[sandbox]\nhooks = false\n")
         val warnings = mutableListOf<String>()
         installer(dir, warn = { warnings.add(it) }).registerCodex()
         val out = Files.readString(toml)
-        assertTrue(out.contains("codex_hooks = true")) // inserted into [features]
-        assertTrue(out.contains("[sandbox]\ncodex_hooks = false")) // the other section is untouched
+        assertTrue(Regex("(?m)^hooks = true$").containsMatchIn(out)) // inserted into [features]
+        assertTrue(out.contains("[sandbox]\nhooks = false")) // the other section is untouched
         assertEquals(0, warnings.size) // the [sandbox] false must not trigger the warning
     }
 
@@ -232,6 +248,71 @@ class HookInstallerTest {
         installer(dir).registerCodex()
         val out = Files.readString(toml)
         assertEquals(1, Regex("(?m)^\\s*\\[\\s*features\\s*\\]").findAll(out).count()) // no duplicate table
-        assertTrue(out.contains("codex_hooks = true"))
+        assertTrue(Regex("(?m)^hooks = true$").containsMatchIn(out))
+    }
+
+    @Test
+    fun `registration leaves a non-object config untouched`(@TempDir dir: Path) {
+        val settings = dir.resolve("dot-claude/settings.json")
+        Files.createDirectories(settings.parent)
+        val original = "[]" // valid JSON, but the root is an array, not an object
+        Files.writeString(settings, original)
+        val warnings = mutableListOf<String>()
+        installer(dir, warn = { warnings.add(it) }).registerClaudeCode()
+        assertEquals(original, Files.readString(settings)) // not clobbered
+        assertEquals(1, warnings.size)
+    }
+
+    @Test
+    fun `registration leaves a config whose hooks value is the wrong type untouched`(@TempDir dir: Path) {
+        val settings = dir.resolve("dot-claude/settings.json")
+        Files.createDirectories(settings.parent)
+        val original = """{"hooks":"nope"}""" // hooks present but a string, not an object
+        Files.writeString(settings, original)
+        val warnings = mutableListOf<String>()
+        installer(dir, warn = { warnings.add(it) }).registerClaudeCode()
+        assertEquals(original, Files.readString(settings)) // user's hooks value preserved
+        assertEquals(1, warnings.size)
+    }
+
+    @Test
+    fun `registerClaudeCode preserves a sibling PreToolUse hook event`(@TempDir dir: Path) {
+        val settings = dir.resolve("dot-claude/settings.json")
+        Files.createDirectories(settings.parent)
+        Files.writeString(
+            settings,
+            """{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"bash /x.sh"}]}]}}""",
+        )
+        installer(dir).registerClaudeCode()
+        val hooks = JsonParser.parseString(Files.readString(settings)).asJsonObject.getAsJsonObject("hooks")
+        assertTrue(hooks.has("PreToolUse")) // sibling event preserved
+        assertEquals(1, hooks.getAsJsonArray("UserPromptSubmit").size())
+    }
+
+    @Test
+    fun `registerClaudeCode writes a well-formed hook object with type command and a timeout`(@TempDir dir: Path) {
+        installer(dir).registerClaudeCode()
+        val root = JsonParser.parseString(Files.readString(dir.resolve("dot-claude/settings.json"))).asJsonObject
+        val hook = root.getAsJsonObject("hooks").getAsJsonArray("UserPromptSubmit")[0]
+            .asJsonObject.getAsJsonArray("hooks")[0].asJsonObject
+        assertEquals("command", hook.get("type").asString)
+        assertEquals(10, hook.get("timeout").asInt)
+    }
+
+    @Test
+    fun `writeAtomically preserves a symlinked settings file`(@TempDir dir: Path) {
+        val real = dir.resolve("store/settings.json")
+        Files.createDirectories(real.parent)
+        Files.writeString(real, """{"model":"opus"}""")
+        val link = dir.resolve("dot-claude/settings.json")
+        Files.createDirectories(link.parent)
+        Files.createSymbolicLink(link, real)
+
+        installer(dir).registerClaudeCode()
+
+        assertTrue(Files.isSymbolicLink(link)) // link preserved, not replaced by a regular file
+        val root = JsonParser.parseString(Files.readString(real)).asJsonObject // written through the link
+        assertEquals("opus", root.get("model").asString) // unrelated content kept
+        assertEquals(1, root.getAsJsonObject("hooks").getAsJsonArray("UserPromptSubmit").size())
     }
 }
