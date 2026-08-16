@@ -187,9 +187,14 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             retireAnchorIfUnused(uuid)
         }
 
-        // Add cards for comments not yet shown in this editor.
+        // Add cards for comments not yet shown; refresh a shown card whose comment changed in place
+        // (e.g. the consumption watcher flipping a comment to PROCESSED → the card relabels to "Seen").
         for ((uuid, comment) in desired) {
-            if (cards.containsKey(uuid)) continue
+            val existing = cards[uuid]
+            if (existing != null) {
+                existing.refreshDisplay(comment)
+                continue
+            }
             displayThread(editor, comment)?.let { cards[uuid] = it }
         }
     }

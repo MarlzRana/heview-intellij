@@ -35,17 +35,19 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
     private val hosts = HashMap<Editor, RecordingHost>()
     private val openedEditors = mutableListOf<Editor>()
 
-    /** A host that counts live cards (and records the last placement offset) for one editor. */
+    /** A host that counts live cards (and records the last placement offset + card) for one editor. */
     private class RecordingHost : InlayCardHost {
         var live = 0
             private set
         var lastOffset = -1
             private set
         private var last: Disposable? = null
+        private var card: JComponent? = null
 
         override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable {
             live++
             lastOffset = lineEndOffset
+            this.card = card
             return Disposable { live-- }.also { last = it }
         }
 
@@ -53,6 +55,14 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
         /** Simulate the platform disposing the most recently placed inlay (e.g. its text was deleted). */
         fun disposeLastReturned() = last?.let { Disposer.dispose(it) } ?: Unit
+
+        /** All JLabel texts in the placed card — used to assert the Pending/Seen status chip. */
+        fun labelTexts(): List<String> = card?.let(::collectLabelTexts) ?: emptyList()
+
+        private fun collectLabelTexts(c: java.awt.Component): List<String> = buildList {
+            if (c is javax.swing.JLabel) c.text?.let { add(it) }
+            if (c is java.awt.Container) c.components.forEach { addAll(collectLabelTexts(it)) }
+        }
     }
 
     /** A host that always declines placement (addComponentInlay returning null). */
@@ -225,6 +235,24 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
         assertNull(manager.compose(e1)) // compose also returns null when placement is declined
         assertEquals(0, manager.anchorCountForTest()) // no leaked RangeMarker on the unplaceable path
+    }
+
+    fun testMarkingProcessedRelabelsTheCardToSeenInPlace() {
+        val (e1, path) = openLocalEditor("M.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "please fix")
+        store.save(comment)
+        manager.init()
+        val host = hosts.getValue(e1)
+        assertEquals(1, host.live)
+        assertTrue(host.labelTexts().contains("Pending"))
+        assertFalse(host.labelTexts().contains("Seen"))
+
+        // The consumption watcher's Seen flip: markProcessed fires a store change → reconcile →
+        // refreshDisplay updates the existing card in place (no remove, no duplicate).
+        store.markProcessed(comment.uuid)
+        assertEquals(1, host.live)
+        assertTrue(host.labelTexts().contains("Seen"))
+        assertFalse(host.labelTexts().contains("Pending"))
     }
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0

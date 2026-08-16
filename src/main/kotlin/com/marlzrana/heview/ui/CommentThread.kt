@@ -11,6 +11,7 @@ import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextArea
 import com.intellij.util.ui.JBUI
+import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
 import org.jetbrains.annotations.TestOnly
 import java.awt.BorderLayout
@@ -35,8 +36,11 @@ import javax.swing.JPanel
  * [onDispose] is registered on the inlay, so it runs on *any* teardown — Cancel/Delete or the
  * platform disposing the inlay when the editor closes — letting the caller release resources it
  * owns (e.g. the line anchor) and drop its bookkeeping. It receives this thread so the owner can
- * identify which card was torn down. Replies / edit / re-pend and the consumption watcher arrive in
- * later increments.
+ * identify which card was torn down.
+ *
+ * A display card shows its comment's status (Pending / Seen); [refreshDisplay] re-renders it in place
+ * when the underlying comment changes — how the consumption watcher's PENDING→PROCESSED "Seen" flip
+ * reaches an already-open card. Replies / edit / re-pend arrive in later increments.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -52,6 +56,9 @@ internal class CommentThread(
     private var inlay: Disposable? = null
     private var disposed = false
     private var composeSubmit: ((text: String) -> HeviewComment)? = null
+    // The comment this card currently shows in display mode; null while composing. Lets refreshDisplay
+    // skip a no-op re-render and lets the compose→submit path own the first display render itself.
+    private var displayed: HeviewComment? = null
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(onSubmit: (text: String) -> HeviewComment): Boolean {
@@ -71,6 +78,19 @@ internal class CommentThread(
     fun startDisplay(comment: HeviewComment): Boolean {
         renderDisplay(comment)
         return place()
+    }
+
+    /**
+     * Re-render this card if [comment] differs from what it currently shows — e.g. the consumption
+     * watcher flipping PENDING→PROCESSED ("Seen"). No-op while still composing (nothing displayed yet,
+     * so the submit path owns the first render) or when the comment is unchanged, so steady-state
+     * reconciles and the compose→submit sequence never needlessly rebuild the card.
+     */
+    fun refreshDisplay(comment: HeviewComment) {
+        if (disposed) return
+        val shown = displayed ?: return
+        if (shown == comment) return
+        renderDisplay(comment)
     }
 
     /** Insert the card below the target line and wire teardown. Returns false if the host declines. */
@@ -126,9 +146,10 @@ internal class CommentThread(
     internal fun submitForTest(text: String) = submit(text)
 
     private fun renderDisplay(current: HeviewComment) {
+        displayed = current
         val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
             add(JBLabel(author))
-            add(JBLabel("Pending").apply { foreground = JBColor.ORANGE })
+            add(statusLabel(current.status))
         }
         val body = JBTextArea(current.content).apply {
             isEditable = false
@@ -153,6 +174,12 @@ internal class CommentThread(
             { if (!disposed) delete.isEnabled = true },
             project.disposed,
         )
+    }
+
+    /** The status chip in the card header — orange "Pending" (actionable) vs green "Seen" (consumed). */
+    private fun statusLabel(status: CommentStatus): JBLabel = when (status) {
+        CommentStatus.PENDING -> JBLabel("Pending").apply { foreground = JBColor.ORANGE }
+        CommentStatus.PROCESSED -> JBLabel("Seen").apply { foreground = JBColor.GREEN }
     }
 
     private fun buttonRow(vararg buttons: JButton): JPanel =
