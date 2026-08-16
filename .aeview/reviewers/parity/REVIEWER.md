@@ -53,6 +53,10 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
   file is on disk long before a human can switch to a terminal and prompt an agent.
 - `line_content` is captured from the editor buffer at submit (what the user sees); reviewa reads
   it from disk for `file://` URIs.
+- Blank / whitespace-only submits are dropped (an empty review comment is meaningless); reviewa
+  persists whatever text was typed.
+- Author identity is the OS user (`user.name`, falling back to "You"); reviewa's GitHub identity +
+  avatar is a deferred polish increment (plan.html §9).
 - The VS Code plugin is NOT being updated yet — parity means matching reviewa's *semantics/contract*,
   never calling into it.
 

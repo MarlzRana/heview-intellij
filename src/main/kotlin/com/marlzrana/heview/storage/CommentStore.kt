@@ -6,8 +6,6 @@ import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
 import java.io.IOException
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -81,9 +79,10 @@ class CommentStore(
                 Files.writeString(tmp, json)
                 try {
                     Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
-                } catch (e: AtomicMoveNotSupportedException) {
-                    Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
-                } catch (e: FileAlreadyExistsException) {
+                } catch (e: IOException) {
+                    // ATOMIC_MOVE unsupported, or the target exists on a non-POSIX FS → non-atomic
+                    // replace. On the POSIX targets we support (macOS/Linux) the atomic move already
+                    // replaces, so this fallback is only reached off-platform.
                     Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
                 }
             } catch (e: IOException) {

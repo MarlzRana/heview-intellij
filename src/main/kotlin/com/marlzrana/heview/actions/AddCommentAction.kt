@@ -66,7 +66,6 @@ internal class AddCommentAction : AnAction() {
                 val lineContent = document.getText(
                     TextRange(document.getLineStartOffset(anchorLine), document.getLineEndOffset(anchorLine)),
                 )
-                if (anchor.isValid) anchor.dispose()
                 newFileComment(
                     workspace = workspace,
                     absPath = absPath,

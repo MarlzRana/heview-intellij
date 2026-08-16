@@ -3,6 +3,7 @@ package com.marlzrana.heview.util
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 /**
  * ISO-8601 UTC with exactly three fractional-second digits and a trailing `Z` — the same profile as
@@ -14,7 +15,10 @@ import java.time.format.DateTimeFormatter
  */
 object HeviewTime {
     private val ISO_MILLIS: DateTimeFormatter =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
+        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+            .withZone(ZoneOffset.UTC)
+            // ROOT locale → ASCII digits regardless of the default locale, like Date.toISOString().
+            .withLocale(Locale.ROOT)
 
     fun nowIso(): String = ISO_MILLIS.format(Instant.now())
 
