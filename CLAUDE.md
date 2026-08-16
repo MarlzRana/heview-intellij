@@ -58,11 +58,17 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   reconcile never double-renders the composing editor. `init()` is EDT-only; boot it via the startup activity.
 - `actions/AddCommentAction.kt` — "heview: Add Comment" (editor context menu / Ctrl+Alt+Shift+H); local files only;
   thin trigger that delegates to `CommentInlayManager.compose(editor)`.
-- `hooks/HookInstaller.kt` — Phase 2: extracts the bundled agent hook scripts into `~/.heview/<agent>/hooks/`
-  (overwrite + chmod 0755), detects an agent CLI via a `PATH` scan, and idempotently registers the
-  `UserPromptSubmit` hook in the agent's own config (`~/.claude/settings.json`; `~/.codex/config.toml` +
-  `hooks.json`) — dedup by injector filename, config preserved, atomic writes. All paths/`PATH`/warn sink
-  injectable → unit-tested against temp dirs. Bundled scripts live in `src/main/resources/hook-scripts/`.
+- `hooks/HookInstaller.kt` — Phase 2: **atomically** extracts the bundled agent hook scripts into
+  `~/.heview/<agent>/hooks/` (tmp→chmod→rename), detects an agent CLI via the **login-shell** PATH
+  (`EnvironmentUtil.getValue("PATH")`, not the GUI launch PATH), and registers the `UserPromptSubmit` hook.
+  Claude → idempotent edit of `~/.claude/settings.json` (dedup by injector filename; command shell-quoted).
+  Codex → `~/.codex/hooks.json` entry + `config.toml`: hooks are default-on so it **never edits a present
+  config.toml** (create-if-absent + warn-on-explicit-`false` only). SAFETY: a present-but-unparseable /
+  non-object / wrong-type / non-UTF-8 config is left UNTOUCHED (never clobbered); writes are atomic and
+  follow a symlink to its real target. `installAll()` returns a success Boolean (per-agent isolated) so the
+  startup once-guard can re-arm and retry. All paths/`PATH`/warn injectable → unit-tested against temp dirs.
+  Bundled injector scripts (`src/main/resources/hook-scripts/{claude-code,codex}/`) match by directory
+  boundary + normalize paths, are UTF-8 + null-tolerant, and single-use-`unlink` (→ move-to-`consumed/` in Phase 3).
 - `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and runs
   `HookInstaller.installAll()` on the background coroutine (off-EDT), **once per app** and **skipped in
   unit-test/headless mode** so tests never touch the real `~/.claude` / `~/.codex`.
@@ -100,6 +106,17 @@ context-blind reviewer will keep raising them:
 - v1 field simplifications: `side` always "file"; `logical_abs_path == abs_path`; `workspace` = project
   basePath; `line_content` from the editor buffer at submit; blank/whitespace submits dropped; author is
   the OS user (`user.name`). Gemini CLI support removed entirely. GitHub identity/avatar deferred.
+- Comments are **durable across sessions** (`hydrate()` on startup; no deactivation/project-close purge) —
+  reviewa is session-scoped. Recreated inlays follow a live document `RangeMarker`, not the stored line.
+- Hooks (Phase 2), sanctioned divergences from reviewa — all in plan.html §5/§6 + the parity allowlist:
+  (1) injectors emit **clean backticks** in BOTH scripts (reviewa's Codex `hook.py` has a `\`` escaping
+  bug); (2) cwd match is **directory-boundary** (`== cwd` or `startsWith(cwd+sep)`), not reviewa's raw
+  `startsWith` which steals sibling-repo comments; (3) a **present-but-unparseable agent config is left
+  untouched**, not overwritten fresh; (4) Codex flag is canonical `[features] hooks = true` (`codex_hooks`
+  deprecated) and heview **never edits an existing `config.toml`** (hooks default-on → create-if-absent +
+  warn-on-`false` only). These three (backtick, sibling-prefix, config-wipe) are latent bugs in reviewa too.
+- Phase 3 will switch injector `unlink` → move into `~/.heview/comments/consumed/` so the watcher can tell
+  consumption (→ mark Seen) from a peer/user delete (→ gone); the renamed VS Code plugin shares that contract.
 </settled-decisions>
 
 <review>
@@ -114,17 +131,22 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 </review>
 
 <status>
-Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment (dogfooded + a 3-cycle
-`/aeview-loop` to convergence) + **Phase 2 — agent hooks** (bundle/extract scripts, CLI detection,
-idempotent registration in `~/.claude` + `~/.codex`) are DONE. The end-to-end loop works: an IDE comment
-is injected into Claude Code / Codex on `UserPromptSubmit`. Gate green: 65 tests, build clean.
+Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment + **Phase 2 — agent
+hooks** are DONE — each dogfooded and taken through `/aeview-loop` to convergence. The end-to-end loop is
+**proven live**: a comment left in the IDE is injected into Claude Code / Codex on `UserPromptSubmit` (exact
+plan-§6 block) and its `<uuid>.json` is consumed. Gate green: **85 tests** (JUnit5 unit + a JUnit3/4
+`BasePlatformTestCase` + node/python behavioral hook-script tests), build clean.
 
-Phase 2 is NOT yet dogfooded in `runIde` (running it edits the real `~/.claude`/`~/.codex`) or aeview-reviewed.
+**Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
+The maintainer normally runs pushes — only push when asked.
 
-Recommended next: dogfood Phase 2 end-to-end (add a comment → prompt Claude/Codex → confirm the block is
-injected and the `<uuid>.json` is consumed), then either **Phase 3 — consumption watcher** (a hook deletes a
-comment file → mark the thread *Seen*; generalize to the multi-client pool watcher, plan §5) or the **Phase 1
-reply/edit/re-pend→processed state machine** (also brings the status-aware display label — the card header
-still hard-codes "Pending"). Full backlog (durable-anchor line-number writeback, external-reload listener,
-`CommentJson.decode` validation, GitHub identity, …) in `implementation_log.local.md`.
+Next increment (approved): **Phase 3 — consumption watcher (consumed-dir design).** A NIO watcher on
+`~/.heview/comments/`: a hook that MOVES a consumed file into `~/.heview/comments/consumed/` flips its thread
+to *Seen* (vs a bare vanish = peer/user delete = gone; a UI delete is suppression-set suppressed). This
+delivers the missing "mark Seen" UX (today a consumed comment stays "Pending" live, vanishes on restart) AND
+resolves the deferred single-use race (the atomic rename IS the claim). Ship the hook change with it (all
+injectors `unlink` → move-into-`consumed/`) + a `consumed/` retention policy. Alt: the Phase 1
+reply/edit/re-pend→processed state machine (also the status-aware label — the card header still hard-codes
+"Pending"). Full deferred backlog (Phase-2 items, durable-anchor line-number writeback, external-reload
+listener, `CommentJson.decode` validation, GitHub identity, …) is in `implementation_log.local.md`.
 </status>
