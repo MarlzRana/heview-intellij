@@ -4,10 +4,13 @@ import java.nio.file.Path
 import kotlin.io.path.Path
 
 /**
- * Resolves the shared `~/.heview` on-disk layout (plan.html §4).
+ * Resolves the shared `~/.heview` on-disk layout + the agents' config paths (plan.html §4).
  *
- * Uses the `user.home` system property so the sandbox IDE can be pointed at a throwaway home via
- * `-Duser.home=…` for isolated dogfooding (README / plan.html §11).
+ * Uses the `user.home` system property. NOTE: `-Duser.home=…` only isolates the in-IDE pool/UI and the
+ * files heview *writes* (pool, extracted scripts, registration targets). It does NOT isolate the hook
+ * *loop*: the agent CLIs and the extracted scripts (`.sh` → `$HOME`, Node `os.homedir()`, Python
+ * `expanduser("~")`) resolve the real OS `$HOME` at runtime, so a sandboxed home can't dogfood
+ * end-to-end injection — that always reads/writes the real `~/.heview/comments`.
  */
 object HeviewPaths {
     private val home: Path = Path(System.getProperty("user.home"))

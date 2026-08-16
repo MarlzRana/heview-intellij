@@ -40,17 +40,26 @@ class HookInstaller(
     /**
      * Extract every bundled script (so upgrades always refresh on-disk copies, even for a CLI missing
      * from the GUI PATH), then register an agent only if its script extracted AND its CLI is present.
+     *
+     * @return true if every present agent was fully installed. Each agent is isolated (one failure can't
+     *   skip the other), but a false result lets the caller re-arm its once-guard so a later attempt
+     *   retries after a transient failure.
      */
-    fun installAll() {
+    fun installAll(): Boolean {
         val claudeExtracted = extractClaudeCodeScripts()
         val codexExtracted = extractCodexScripts()
-        // Isolate each agent so one's registration failure can't skip the other.
-        if (claudeExtracted && hasCli("claude")) {
-            runCatching { registerClaudeCode() }.onFailure { LOG.warn("heview: Claude Code hook registration failed", it) }
+        var ok = true
+        if (hasCli("claude")) {
+            ok = claudeExtracted &&
+                runCatching { registerClaudeCode() }.onFailure { LOG.warn("heview: Claude Code hook registration failed", it) }.isSuccess &&
+                ok
         }
-        if (codexExtracted && hasCli("codex")) {
-            runCatching { registerCodex() }.onFailure { LOG.warn("heview: Codex hook registration failed", it) }
+        if (hasCli("codex")) {
+            ok = codexExtracted &&
+                runCatching { registerCodex() }.onFailure { LOG.warn("heview: Codex hook registration failed", it) }.isSuccess &&
+                ok
         }
+        return ok
     }
 
     /** True if [name] resolves to an executable on `PATH` (a `which`-equivalent, no subprocess). */
@@ -127,11 +136,14 @@ class HookInstaller(
     }
 
     /**
-     * Ensure `[features] hooks = true` in `~/.codex/config.toml` (the canonical key; `codex_hooks` is a
-     * deprecated alias Codex still honors), preserving the rest of the file via string edits — no TOML
-     * library. Warns if the user has hooks explicitly `false`. On a read failure other than "absent"
-     * (permissions, non-UTF-8) it leaves the file untouched; if `features` exists only as an inline/dotted
-     * key it can't safely edit, it warns rather than appending a conflicting table.
+     * Codex hooks are **enabled by default**, so heview never edits an *existing* `~/.codex/config.toml`
+     * (robustly editing arbitrary TOML by hand is a corruption risk — duplicate keys, inline tables,
+     * multi-line arrays, invalid syntax). We only:
+     *  - create a minimal `[features] hooks = true` when the file is **absent**, and
+     *  - **warn** (touching nothing) if the user has explicitly turned hooks off (`hooks`/`codex_hooks
+     *    = false`), since that would suppress the injector.
+     * A read failure other than "absent" leaves the file untouched. (`hooks` is the canonical key;
+     * `codex_hooks` is a deprecated alias Codex still honors.)
      */
     private fun ensureCodexHooksEnabled() {
         val content = try {
@@ -140,35 +152,13 @@ class HookInstaller(
             writeAtomically(codexConfigToml, "[features]\nhooks = true\n")
             return
         } catch (e: IOException) {
-            warn("heview: could not read ~/.codex/config.toml; leaving it untouched. Set [features].hooks = true for Codex hooks.")
+            warn("heview: could not read ~/.codex/config.toml; leaving it untouched. Codex hooks are on by default; set [features].hooks = true if you disabled them.")
             return
         }
-
-        val features = FEATURES_HEADER.find(content)
-        if (features == null) {
-            if (FEATURES_INLINE_KEY.containsMatchIn(content)) {
-                warn("heview: ~/.codex/config.toml defines `features` inline; set [features].hooks = true manually for Codex hooks.")
-                return
-            }
-            writeAtomically(codexConfigToml, content.trimEnd() + "\n\n[features]\nhooks = true\n")
-            return
+        if (CODEX_HOOKS_DISABLED.containsMatchIn(content)) {
+            warn("heview: Codex hooks appear disabled ((codex_)hooks = false in ~/.codex/config.toml); set it true for heview's Codex integration.")
         }
-
-        // The [features] section runs from its header to the next section header (or EOF). Search for
-        // the next section AFTER this header so its own '[' isn't re-matched — no substring/offset dance.
-        val headerEnd = features.range.last + 1
-        val nextSection = SECTION_HEADER.find(content, startIndex = headerEnd)?.range?.first
-        val featuresSection = content.substring(features.range.first, nextSection ?: content.length)
-
-        val hooksFlag = CODEX_HOOKS_FLAG.find(featuresSection)
-        when {
-            hooksFlag == null ->
-                // Insert right after the matched header, preserving the user's exact header text.
-                writeAtomically(codexConfigToml, content.substring(0, headerEnd) + "\nhooks = true" + content.substring(headerEnd))
-            hooksFlag.groupValues[2] == "false" ->
-                warn("heview: Codex hooks are disabled (${hooksFlag.groupValues[1]} = false in ~/.codex/config.toml); set it true for heview's Codex integration.")
-            // already true (via `hooks` or the deprecated `codex_hooks`) → nothing to do
-        }
+        // Otherwise: hooks are on (explicitly or by default) → leave the file entirely untouched.
     }
 
     /**
@@ -185,9 +175,21 @@ class HookInstaller(
                 LOG.warn("heview: bundled hook script missing from the plugin: $resource")
                 return false
             }
-            stream.use { Files.copy(it, dest, StandardCopyOption.REPLACE_EXISTING) }
-            runCatching { Files.setPosixFilePermissions(dest, EXECUTABLE) }
-                .onFailure { LOG.debug("heview: could not chmod $dest", it) }
+            // tmp → chmod → atomic rename, so an agent never executes a half-written script mid-upgrade.
+            val tmp = Files.createTempFile(destDir, filename, ".tmp")
+            try {
+                stream.use { Files.copy(it, tmp, StandardCopyOption.REPLACE_EXISTING) }
+                runCatching { Files.setPosixFilePermissions(tmp, EXECUTABLE) }
+                    .onFailure { LOG.debug("heview: could not chmod $tmp", it) }
+                try {
+                    Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE)
+                } catch (e: IOException) {
+                    Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING)
+                }
+            } catch (e: IOException) {
+                Files.deleteIfExists(tmp)
+                throw e
+            }
             true
         } catch (e: IOException) {
             LOG.warn("heview: failed to extract hook script $resource", e)
@@ -229,14 +231,11 @@ class HookInstaller(
      */
     private fun writeAtomically(path: Path, text: String) {
         val target = try {
-            when {
-                // A live symlink (dotfiles) → write through to its real target, preserving the link.
-                Files.isSymbolicLink(path) -> path.toRealPath()
-                Files.exists(path) -> path.toRealPath()
-                else -> path
-            }
+            // An existing file or any symlink (incl. dotfiles) → resolve so we write through a live
+            // link rather than replacing it; a brand-new file → the path itself.
+            if (Files.isSymbolicLink(path) || Files.exists(path)) path.toRealPath() else path
         } catch (e: IOException) {
-            // A dangling symlink: toRealPath throws → don't replace the link with a regular file.
+            // A dangling symlink: toRealPath throws → don't replace the broken link with a regular file.
             warn("heview: ${path} is a broken symlink; leaving it untouched.")
             return
         }
@@ -263,15 +262,10 @@ class HookInstaller(
         private val LOG = logger<HookInstaller>()
         private val EXECUTABLE = PosixFilePermissions.fromString("rwxr-xr-x")
         private val GSON = GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create()
-        // Tolerate TOML header whitespace (`[ features ]`) so we edit the existing table instead of
-        // appending a duplicate one (which would make config.toml invalid).
-        private val FEATURES_HEADER = Regex("^\\s*\\[\\s*features\\s*\\]", RegexOption.MULTILINE)
-        private val SECTION_HEADER = Regex("^\\s*\\[", RegexOption.MULTILINE)
-        // A `features` inline table / dotted key (no [features] header) we cannot safely edit by hand.
-        private val FEATURES_INLINE_KEY = Regex("^\\s*\"?features\"?\\s*[.=]", RegexOption.MULTILINE)
-        // group(1) = the key (canonical `hooks` or deprecated `codex_hooks`, optionally quoted);
-        // group(2) = its boolean value. Matches either key so an explicit `false` is detected.
-        private val CODEX_HOOKS_FLAG =
-            Regex("^\\s*\"?(codex_hooks|hooks)\"?\\s*=\\s*(true|false)", RegexOption.MULTILINE)
+        // A line-anchored `hooks = false` / `codex_hooks = false` (optionally quoted key) anywhere in
+        // config.toml — the only condition that suppresses Codex's default-on hooks. Detection only; we
+        // never edit an existing config.toml (see ensureCodexHooksEnabled).
+        private val CODEX_HOOKS_DISABLED =
+            Regex("^\\s*\"?(?:codex_)?hooks\"?\\s*=\\s*false", RegexOption.MULTILINE)
     }
 }

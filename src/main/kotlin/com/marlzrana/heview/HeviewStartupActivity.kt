@@ -40,12 +40,15 @@ internal class HeviewStartupActivity : ProjectActivity {
         if (!installationAllowed(app.isUnitTestMode, app.isHeadlessEnvironment)) return
         if (!HOOKS_INSTALLED.compareAndSet(false, true)) return
         app.executeOnPooledThread {
-            try {
+            val installed = try {
                 HookInstaller(warn = ::notifyHookWarning).installAll()
             } catch (e: Exception) {
-                HOOKS_INSTALLED.set(false) // allow a later project-open to retry after a failure
-                thisLogger().warn("heview: hook installation failed; will retry on next project open", e)
+                thisLogger().warn("heview: hook installation failed", e)
+                false
             }
+            // installAll swallows per-agent failures (returning false); re-arm so a later project-open
+            // retries after a transient failure, rather than leaving one agent unhooked all session.
+            if (!installed) HOOKS_INSTALLED.set(false)
         }
     }
 
