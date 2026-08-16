@@ -12,6 +12,11 @@ def format_line_content(comment):
     return prefix + comment.get("line_content", "")
 
 
+def is_under_cwd(p, cwd):
+    # Match on directory boundaries so cwd /a/app does not capture /a/app-backend.
+    return p == cwd or p.startswith(cwd + os.sep)
+
+
 def main():
     try:
         data = json.loads(sys.stdin.read())
@@ -40,7 +45,7 @@ def main():
             continue
 
         abs_path = comment.get("abs_path", "")
-        if not abs_path or not abs_path.startswith(cwd):
+        if not abs_path or not is_under_cwd(abs_path, cwd):
             continue
 
         matched.append((comment, filepath))

@@ -11,6 +11,11 @@ function formatLineContent(comment) {
 	return prefix + comment.line_content;
 }
 
+// Match on directory boundaries so cwd `/a/app` does not capture `/a/app-backend`.
+function isUnderCwd(p, cwd) {
+	return p === cwd || p.startsWith(cwd + path.sep);
+}
+
 async function main() {
 	const chunks = [];
 	for await (const chunk of process.stdin) {
@@ -45,7 +50,7 @@ async function main() {
 		}
 
 		const matchPath = comment.logical_abs_path || comment.abs_path;
-		if (!matchPath || !matchPath.startsWith(cwd)) {
+		if (!matchPath || !isUnderCwd(matchPath, cwd)) {
 			continue;
 		}
 
@@ -60,7 +65,7 @@ async function main() {
 
 	const parts = [];
 	for (const { comment } of matchedComments) {
-		const displayPath = comment.abs_path.startsWith(cwd) ? path.relative(cwd, comment.abs_path) : comment.abs_path;
+		const displayPath = isUnderCwd(comment.abs_path, cwd) ? path.relative(cwd, comment.abs_path) : comment.abs_path;
 		const formatted = formatLineContent(comment);
 		parts.push('In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content);
 	}
