@@ -11,11 +11,14 @@ function formatLineContent(comment) {
 	return prefix + comment.line_content;
 }
 
-// Match on directory boundaries so cwd `/a/app` does not capture `/a/app-backend`.
-// Strip trailing separators first so cwd `/a/app/` (or `/`) still matches its descendants.
+// Directory-boundary match (cwd `/a/app` must not capture `/a/app-backend`). Guard non-strings (a
+// foreign pool file may carry a null/missing path), normalize to collapse `..`/`//`, and strip
+// trailing separators so cwd `/a/app/` (or `/`) still matches its descendants.
 function isUnderCwd(p, cwd) {
-	const base = cwd.replace(/[/\\]+$/, '');
-	return p === base || p.startsWith(base + path.sep);
+	if (typeof p !== 'string' || typeof cwd !== 'string') return false;
+	const np = path.normalize(p);
+	const base = path.normalize(cwd).replace(/[/\\]+$/, '');
+	return np === base || np.startsWith(base + path.sep);
 }
 
 async function main() {

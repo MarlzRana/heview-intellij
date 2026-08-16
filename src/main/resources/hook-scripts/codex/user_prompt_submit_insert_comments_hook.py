@@ -9,14 +9,17 @@ COMMENTS_DIR = os.path.join(os.path.expanduser("~"), ".heview", "comments")
 def format_line_content(comment):
     side = comment.get("side", "")
     prefix = "+" if side == "addition" else "-" if side == "removal" else ""
-    return prefix + comment.get("line_content", "")
+    return prefix + (comment.get("line_content") or "")  # tolerate a null line_content
 
 
 def is_under_cwd(p, cwd):
-    # Match on directory boundaries so cwd /a/app does not capture /a/app-backend.
-    # Strip trailing separators so cwd /a/app/ (or /) still matches its descendants.
-    base = cwd.rstrip("/\\")
-    return p == base or p.startswith(base + os.sep)
+    # Directory-boundary match (cwd /a/app must not capture /a/app-backend); normalize collapses `..`
+    # and `//`, and stripping trailing separators lets cwd `/a/app/` (or `/`) match its descendants.
+    if not isinstance(p, str) or not isinstance(cwd, str):
+        return False
+    np = os.path.normpath(p)
+    base = os.path.normpath(cwd).rstrip("/\\")
+    return np == base or np.startswith(base + os.sep)
 
 
 def main():
@@ -57,25 +60,34 @@ def main():
 
     matched.sort(key=lambda x: x[0].get("created_at", ""))
 
+    # Format each comment defensively: a matched-but-schema-incomplete file is skipped (and NOT
+    # consumed), so one bad file can't abort the batch or delete a comment it never injected.
     parts = []
-    for comment, _ in matched:
-        # Lenient reads: a matched-but-schema-incomplete file must not abort the whole batch.
-        rel_path = os.path.relpath(comment.get("abs_path", ""), cwd)
-        formatted = format_line_content(comment)
-        parts.append(
-            "In `"
-            + rel_path
-            + "` at line "
-            + str(comment.get("line_number", ""))
-            + ":\n```\n"
-            + formatted
-            + "\n```\n"
-            + comment.get("content", "")
-        )
+    emitted = []
+    for comment, filepath in matched:
+        try:
+            rel_path = os.path.relpath(comment.get("abs_path") or "", cwd)
+            block = (
+                "In `"
+                + rel_path
+                + "` at line "
+                + str(comment.get("line_number") or "")
+                + ":\n```\n"
+                + format_line_content(comment)
+                + "\n```\n"
+                + (comment.get("content") or "")
+            )
+        except Exception:
+            continue
+        parts.append(block)
+        emitted.append(filepath)
+
+    if not parts:
+        sys.exit(0)
 
     additional_context = "\n\n".join(parts)
 
-    for _, filepath in matched:
+    for filepath in emitted:
         try:
             os.unlink(filepath)
         except Exception:
