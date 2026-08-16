@@ -16,7 +16,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 43 tests — the gate (JUnit5 unit tests + a JUnit3/4 BasePlatformTestCase via the vintage engine)
+    ./gradlew test          # 65 tests — the gate (JUnit5 unit tests + a JUnit3/4 BasePlatformTestCase via the vintage engine)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -58,10 +58,17 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   reconcile never double-renders the composing editor. `init()` is EDT-only; boot it via the startup activity.
 - `actions/AddCommentAction.kt` — "heview: Add Comment" (editor context menu / Ctrl+Alt+Shift+H); local files only;
   thin trigger that delegates to `CommentInlayManager.compose(editor)`.
-- `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT (the activity
-  runs on a background coroutine).
+- `hooks/HookInstaller.kt` — Phase 2: extracts the bundled agent hook scripts into `~/.heview/<agent>/hooks/`
+  (overwrite + chmod 0755), detects an agent CLI via a `PATH` scan, and idempotently registers the
+  `UserPromptSubmit` hook in the agent's own config (`~/.claude/settings.json`; `~/.codex/config.toml` +
+  `hooks.json`) — dedup by injector filename, config preserved, atomic writes. All paths/`PATH`/warn sink
+  injectable → unit-tested against temp dirs. Bundled scripts live in `src/main/resources/hook-scripts/`.
+- `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and runs
+  `HookInstaller.installAll()` on the background coroutine (off-EDT), **once per app** and **skipped in
+  unit-test/headless mode** so tests never touch the real `~/.claude` / `~/.codex`.
 `src/main/resources/META-INF/plugin.xml` registers the postStartupActivity, the CommentStore application service,
-and the action. `CommentInlayManager` is a light `@Service` — intentionally NOT in plugin.xml.
+the action, and the `heview` notificationGroup (hook warnings). `CommentInlayManager` is a light `@Service` —
+intentionally NOT in plugin.xml.
 </architecture>
 
 <conventions>
@@ -107,18 +114,17 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 </review>
 
 <status>
-Phase 0 (scaffold) + Phase 1 foundation (schema, store, create/display/delete inlay UI) + the
-**`CommentInlayManager`** increment (per-editor recreate/dispose on open/split/reopen/close + startup
-`hydrate()` from `~/.heview/comments`) are DONE. Phase 1 foundation went through a full `/aeview-loop`
-(5 cycles → converged); the CommentInlayManager increment is NOT yet aeview-reviewed or dogfooded in
-`runIde`. Gate green: 32 tests, build clean.
+Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment (dogfooded + a 3-cycle
+`/aeview-loop` to convergence) + **Phase 2 — agent hooks** (bundle/extract scripts, CLI detection,
+idempotent registration in `~/.claude` + `~/.codex`) are DONE. The end-to-end loop works: an IDE comment
+is injected into Claude Code / Codex on `UserPromptSubmit`. Gate green: 65 tests, build clean.
 
-Recommended next increment: **Phase 2 — hook install & registration** (Claude Code + Codex): ship the
-hook scripts into `~/.heview/{claude-code,codex}/hooks/` and do idempotent config registration (see
-plan.html §4/§6). This is the step that makes comments actually reach the agents — the first end-to-end
-loop. Alternatives the maintainer may prefer first: the Phase 1 reply/edit/re-pend→processed state machine,
-or the Phase 3 consumption watcher (marks a thread Seen when a hook deletes its file). The full backlog
-(status-aware persistence, platform-fixture UI tests, `CommentJson.decode` validation, GitHub identity, …)
-lives in `implementation_log.local.md`. NOTE: the display card header still hard-codes "Pending" — a
-status-aware label is deferred with the state machine.
+Phase 2 is NOT yet dogfooded in `runIde` (running it edits the real `~/.claude`/`~/.codex`) or aeview-reviewed.
+
+Recommended next: dogfood Phase 2 end-to-end (add a comment → prompt Claude/Codex → confirm the block is
+injected and the `<uuid>.json` is consumed), then either **Phase 3 — consumption watcher** (a hook deletes a
+comment file → mark the thread *Seen*; generalize to the multi-client pool watcher, plan §5) or the **Phase 1
+reply/edit/re-pend→processed state machine** (also brings the status-aware display label — the card header
+still hard-codes "Pending"). Full backlog (durable-anchor line-number writeback, external-reload listener,
+`CommentJson.decode` validation, GitHub identity, …) in `implementation_log.local.md`.
 </status>
