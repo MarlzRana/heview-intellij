@@ -9,8 +9,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.marlzrana.heview.hooks.HookInstaller
 import com.marlzrana.heview.ui.CommentInlayManager
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -18,11 +16,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - boots the project's [CommentInlayManager] (editor + store listeners, pool hydration), and
  * - installs the coding-agent hooks once per application session.
  *
- * [ProjectActivity.execute] runs on a background coroutine. The manager touches editors and the
- * EDT-confined store, so [CommentInlayManager.init] is dispatched to the EDT. Hook installation is
- * file I/O against the agents' global config, so it runs here on the background coroutine (off the
- * EDT), guarded to run at most once per app and never in unit-test / headless mode so tests can't
- * touch the real `~/.claude` / `~/.codex`.
+ * [CommentInlayManager.init] touches editors + the EDT-confined store, so it's dispatched to the EDT.
+ * Hook installation is application-global work (edits `~/.claude` / `~/.codex`, and loading the shell
+ * PATH via EnvironmentUtil can block), so it runs on an **application-pooled** thread — not this
+ * project's coroutine — so project close can't cancel it and it isn't on the startup critical path.
+ * It runs at most once per app, retries on the next project open after a failure, and is skipped in
+ * unit-test / headless mode so tests can't touch the real `~/.claude` / `~/.codex`.
  */
 internal class HeviewStartupActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
@@ -33,19 +32,19 @@ internal class HeviewStartupActivity : ProjectActivity {
             project.disposed,
         )
 
-        installHooksOncePerApp()
+        maybeInstallHooks()
     }
 
-    private suspend fun installHooksOncePerApp() {
+    private fun maybeInstallHooks() {
         val app = ApplicationManager.getApplication()
-        if (app.isUnitTestMode || app.isHeadlessEnvironment) return
+        if (!installationAllowed(app.isUnitTestMode, app.isHeadlessEnvironment)) return
         if (!HOOKS_INSTALLED.compareAndSet(false, true)) return
-        // PATH scan + config reads/writes are blocking I/O → the IO dispatcher, not the startup default.
-        withContext(Dispatchers.IO) {
+        app.executeOnPooledThread {
             try {
                 HookInstaller(warn = ::notifyHookWarning).installAll()
             } catch (e: Exception) {
-                thisLogger().warn("heview: hook installation failed", e)
+                HOOKS_INSTALLED.set(false) // allow a later project-open to retry after a failure
+                thisLogger().warn("heview: hook installation failed; will retry on next project open", e)
             }
         }
     }
@@ -59,5 +58,9 @@ internal class HeviewStartupActivity : ProjectActivity {
 
     companion object {
         private val HOOKS_INSTALLED = AtomicBoolean(false)
+
+        /** Pure guard (unit-tested): hooks must NEVER install in unit-test or headless mode. */
+        fun installationAllowed(isUnitTestMode: Boolean, isHeadless: Boolean): Boolean =
+            !isUnitTestMode && !isHeadless
     }
 }
