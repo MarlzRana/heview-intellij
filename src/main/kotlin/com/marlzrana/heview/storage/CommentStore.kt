@@ -1,5 +1,7 @@
 package com.marlzrana.heview.storage
 
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.util.concurrency.AppExecutorUtil
 import com.marlzrana.heview.model.CommentJson
@@ -7,8 +9,10 @@ import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * In-memory index + JSON persistence for comment threads, mirroring reviewa's `CommentStore`:
@@ -24,6 +28,7 @@ import java.nio.file.StandardCopyOption
 class CommentStore(
     private val commentsDir: Path,
     private val runIo: (Runnable) -> Unit = { IO_POOL.execute(it) },
+    private val runEdt: (Runnable) -> Unit = { ApplicationManager.getApplication().invokeLater(it) },
 ) {
     /** Application-service constructor — binds to the shared `~/.heview/comments` pool. */
     @Suppress("unused")
@@ -31,12 +36,16 @@ class CommentStore(
 
     private val index = LinkedHashMap<String, HeviewComment>()
     private val listeners = mutableListOf<() -> Unit>()
+    private val hydrated = AtomicBoolean(false)
 
-    fun addChangeListener(listener: () -> Unit) {
+    /** Register a change listener; dispose the returned handle to unregister (e.g. on project close). */
+    fun addChangeListener(listener: () -> Unit): Disposable {
         listeners += listener
+        return Disposable { listeners.remove(listener) }
     }
 
-    private fun fireChanged() = listeners.forEach { it() }
+    // Iterate a copy so a listener may unregister itself (or another) during the callback.
+    private fun fireChanged() = listeners.toList().forEach { it() }
 
     private fun fileFor(uuid: String): Path = commentsDir.resolve("$uuid.json")
 
@@ -49,9 +58,59 @@ class CommentStore(
         runIo { writeAtomically(uuid, json) }
     }
 
+    /**
+     * Load existing threads from the shared pool into the index — once per application. Runs at most
+     * once: the read happens on the background executor, then the index is populated and listeners
+     * fired back on the EDT ([runEdt]). In-memory records win over disk (a record created this
+     * session is authoritative), so hydrating after some saves never clobbers newer state.
+     */
+    fun hydrate() {
+        if (!hydrated.compareAndSet(false, true)) return
+        runIo {
+            val loaded = readAllFromDisk()
+            runEdt {
+                var changed = false
+                for (comment in loaded) {
+                    if (index.putIfAbsent(comment.uuid, comment) == null) changed = true
+                }
+                if (changed) fireChanged()
+            }
+        }
+    }
+
+    /** Read and decode every `<uuid>.json` in the pool, skipping any file that can't be parsed. */
+    private fun readAllFromDisk(): List<HeviewComment> {
+        if (!Files.isDirectory(commentsDir)) return emptyList()
+        return try {
+            Files.newDirectoryStream(commentsDir, "*.json").use { stream ->
+                stream.mapNotNull { path ->
+                    try {
+                        CommentJson.decode(Files.readString(path))
+                    } catch (e: Exception) {
+                        LOG.warn("heview: skipping unreadable comment file $path", e)
+                        null
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            LOG.warn("heview: failed to list the comments directory $commentsDir", e)
+            emptyList()
+        }
+    }
+
     fun get(uuid: String): HeviewComment? = index[uuid]
 
     fun all(): List<HeviewComment> = index.values.toList()
+
+    /**
+     * Comments anchored to [absPath], matched by normalized path so an editor's `toNioPath()` string
+     * lines up with a stored `abs_path` regardless of `..`/redundant separators. Foreign pool writers
+     * (another agent, reviewa) may use a different textual form for the same file.
+     */
+    fun forAbsPath(absPath: String): List<HeviewComment> {
+        val target = normalizePath(absPath)
+        return index.values.filter { normalizePath(it.absPath) == target }
+    }
 
     fun pendingCount(): Int = index.values.count { it.status == CommentStatus.PENDING }
 
@@ -93,6 +152,14 @@ class CommentStore(
             LOG.warn("heview: failed to persist comment $uuid", e)
         }
     }
+
+    /** Normalize for path comparison; fall back to the raw string if it isn't a valid path. */
+    private fun normalizePath(path: String): String =
+        try {
+            Path.of(path).normalize().toString()
+        } catch (e: InvalidPathException) {
+            path
+        }
 
     companion object {
         private val LOG = logger<CommentStore>()

@@ -16,7 +16,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 26 JUnit5 unit tests — the gate
+    ./gradlew test          # 32 JUnit5 unit tests — the gate
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -41,14 +41,27 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
 - `util/HeviewTime.kt` — `nowIso()`: fixed 3-digit-millis ASCII ISO (matches JS `toISOString` so ordering matches reviewa).
 - `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`.
-- `storage/CommentStore.kt` — in-memory index + JSON persistence; registered as an **application** service.
-  EDT-confined; disk I/O offloaded to a serial background executor (`runIo`, injectable → synchronous in tests).
+- `storage/CommentStore.kt` — in-memory index + JSON persistence; registered as an **application** service
+  (the pool is shared). EDT-confined; disk I/O offloaded to a serial background executor (`runIo`, injectable).
+  `hydrate()` loads the pool from disk once (read on `runIo`, apply on `runEdt` — both injectable → sync in
+  tests); `forAbsPath(path)` returns a file's comments (normalized-path match); `addChangeListener` returns a
+  `Disposable` to unregister.
 - `ui/InlayCardHost.kt` — THE seam isolating the experimental inlay API (the ONE swap point).
 - `ui/ComponentInlayCardHost.kt` — backs it via `Editor.addComponentInlay(offset, InlayProperties().relatesToPrecedingText(true), card, FIT_VIEWPORT_WIDTH)`, wrapped in `EditorScrollingPositionKeeper`. Verified present on 2024.2.
-- `ui/CommentThread.kt` — the inlay card: compose (an `EditorTextField`, so it owns editor keys) ⇄ display; EDT-only; `onDispose` parented to the inlay.
-- `actions/AddCommentAction.kt` — "heview: Add Comment" (editor context menu / Ctrl+Alt+Shift+H); local files only; reads the line via a `RangeMarker` at submit.
-- `HeviewStartupActivity.kt` — Phase-0 load smoke marker (logs).
-`src/main/resources/META-INF/plugin.xml` registers the postStartupActivity, the CommentStore application service, and the action.
+- `ui/CommentThread.kt` — the inlay card. Two entry points: `startCompose()` (an `EditorTextField`, so it owns
+  editor keys) for the create flow, and `startDisplay(comment)` for an already-persisted comment. EDT-only;
+  `onDispose` parented to the inlay; `dispose()` is idempotent.
+- `ui/CommentInlayManager.kt` — **project** light `@Service`; the single controller that owns every
+  `CommentThread`. Renders/disposes display cards per `Editor` on open/split/reopen/close (`EditorFactoryListener`),
+  and reconciles all open editors on any `CommentStore` change so a comment appears/disappears in every split.
+  Owns the create flow too (`compose(editor)`) — tracks the thread under its uuid *before* `store.save` fires, so
+  reconcile never double-renders the composing editor. `init()` is EDT-only; boot it via the startup activity.
+- `actions/AddCommentAction.kt` — "heview: Add Comment" (editor context menu / Ctrl+Alt+Shift+H); local files only;
+  thin trigger that delegates to `CommentInlayManager.compose(editor)`.
+- `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT (the activity
+  runs on a background coroutine).
+`src/main/resources/META-INF/plugin.xml` registers the postStartupActivity, the CommentStore application service,
+and the action. `CommentInlayManager` is a light `@Service` — intentionally NOT in plugin.xml.
 </architecture>
 
 <conventions>
@@ -87,14 +100,18 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 </review>
 
 <status>
-Phase 0 (scaffold) + Phase 1 foundation (schema, store, create/display/delete inlay UI) are DONE and
-have been through a full `/aeview-loop` (5 cycles → converged in substance). Gate green: 26 tests, build
-clean. HEAD is a clean tree.
+Phase 0 (scaffold) + Phase 1 foundation (schema, store, create/display/delete inlay UI) + the
+**`CommentInlayManager`** increment (per-editor recreate/dispose on open/split/reopen/close + startup
+`hydrate()` from `~/.heview/comments`) are DONE. Phase 1 foundation went through a full `/aeview-loop`
+(5 cycles → converged); the CommentInlayManager increment is NOT yet aeview-reviewed or dogfooded in
+`runIde`. Gate green: 32 tests, build clean.
 
-Recommended next increment (the maintainer approved starting it): **`CommentInlayManager`** — recreate/
-dispose inlay cards per `Editor` on open/split/reopen (via `FileEditorManagerListener`/`EditorFactoryListener`,
-parented to the editor Disposable) and hydrate the store from `~/.heview/comments` on startup. This clears
-the biggest cluster of deferred review findings. The full backlog (state machine, consumption watcher [Phase 3],
-hook install/registration [Phase 2], platform-fixture tests, decode validation, GitHub identity, …) lives in
-`implementation_log.local.md`.
+Recommended next increment: **Phase 2 — hook install & registration** (Claude Code + Codex): ship the
+hook scripts into `~/.heview/{claude-code,codex}/hooks/` and do idempotent config registration (see
+plan.html §4/§6). This is the step that makes comments actually reach the agents — the first end-to-end
+loop. Alternatives the maintainer may prefer first: the Phase 1 reply/edit/re-pend→processed state machine,
+or the Phase 3 consumption watcher (marks a thread Seen when a hook deletes its file). The full backlog
+(status-aware persistence, platform-fixture UI tests, `CommentJson.decode` validation, GitHub identity, …)
+lives in `implementation_log.local.md`. NOTE: the display card header still hard-codes "Pending" — a
+status-aware label is deferred with the state machine.
 </status>

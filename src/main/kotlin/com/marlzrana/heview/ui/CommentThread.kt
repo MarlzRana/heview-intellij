@@ -22,12 +22,18 @@ import javax.swing.JPanel
 /**
  * A single comment thread rendered as an editor inlay card via [InlayCardHost].
  *
- * Phase 1 covers the create → display → delete loop: [startCompose] shows an empty compose card;
- * Submit calls [onSubmit] (which persists and returns the stored record) and flips to display mode;
- * Delete calls [onDelete] and removes the inlay; Cancel discards. [onDispose] is registered on the
- * inlay, so it runs on *any* teardown — Cancel/Delete or the platform disposing the inlay when the
- * editor closes — letting the caller release resources it owns (e.g. the line anchor). Replies /
- * edit / re-pend and the consumption watcher arrive in later increments.
+ * Two entry points, mutually exclusive per instance:
+ * - [startCompose] opens an empty compose card; Submit calls [onSubmit] (which persists and returns
+ *   the stored record) and flips to display; Delete calls [onDelete] and removes the inlay; Cancel
+ *   discards. Used for the create flow.
+ * - [startDisplay] renders an already-persisted comment straight in display mode (no compose step).
+ *   Used by the [com.marlzrana.heview.ui.CommentInlayManager] when hydrating existing comments into
+ *   newly opened editors.
+ *
+ * [onDispose] is registered on the inlay, so it runs on *any* teardown — Cancel/Delete or the
+ * platform disposing the inlay when the editor closes — letting the caller release resources it
+ * owns (e.g. the line anchor) and drop its bookkeeping. Replies / edit / re-pend and the consumption
+ * watcher arrive in later increments.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -36,8 +42,8 @@ internal class CommentThread(
     private val host: InlayCardHost,
     private val lineEndOffset: Int,
     private val author: String,
-    private val onSubmit: (text: String) -> HeviewComment,
     private val onDelete: (comment: HeviewComment) -> Unit,
+    private val onSubmit: (text: String) -> HeviewComment = { error("CommentThread has no compose callback") },
     private val onDispose: () -> Unit = {},
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
@@ -47,11 +53,7 @@ internal class CommentThread(
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(): Boolean {
         val input = renderCompose()
-        val placed = host.addCardBelow(lineEndOffset, panel) ?: return false
-        inlay = placed
-        // Run onDispose on any teardown, including the platform disposing the inlay on editor close;
-        // set `disposed` so queued UI callbacks (focus, delete-enable) become no-ops.
-        Disposer.register(placed, Disposable { disposed = true; onDispose() })
+        if (!place()) return false
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
         // and realized (next EDT tick), guarded so we never focus a torn-down card or closed project.
         ApplicationManager.getApplication().invokeLater(
@@ -61,7 +63,24 @@ internal class CommentThread(
         return true
     }
 
-    private fun dispose() {
+    /** Place an already-persisted comment straight in display mode. Returns false if unplaceable. */
+    fun startDisplay(comment: HeviewComment): Boolean {
+        renderDisplay(comment)
+        return place()
+    }
+
+    /** Insert the card below the target line and wire teardown. Returns false if the host declines. */
+    private fun place(): Boolean {
+        val placed = host.addCardBelow(lineEndOffset, panel) ?: return false
+        inlay = placed
+        // Run onDispose on any teardown, including the platform disposing the inlay on editor close;
+        // set `disposed` so queued UI callbacks (focus, delete-enable) become no-ops.
+        Disposer.register(placed, Disposable { disposed = true; onDispose() })
+        return true
+    }
+
+    /** Tear down the inlay; safe to call more than once. Triggers the registered [onDispose]. */
+    fun dispose() {
         if (disposed) return
         disposed = true
         inlay?.let { Disposer.dispose(it) } // triggers the registered onDispose

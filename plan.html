@@ -360,7 +360,7 @@ Your comment here</code></pre>
     <h3>Domain &amp; storage</h3>
     <ul>
       <li><code>HeviewComment</code> — data class mirroring the JSON schema.</li>
-      <li><code>CommentStore</code> (project service) — in-memory <code>Map&lt;uuid, Tracked&gt;</code>, JSON read/write, suppression set, change events, scoped cleanup.</li>
+      <li><code>CommentStore</code> (application service — the pool is shared across projects) — in-memory <code>Map&lt;uuid, HeviewComment&gt;</code>, JSON read/write + startup <code>hydrate()</code>, <code>forAbsPath</code> lookup, removable change events; suppression set + scoped cleanup arrive with the watcher.</li>
       <li><code>HeviewPaths</code> — central resolver for <code>~/.heview/…</code>.</li>
     </ul>
   </div>

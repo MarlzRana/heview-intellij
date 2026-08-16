@@ -11,7 +11,8 @@
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <!-- Phase 0: smoke marker confirming the plugin loads. -->
+        <!-- Boots the per-project CommentInlayManager (editor + store listeners, pool hydration).
+             CommentInlayManager itself is a light @Service(PROJECT) — no XML registration needed. -->
         <postStartupActivity implementation="com.marlzrana.heview.HeviewStartupActivity"/>
         <!-- Shared in-memory index + persistence over ~/.heview/comments. -->
         <applicationService serviceImplementation="com.marlzrana.heview.storage.CommentStore"/>

@@ -16,8 +16,13 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class CommentStoreTest {
-    // Synchronous IO executor so the async disk path runs inline and deterministically in tests.
-    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() })
+    // Synchronous executors so the async disk + EDT-hop paths run inline and deterministically.
+    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() })
+
+    private fun seed(dir: Path, comment: com.marlzrana.heview.model.HeviewComment) {
+        Files.createDirectories(dir)
+        Files.writeString(dir.resolve("${comment.uuid}.json"), CommentJson.encode(comment))
+    }
 
     /** Make [dir] non-writable; skip the test if the platform doesn't enforce it (e.g. running as root). */
     private fun makeReadOnlyOrSkip(dir: Path) {
@@ -119,6 +124,70 @@ class CommentStoreTest {
         store.save(sampleComment(uuid = "u1"))
         store.delete("u1")
         assertEquals(2, count)
+    }
+
+    @Test
+    fun `hydrate loads existing pool files into the index and fires one change`(@TempDir dir: Path) {
+        seed(dir, sampleComment(uuid = "a"))
+        seed(dir, sampleComment(uuid = "b"))
+        val store = store(dir)
+        var count = 0
+        store.addChangeListener { count++ }
+        store.hydrate()
+        assertEquals(2, store.all().size)
+        assertNotNull(store.get("a"))
+        assertNotNull(store.get("b"))
+        assertEquals(1, count)
+    }
+
+    @Test
+    fun `hydrate skips unreadable files and loads the rest`(@TempDir dir: Path) {
+        seed(dir, sampleComment(uuid = "ok"))
+        Files.writeString(dir.resolve("broken.json"), "{ not valid json")
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(1, store.all().size)
+        assertNotNull(store.get("ok"))
+    }
+
+    @Test
+    fun `hydrate does not overwrite a record already held in memory`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", status = CommentStatus.PROCESSED))
+        // A stale on-disk copy for the same uuid; the in-memory record must win.
+        seed(dir, sampleComment(uuid = "u1", status = CommentStatus.PENDING))
+        store.hydrate()
+        assertEquals(1, store.all().size)
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
+    }
+
+    @Test
+    fun `hydrate runs at most once`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.hydrate()
+        seed(dir, sampleComment(uuid = "late"))
+        store.hydrate() // second call is a no-op — the pool is not re-read
+        assertNull(store.get("late"))
+    }
+
+    @Test
+    fun `hydrate on a missing directory is a no-op`(@TempDir dir: Path) {
+        val store = store(dir.resolve("nope"))
+        store.hydrate()
+        assertEquals(0, store.all().size)
+    }
+
+    @Test
+    fun `forAbsPath returns only comments for that file, matched normalized`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "here")) // abs_path = /repo/src/Foo.kt
+        store.save(
+            sampleComment(uuid = "elsewhere").copy(absPath = "/repo/src/Bar.kt", logicalAbsPath = "/repo/src/Bar.kt"),
+        )
+        assertEquals(listOf("here"), store.forAbsPath("/repo/src/Foo.kt").map { it.uuid })
+        // A non-normalized spelling of the same path still matches.
+        assertEquals(listOf("here"), store.forAbsPath("/repo/./src/Foo.kt").map { it.uuid })
+        assertTrue(store.forAbsPath("/repo/src/Nope.kt").isEmpty())
     }
 
     @Test
