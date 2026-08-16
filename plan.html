@@ -313,6 +313,32 @@ comment intuitively "sticks".</p>
   can be removed by hand from <code>~/.heview/comments/</code>.
 </div>
 
+<h3>Multi-client sync — the durable pool can have ≥2 live editors <span class="pill later">Later</span></h3>
+<div class="callout warn">
+  <b>Durability turns the pool into shared live state.</b> heview-intellij, a future heview-vscode (once
+  moved to this model), and the agent hooks can all be open on <code>~/.heview/comments/</code> at the same
+  time. Today each editor only <code>hydrate()</code>s <b>once at startup</b>, so a comment created, edited,
+  or deleted in one <i>already-open</i> editor is invisible to the other until it restarts.
+</div>
+<p>Making concurrent editors consistent means generalizing the <span class="pill later">Phase&nbsp;3</span>
+"consumption watcher" from a delete-only listener into a full <b>pool watcher</b> that reconciles the
+in-memory index + inlays against filesystem events:</p>
+<ul>
+  <li><b>CREATE</b> (a peer added a comment) → add the thread and render its inlay in matching editors.</li>
+  <li><b>MODIFY</b> (a peer edited content/status, or <code>created_at</code> bumped) → re-read the file and
+    refresh the card. Concurrent edits settle as <b>last-writer-wins</b> — acceptable for v1 (files are
+    per-uuid, writes are atomic tmp→rename, edits are rare).</li>
+  <li><b>DELETE</b> is the hard one — three causes are <i>indistinguishable on the filesystem</i>: a hook
+    <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should vanish
+    silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set). Telling
+    consumption from peer-deletion needs an <b>intent signal</b> — e.g. hooks move consumed files into a
+    <code>~/.heview/comments/consumed/</code> dir (or drop a tombstone) instead of a bare <code>unlink</code>.
+    Absent that, fall back to: treat any unexplained delete as "gone".</li>
+</ul>
+<p class="muted">This also matters for the VS Code side: when heview-vscode adopts the durable model, both
+plugins should share one watcher contract (same events, same tombstone/consumed convention) so a comment
+created in one and resolved in the other stays consistent.</p>
+
 <!-- ============================================================ -->
 <h2 id="hooks">6 · Hook integration (Claude &amp; Codex)</h2>
 <p>Scripts ship as plugin resources and are extracted on startup — the IntelliJ analogue of reviewa's esbuild copy step.</p>
