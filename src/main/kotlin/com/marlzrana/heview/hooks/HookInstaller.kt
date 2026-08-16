@@ -5,10 +5,12 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.openapi.diagnostic.logger
+import com.intellij.util.EnvironmentUtil
 import com.marlzrana.heview.storage.HeviewPaths
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
@@ -19,9 +21,10 @@ import java.nio.file.attribute.PosixFilePermissions
  * in the agent's own config (`~/.claude/settings.json`, `~/.codex/{config.toml,hooks.json}`).
  *
  * Registration is idempotent (dedup by the injector filename in the command) and preserves unrelated
- * config; writes are atomic (tmp→rename) so a crash can't corrupt the user's config. Paths, `PATH`,
- * and the warning sink are injectable so everything is unit-testable against a temp directory without
- * a running IDE. heview's dedup marker never matches reviewa's, so both can register side-by-side.
+ * config. Safety: a present-but-unparseable config is left untouched (never clobbered); writes are
+ * atomic (tmp→rename) and follow a symlinked config to its real target; the command path is
+ * shell-quoted. Paths, `PATH`, and the warning sink are injectable so everything is unit-testable
+ * against a temp dir. heview's dedup marker never matches reviewa's, so both can register side-by-side.
  */
 class HookInstaller(
     private val claudeCodeHooksDir: Path = HeviewPaths.claudeCodeHooksDir,
@@ -29,19 +32,20 @@ class HookInstaller(
     private val claudeSettings: Path = HeviewPaths.claudeSettings,
     private val codexConfigToml: Path = HeviewPaths.codexConfigToml,
     private val codexHooksJson: Path = HeviewPaths.codexHooksJson,
-    private val pathEnv: String = System.getenv("PATH") ?: "",
+    // EnvironmentUtil loads the user's *login-shell* PATH; a GUI-launched IDE (Toolbox/Dock/Finder)
+    // otherwise sees only a bare PATH that misses /opt/homebrew/bin, ~/.local/bin, nvm, etc.
+    private val pathEnv: String = EnvironmentUtil.getValue("PATH") ?: System.getenv("PATH").orEmpty(),
     private val warn: (String) -> Unit = { LOG.warn(it) },
 ) {
-    /** For each agent whose CLI is on `PATH`: extract its script(s) and register the hook. */
+    /**
+     * Extract every bundled script (so upgrades always refresh on-disk copies, even for a CLI missing
+     * from the GUI PATH), then register an agent only if its script extracted AND its CLI is present.
+     */
     fun installAll() {
-        if (hasCli("claude")) {
-            extractClaudeCodeScripts()
-            registerClaudeCode()
-        }
-        if (hasCli("codex")) {
-            extractCodexScripts()
-            registerCodex()
-        }
+        val claudeExtracted = extractClaudeCodeScripts()
+        val codexExtracted = extractCodexScripts()
+        if (claudeExtracted && hasCli("claude")) registerClaudeCode()
+        if (codexExtracted && hasCli("codex")) registerCodex()
     }
 
     /** True if [name] resolves to an executable on `PATH` (a `which`-equivalent, no subprocess). */
@@ -52,27 +56,26 @@ class HookInstaller(
                 runCatching { Files.isExecutable(Path.of(dir).resolve(name)) }.getOrDefault(false)
             }
 
-    /** Extract (overwriting) the Claude Code injector + its bash wrapper into the hooks dir. */
-    fun extractClaudeCodeScripts() {
-        extract("claude-code", CLAUDE_JS, claudeCodeHooksDir)
-        extract("claude-code", CLAUDE_SH, claudeCodeHooksDir)
+    /** Extract (overwriting) the Claude Code injector + its bash wrapper. True if both landed. */
+    fun extractClaudeCodeScripts(): Boolean {
+        val js = extract("claude-code", CLAUDE_JS, claudeCodeHooksDir)
+        val sh = extract("claude-code", CLAUDE_SH, claudeCodeHooksDir)
+        return js && sh
     }
 
-    /** Extract (overwriting) the Codex injector into the hooks dir. */
-    fun extractCodexScripts() {
-        extract("codex", CODEX_PY, codexHooksDir)
-    }
+    /** Extract (overwriting) the Codex injector. True if it landed. */
+    fun extractCodexScripts(): Boolean = extract("codex", CODEX_PY, codexHooksDir)
 
     /** Register the Claude Code `UserPromptSubmit` hook in `~/.claude/settings.json`. */
     fun registerClaudeCode() {
-        val command = "bash ${claudeCodeHooksDir.resolve(CLAUDE_SH)}"
+        val command = "bash ${shellQuote(claudeCodeHooksDir.resolve(CLAUDE_SH).toString())}"
         registerUserPromptSubmit(claudeSettings, command, marker = CLAUDE_SH)
     }
 
     /** Enable codex hooks and register the `UserPromptSubmit` hook in `~/.codex/hooks.json`. */
     fun registerCodex() {
         ensureCodexHooksEnabled()
-        val command = "python3 ${codexHooksDir.resolve(CODEX_PY)}"
+        val command = "python3 ${shellQuote(codexHooksDir.resolve(CODEX_PY).toString())}"
         registerUserPromptSubmit(codexHooksJson, command, marker = CODEX_PY)
     }
 
@@ -82,7 +85,7 @@ class HookInstaller(
      * [marker] is present. Both Claude `settings.json` and Codex `hooks.json` share this shape.
      */
     private fun registerUserPromptSubmit(configPath: Path, command: String, marker: String) {
-        val root = readJsonObject(configPath) ?: JsonObject()
+        val root = loadConfigForEdit(configPath) ?: return // present-but-unparseable → leave it untouched
         val hooks = root.get("hooks")?.takeIf { it.isJsonObject }?.asJsonObject
             ?: JsonObject().also { root.add("hooks", it) }
         val entries = hooks.get("UserPromptSubmit")?.takeIf { it.isJsonArray }?.asJsonArray
@@ -126,15 +129,17 @@ class HookInstaller(
             return
         }
 
-        // The [features] section runs from its header to the next section header (or EOF).
-        val afterHeader = content.substring(features.range.first)
-        val nextSection = SECTION_HEADER.find(afterHeader.substring(1))?.range?.first
-        val featuresSection = if (nextSection == null) afterHeader else afterHeader.substring(0, nextSection + 1)
+        // The [features] section runs from its header to the next section header (or EOF). Search for
+        // the next section AFTER this header so its own '[' isn't re-matched — no substring/offset dance.
+        val headerEnd = features.range.last + 1
+        val nextSection = SECTION_HEADER.find(content, startIndex = headerEnd)?.range?.first
+        val featuresSection = content.substring(features.range.first, nextSection ?: content.length)
 
         val hooksFlag = CODEX_HOOKS_FLAG.find(featuresSection)
         when {
             hooksFlag == null ->
-                writeAtomically(codexConfigToml, content.replaceFirst(FEATURES_HEADER, "[features]\ncodex_hooks = true"))
+                // Insert right after the matched header, preserving the user's exact header text.
+                writeAtomically(codexConfigToml, content.substring(0, headerEnd) + "\ncodex_hooks = true" + content.substring(headerEnd))
             hooksFlag.groupValues[1] == "false" ->
                 warn("Codex hooks are disabled (codex_hooks = false in ~/.codex/config.toml); heview's Codex integration won't run until it's true.")
             // already true → nothing to do
@@ -145,41 +150,68 @@ class HookInstaller(
      * Copy a bundled script resource to `<destDir>/<filename>`, overwriting so upgrades take effect,
      * and mark it executable. Best-effort: a missing resource or a chmod failure is logged, not thrown.
      */
-    private fun extract(agent: String, filename: String, destDir: Path) {
+    private fun extract(agent: String, filename: String, destDir: Path): Boolean {
         val resource = "/hook-scripts/$agent/$filename"
-        try {
+        return try {
             Files.createDirectories(destDir)
             val dest = destDir.resolve(filename)
             val stream = javaClass.getResourceAsStream(resource)
             if (stream == null) {
                 LOG.warn("heview: bundled hook script missing from the plugin: $resource")
-                return
+                return false
             }
             stream.use { Files.copy(it, dest, StandardCopyOption.REPLACE_EXISTING) }
             runCatching { Files.setPosixFilePermissions(dest, EXECUTABLE) }
                 .onFailure { LOG.debug("heview: could not chmod $dest", it) }
+            true
         } catch (e: IOException) {
             LOG.warn("heview: failed to extract hook script $resource", e)
+            false
         }
     }
 
-    private fun readJsonObject(path: Path): JsonObject? =
-        try {
-            JsonParser.parseString(Files.readString(path)).takeIf { it.isJsonObject }?.asJsonObject
-        } catch (e: Exception) {
-            null // absent or invalid JSON → start fresh (matches reviewa)
-        }
+    /** POSIX single-quote a path so a home dir with spaces doesn't break the hook command. */
+    private fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
 
-    /** Write [text] to [path] via a temp file + atomic rename, so a crash can't corrupt the config. */
+    /**
+     * Load a config for editing. An **absent** file → a fresh object (we'll create it). A file that is
+     * present but **unreadable or not a JSON object** → `null`, so the caller leaves it untouched rather
+     * than clobbering recoverable user content (safer than reviewa, which starts fresh on any read/parse
+     * failure and would overwrite a hand-edited-mid-save or transiently-unreadable config).
+     */
+    private fun loadConfigForEdit(path: Path): JsonObject? {
+        val text = try {
+            Files.readString(path)
+        } catch (e: NoSuchFileException) {
+            return JsonObject()
+        } catch (e: IOException) {
+            warn("heview: could not read ${path}; leaving it untouched and skipping hook registration.")
+            return null
+        }
+        return try {
+            JsonParser.parseString(text).takeIf { it.isJsonObject }?.asJsonObject
+                ?: run { warn("heview: ${path} is not a JSON object; leaving it untouched."); null }
+        } catch (e: Exception) {
+            warn("heview: ${path} is not valid JSON; leaving it untouched and skipping hook registration.")
+            null
+        }
+    }
+
+    /**
+     * Write [text] to [path] via a temp file + atomic rename, so a crash can't corrupt the config. If
+     * [path] is a symlink (e.g. a dotfiles-managed config), resolve to its real target and rename over
+     * that, leaving the symlink itself in place rather than replacing it with a regular file.
+     */
     private fun writeAtomically(path: Path, text: String) {
         Files.createDirectories(path.parent)
-        val tmp = Files.createTempFile(path.parent, path.fileName.toString(), ".tmp")
+        val target = if (Files.exists(path)) path.toRealPath() else path
+        val tmp = Files.createTempFile(target.parent, target.fileName.toString(), ".tmp")
         try {
             Files.writeString(tmp, text)
             try {
-                Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE)
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE)
             } catch (e: IOException) {
-                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING)
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
             }
         } catch (e: IOException) {
             Files.deleteIfExists(tmp)
@@ -195,8 +227,10 @@ class HookInstaller(
         private val LOG = logger<HookInstaller>()
         private val EXECUTABLE = PosixFilePermissions.fromString("rwxr-xr-x")
         private val GSON = GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create()
-        private val FEATURES_HEADER = Regex("^\\[features\\]", RegexOption.MULTILINE)
-        private val SECTION_HEADER = Regex("^\\[", RegexOption.MULTILINE)
+        // Tolerate TOML header whitespace (`[ features ]`) so we edit the existing table instead of
+        // appending a duplicate one (which would make config.toml invalid).
+        private val FEATURES_HEADER = Regex("^\\s*\\[\\s*features\\s*\\]", RegexOption.MULTILINE)
+        private val SECTION_HEADER = Regex("^\\s*\\[", RegexOption.MULTILINE)
         private val CODEX_HOOKS_FLAG = Regex("^\\s*codex_hooks\\s*=\\s*(true|false)", RegexOption.MULTILINE)
     }
 }
