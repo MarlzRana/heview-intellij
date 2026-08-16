@@ -91,21 +91,24 @@ class CommentStore(
             Files.newDirectoryStream(commentsDir, "*.json").use { stream ->
                 stream.mapNotNull { path -> decodeIfValid(path) }
             }
-        } catch (e: IOException) {
-            LOG.warn("heview: failed to list the comments directory $commentsDir", e)
+        } catch (e: Exception) {
+            // Never let one bad file or listing error strand the once-only hydrate; log and move on.
+            LOG.warn("heview: failed to read the comments directory $commentsDir", e)
             emptyList()
         }
     }
 
     private fun decodeIfValid(path: Path): HeviewComment? {
         val expectedUuid = path.fileName.toString().removeSuffix(".json")
-        val comment = try {
+        // Nullable: Gson returns null (without throwing) for a literal `null` payload, and decode's
+        // declared non-null type does not insert a runtime check — so guard explicitly below.
+        val comment: HeviewComment? = try {
             CommentJson.decode(Files.readString(path))
         } catch (e: Exception) {
             LOG.warn("heview: skipping unreadable comment file $path", e)
             return null
         }
-        if (!isWellFormed(comment, expectedUuid)) {
+        if (comment == null || !isWellFormed(comment, expectedUuid)) {
             // Rejects schema-incomplete JSON (Gson leaves absent required fields null) and files whose
             // payload uuid doesn't match the filename — the latter both prevents `fileFor` path traversal
             // (e.g. a uuid of "../../.codex/hooks") and stops a stale file resurrecting on every restart.

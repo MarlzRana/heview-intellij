@@ -210,6 +210,47 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `hydrate skips a literal-null json file and still loads valid neighbors`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        Files.writeString(dir.resolve("nul.json"), "null") // Gson returns null without throwing
+        seed(dir, sampleComment(uuid = "good"))
+        val store = store(dir)
+        store.hydrate()
+        // The null file must not abort hydration for the whole pool.
+        assertEquals(listOf("good"), store.all().map { it.uuid })
+    }
+
+    @Test
+    fun `hydrate skips records with an unknown enum value`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        seed(dir, sampleComment(uuid = "ok"))
+        Files.writeString(
+            dir.resolve("badstatus.json"),
+            CommentJson.encode(sampleComment(uuid = "badstatus")).replace("\"pending\"", "\"frobnicated\""),
+        )
+        Files.writeString(
+            dir.resolve("badside.json"),
+            CommentJson.encode(sampleComment(uuid = "badside")).replace("\"file\"", "\"sideways\""),
+        )
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(listOf("ok"), store.all().map { it.uuid }) // unknown enum → null field → skipped
+    }
+
+    @Test
+    fun `hydrate skips a record with a non-positive line number`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("zero.json"),
+            CommentJson.encode(sampleComment(uuid = "zero")).replace("\"line_number\": 42", "\"line_number\": 0"),
+        )
+        val store = store(dir)
+        store.hydrate()
+        assertNull(store.get("zero"))
+        assertEquals(0, store.all().size)
+    }
+
+    @Test
     fun `hydrate does not load processed comments`(@TempDir dir: Path) {
         seed(dir, sampleComment(uuid = "p", status = CommentStatus.PROCESSED))
         seed(dir, sampleComment(uuid = "q", status = CommentStatus.PENDING))
