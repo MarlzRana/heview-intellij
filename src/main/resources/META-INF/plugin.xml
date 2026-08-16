@@ -16,6 +16,8 @@
         <postStartupActivity implementation="com.marlzrana.heview.HeviewStartupActivity"/>
         <!-- Shared in-memory index + persistence over ~/.heview/comments. -->
         <applicationService serviceImplementation="com.marlzrana.heview.storage.CommentStore"/>
+        <!-- Balloon group for hook-integration warnings (e.g. codex_hooks = false). -->
+        <notificationGroup id="heview" displayType="BALLOON"/>
     </extensions>
 
     <actions>
