@@ -9,19 +9,22 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.marlzrana.heview.hooks.HookInstaller
 import com.marlzrana.heview.ui.CommentInlayManager
+import com.marlzrana.heview.watch.CommentsPoolWatcher
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * On project open:
- * - boots the project's [CommentInlayManager] (editor + store listeners, pool hydration), and
+ * - boots the project's [CommentInlayManager] (editor + store listeners, pool hydration),
+ * - starts the application [CommentsPoolWatcher] (marks consumed comments *Seen*), and
  * - installs the coding-agent hooks once per application session.
  *
  * [CommentInlayManager.init] touches editors + the EDT-confined store, so it's dispatched to the EDT.
- * Hook installation is application-global work (edits `~/.claude` / `~/.codex`, and loading the shell
- * PATH via EnvironmentUtil can block), so it runs on an **application-pooled** thread — not this
- * project's coroutine — so project close can't cancel it and it isn't on the startup critical path.
- * It runs at most once per app, retries on the next project open after a failure, and is skipped in
- * unit-test / headless mode so tests can't touch the real `~/.claude` / `~/.codex`.
+ * The watcher (creates a NIO WatchService + directories) and hook installation (edits `~/.claude` /
+ * `~/.codex`; loading the shell PATH via EnvironmentUtil can block) are application-global blocking
+ * work, so they run on an **application-pooled** thread — not this project's coroutine — so project
+ * close can't cancel them and they're off the startup critical path. The watcher's own once-guard and
+ * the hook installer's once/retry flag dedup across repeated project opens; both are skipped in
+ * unit-test / headless mode so tests never spin a real watcher thread or touch `~/.claude` / `~/.codex`.
  */
 internal class HeviewStartupActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
@@ -32,24 +35,34 @@ internal class HeviewStartupActivity : ProjectActivity {
             project.disposed,
         )
 
-        maybeInstallHooks()
+        maybeStartAppSideEffects()
     }
 
-    private fun maybeInstallHooks() {
+    private fun maybeStartAppSideEffects() {
         val app = ApplicationManager.getApplication()
         if (!installationAllowed(app.isUnitTestMode, app.isHeadlessEnvironment)) return
-        if (!HOOKS_INSTALLED.compareAndSet(false, true)) return
         app.executeOnPooledThread {
-            val installed = try {
-                HookInstaller(warn = ::notifyHookWarning).installAll()
+            try {
+                // Idempotent: only the first call per app actually starts the watch thread.
+                service<CommentsPoolWatcher>().ensureStarted()
             } catch (e: Exception) {
-                thisLogger().warn("heview: hook installation failed", e)
-                false
+                thisLogger().warn("heview: failed to start the comments watcher", e)
             }
-            // installAll swallows per-agent failures (returning false); re-arm so a later project-open
-            // retries after a transient failure, rather than leaving one agent unhooked all session.
-            if (!installed) HOOKS_INSTALLED.set(false)
+            installHooksOnce()
         }
+    }
+
+    private fun installHooksOnce() {
+        if (!HOOKS_INSTALLED.compareAndSet(false, true)) return
+        val installed = try {
+            HookInstaller(warn = ::notifyHookWarning).installAll()
+        } catch (e: Exception) {
+            thisLogger().warn("heview: hook installation failed", e)
+            false
+        }
+        // installAll swallows per-agent failures (returning false); re-arm so a later project-open
+        // retries after a transient failure, rather than leaving one agent unhooked all session.
+        if (!installed) HOOKS_INSTALLED.set(false)
     }
 
     private fun notifyHookWarning(message: String) {
