@@ -69,6 +69,13 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
   hook and the plan §6 format. reviewa's *Codex* `hook.py` has a bug — JS-style `"\`"` escaping in Python
   yields a literal backslash + backtick — so heview intentionally diverges from reviewa's Codex *bytes* to
   match the documented contract. Do NOT flag the missing backslashes as drift.
+- **cwd matching uses a directory boundary** (`== cwd` or `startsWith(cwd + sep)`), NOT reviewa's raw
+  `startsWith(cwd)`. This is a sanctioned fix (plan §6): reviewa's raw prefix lets a session in `/a/app`
+  match + delete comments from the sibling `/a/app-backend`. Do NOT flag the boundary check as drift.
+- **A present-but-unparseable agent config is left untouched** (warn + skip), NOT overwritten fresh as
+  reviewa does. Sanctioned config-safety divergence (plan §6). Do NOT flag the skip-instead-of-clobber.
+- **Codex flag is `[features] hooks = true`** (canonical), not reviewa's `codex_hooks` (a deprecated
+  alias). Per current Codex docs. Do NOT flag the key change as drift.
 
 Flag any divergence that lacks such a recorded decision, even a small one.
 

@@ -231,7 +231,7 @@
   <thead><tr><th>Agent</th><th>Registered in</th><th>Event → command</th></tr></thead>
   <tbody>
     <tr><td>Claude Code</td><td><code>~/.claude/settings.json</code></td><td><code>UserPromptSubmit</code> → <code>bash ~/.heview/claude-code/hooks/user_prompt_submit_insert_comments_hook.sh</code></td></tr>
-    <tr><td>Codex</td><td><code>~/.codex/hooks.json</code> (+ <code>~/.codex/config.toml</code> flag <code>codex_hooks = true</code>)</td><td><code>UserPromptSubmit</code> → <code>python3 ~/.heview/codex/hooks/user_prompt_submit_insert_comments_hook.py</code></td></tr>
+    <tr><td>Codex</td><td><code>~/.codex/hooks.json</code> (+ <code>~/.codex/config.toml</code> flag <code>[features] hooks = true</code> — <code>codex_hooks</code> is a deprecated alias)</td><td><code>UserPromptSubmit</code> → <code>python3 ~/.heview/codex/hooks/user_prompt_submit_insert_comments_hook.py</code></td></tr>
   </tbody>
 </table>
 <p class="muted">Changes vs reviewa: the comment injectors are renamed from the generic <code>hook.js</code> / <code>hook.py</code> to descriptive, event-prefixed names (<code>user_prompt_submit_insert_comments_hook.*</code>), matching the <code>post_tool_use_plan_hook.*</code> convention; the injectors also move out of the loose <code>v1/</code> root into their own <code>&lt;agent&gt;/hooks/</code> dirs, and every path baked into the wrappers and registration commands is updated to <code>~/.heview/&lt;agent&gt;/hooks/…</code>. The scripts are otherwise functionally identical — same events, same read/format/delete logic (with <code>COMMENTS_DIR = ~/.heview/comments</code>).</p>
@@ -355,7 +355,7 @@ created in one and resolved in the other stays consistent.</p>
 <ol>
   <li>Reads <code>cwd</code> from stdin JSON.</li>
   <li>Scans <code>~/.heview/comments/*.json</code>.</li>
-  <li>Keeps a comment if its <code>intended_consumer</code> is absent or matches this agent, <b>and</b> its match-path (Claude: <code>logical_abs_path || abs_path</code>; Codex: <code>abs_path</code>) starts with <code>cwd</code>.</li>
+  <li>Keeps a comment if its <code>intended_consumer</code> is absent or matches this agent, <b>and</b> its match-path (Claude: <code>logical_abs_path || abs_path</code>; Codex: <code>abs_path</code>) is <b>under <code>cwd</code> at a directory boundary</b> (<code>== cwd</code> or starts with <code>cwd + "/"</code>). <span class="muted"><b>Divergence from reviewa (sanctioned):</b> reviewa uses a raw <code>startsWith(cwd)</code>, so a session in <code>/a/app</code> also matches — and, since injection deletes the file, <b>steals</b> — comments left in the sibling <code>/a/app-backend</code>. heview's boundary check fixes that cross-repo data loss.</span></li>
   <li>Sorts by <code>created_at</code>, formats each block, deletes the consumed files, emits <code>additionalContext</code>.</li>
 </ol>
 <p>Injected block format (byte-for-byte identical to reviewa's <em>Claude</em> hook):</p>
@@ -371,8 +371,9 @@ Your comment here</code></pre>
 <ul>
   <li><b>Extraction</b>: copy bundled scripts → <code>~/.heview/&lt;agent&gt;/hooks/</code>, <code>chmod 0755</code>. Overwrite on every startup so upgrades take effect.</li>
   <li><b>CLI detection</b>: register an agent's hook only if its CLI is on <code>PATH</code> (<code>which claude</code> / <code>which codex</code>).</li>
-  <li><b>Claude</b>: append a <code>UserPromptSubmit</code> entry to <code>~/.claude/settings.json</code> if no existing <code>heview</code> command is present (dedupe by command substring); strip any stale entries from prior registration slots.</li>
-  <li><b>Codex</b>: ensure <code>[features] codex_hooks = true</code> in <code>~/.codex/config.toml</code> (surface an IDE warning if explicitly <code>false</code>); append a <code>UserPromptSubmit</code> entry to <code>~/.codex/hooks.json</code>.</li>
+  <li><b>Claude</b>: append a <code>UserPromptSubmit</code> entry to <code>~/.claude/settings.json</code> if no existing heview injector is present (dedupe by the injector filename in the command).</li>
+  <li><b>Codex</b>: ensure <code>[features] hooks = true</code> in <code>~/.codex/config.toml</code> (the canonical key; <code>codex_hooks</code> is a deprecated alias — warn on an explicit <code>false</code> of either); append a <code>UserPromptSubmit</code> entry to <code>~/.codex/hooks.json</code>. <span class="muted">Codex also requires the user to <b>trust</b> the hook via <code>/hooks</code> before it runs.</span></li>
+  <li><b>Config safety (sanctioned divergence from reviewa):</b> a present-but-unparseable config (bad JSON, non-object root/members, non-UTF-8 TOML, unreadable) is <b>left untouched</b> (warn + skip), never overwritten. reviewa starts fresh on any parse/read failure, which would discard the user's recoverable settings. Writes are atomic (tmp→rename) and follow a symlinked config to its real target.</li>
 </ul>
 <div class="callout">The dedupe substring changes from <code>reviewa</code> to <code>heview</code>. Because the two products use different roots and different marker strings, a machine can run both side-by-side without their registrations colliding.</div>
 
