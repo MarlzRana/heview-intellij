@@ -14,10 +14,12 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 /**
- * Behavioral coverage for the bundled injector scripts — the load-bearing Phase 2 contract that the
- * installer tests can't see: actually run node / python3 against a seeded `~/.heview/comments` pool and
- * assert the injected `additionalContext`, clean backticks, cwd directory-boundary matching, consumer
- * routing, and single-use consumption. Skips gracefully where node / python3 aren't installed.
+ * Behavioral coverage for the bundled injector scripts — the load-bearing contract that the installer
+ * tests can't see: actually run node / python3 against a seeded `~/.heview/comments` pool and assert the
+ * injected `additionalContext`, clean backticks, cwd directory-boundary matching, consumer routing, and
+ * single-use consumption. Consumption is a **claim-by-move**: a consumed file is atomically moved into
+ * `comments/consumed/` (the intent signal the watcher reads), not unlinked. Skips gracefully where
+ * node / python3 aren't installed.
  */
 class HookScriptTest {
     private fun toolAvailable(vararg cmd: String): Boolean =
@@ -71,6 +73,11 @@ class HookScriptTest {
         return out
     }
 
+    private fun pending(home: Path, uuid: String) = Files.exists(home.resolve(".heview/comments/$uuid.json"))
+
+    private fun consumed(home: Path, uuid: String) =
+        Files.exists(home.resolve(".heview/comments/consumed/$uuid.json"))
+
     private fun additionalContext(stdout: String): String? {
         if (stdout.isBlank()) return null
         return JsonParser.parseString(stdout).asJsonObject
@@ -78,7 +85,7 @@ class HookScriptTest {
     }
 
     @Test
-    fun `claude and codex inject the identical clean-backtick block and consume the file`(@TempDir dir: Path) {
+    fun `claude and codex inject the identical clean-backtick block and claim the file into consumed`(@TempDir dir: Path) {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val expected = "In `sub/Foo.kt` at line 3:\n```\nval x = 1\n```\nmake it const"
 
@@ -87,13 +94,30 @@ class HookScriptTest {
         val claudeOut = additionalContext(run(claudeCmd(h1), h1, "/tmp/proj"))
         assertEquals(expected, claudeOut)
         assertFalse(claudeOut!!.contains("\\`")) // clean backticks, no literal backslash
-        assertFalse(Files.exists(h1.resolve(".heview/comments/c1.json"))) // single-use: consumed
+        assertFalse(pending(h1, "c1")) // left the pending pool…
+        assertTrue(consumed(h1, "c1")) // …by moving into consumed/ (single-use claim)
 
         val h2 = setupHome(dir.resolve("b"))
         seed(h2, "c1", "/tmp/proj/sub/Foo.kt", 3, "val x = 1", "make it const")
         val codexOut = additionalContext(run(codexCmd(h2), h2, "/tmp/proj"))
         assertEquals(expected, codexOut) // byte-identical to Claude
-        assertFalse(Files.exists(h2.resolve(".heview/comments/c1.json")))
+        assertFalse(pending(h2, "c1"))
+        assertTrue(consumed(h2, "c1"))
+    }
+
+    @Test
+    fun `a second run does not re-inject an already-consumed comment`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("rerun-$name"))
+            seed(home, "c1", "/tmp/proj/f.kt", 1, "x", "note")
+            assertNotNull(additionalContext(run(cmd(home), home, "/tmp/proj"))) // injected once
+            assertTrue(consumed(home, "c1"))                                    // claimed into consumed/
+            // The claimed file lives under consumed/, which the pool listing (*.json only) skips, so a
+            // second UserPromptSubmit finds nothing to inject — single-use holds across invocations.
+            assertNull(additionalContext(run(cmd(home), home, "/tmp/proj")))
+        }
     }
 
     @Test
@@ -148,7 +172,8 @@ class HookScriptTest {
             seed(home, "t1", "/tmp/proj/f.kt", 1, "x", "note")
             val out = additionalContext(run(cmd(home), home, "/tmp/proj/")) // note the trailing slash
             assertNotNull(out)
-            assertFalse(Files.exists(home.resolve(".heview/comments/t1.json"))) // matched + consumed
+            assertFalse(pending(home, "t1")) // matched + consumed
+            assertTrue(consumed(home, "t1")) // claimed into consumed/
         }
     }
 
@@ -162,7 +187,8 @@ class HookScriptTest {
             seed(home, "ok", "/tmp/proj/f.kt", 1, "x", "note")
             val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
             assertEquals("In `f.kt` at line 1:\n```\nx\n```\nnote", out) // valid one still injected
-            assertFalse(Files.exists(home.resolve(".heview/comments/ok.json"))) // valid consumed
+            assertFalse(pending(home, "ok")) // valid consumed…
+            assertTrue(consumed(home, "ok")) // …by moving into consumed/
             assertTrue(Files.exists(home.resolve(".heview/comments/bad.json"))) // corrupt left alone
         }
     }
@@ -176,11 +202,12 @@ class HookScriptTest {
         val claudeOut = additionalContext(run(claudeCmd(hc), hc, "/tmp/proj"))
         assertNotNull(claudeOut) // Claude matches via logical_abs_path
         assertTrue(claudeOut!!.contains("/tmp/other/x.kt")) // display uses abs_path (absolute, since outside cwd)
-        assertFalse(Files.exists(hc.resolve(".heview/comments/l1.json"))) // consumed by Claude
+        assertFalse(pending(hc, "l1")) // consumed by Claude…
+        assertTrue(consumed(hc, "l1")) // …moved into consumed/
 
         val hx = setupHome(dir.resolve("lp-codex"))
         seed(hx, "l1", "/tmp/other/x.kt", 5, "code", "note", logicalAbsPath = "/tmp/proj/x.kt")
         assertNull(additionalContext(run(codexCmd(hx), hx, "/tmp/proj"))) // Codex matches abs_path only
-        assertTrue(Files.exists(hx.resolve(".heview/comments/l1.json"))) // NOT consumed by Codex
+        assertTrue(pending(hx, "l1")) // NOT consumed by Codex
     }
 }

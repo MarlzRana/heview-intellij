@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const COMMENTS_DIR = path.join(require('os').homedir(), '.heview', 'comments');
+const CONSUMED_DIR = path.join(COMMENTS_DIR, 'consumed');
 
 function formatLineContent(comment) {
 	const prefix = comment.side === 'addition' ? '+' : comment.side === 'removal' ? '-' : '';
@@ -19,6 +20,20 @@ function isUnderCwd(p, cwd) {
 	const np = path.normalize(p);
 	const base = path.normalize(cwd).replace(/[/\\]+$/, '');
 	return np === base || np.startsWith(base + path.sep);
+}
+
+// Claim a comment by atomically moving its file into `comments/consumed/`. The move IS the single-use
+// claim: renameSync is atomic on the same filesystem, so of two concurrent agents only the one that
+// wins the rename emits the comment — the loser's rename throws (ENOENT) and it skips. Moving (rather
+// than unlinking) also leaves the intent signal heview's watcher reads to mark the thread "Seen".
+function claim(filePath, filename) {
+	try {
+		fs.mkdirSync(CONSUMED_DIR, { recursive: true });
+		fs.renameSync(filePath, path.join(CONSUMED_DIR, filename));
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 async function main() {
@@ -59,7 +74,7 @@ async function main() {
 			continue;
 		}
 
-		matchedComments.push({ comment, filePath });
+		matchedComments.push({ comment, filePath, file });
 	}
 
 	if (matchedComments.length === 0) {
@@ -69,19 +84,21 @@ async function main() {
 	matchedComments.sort((a, b) => (a.comment.created_at || '').localeCompare(b.comment.created_at || ''));
 
 	const parts = [];
-	for (const { comment } of matchedComments) {
+	for (const { comment, filePath, file } of matchedComments) {
 		const displayPath = isUnderCwd(comment.abs_path, cwd) ? path.relative(cwd, comment.abs_path) : comment.abs_path;
 		const formatted = formatLineContent(comment);
-		parts.push('In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content);
+		const block = 'In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content;
+		// Claim after formatting, emit only if we won it: a formatting error can't leave a comment
+		// claimed-but-not-injected, and two concurrent agents never inject the same comment.
+		if (!claim(filePath, file)) continue;
+		parts.push(block);
+	}
+
+	if (parts.length === 0) {
+		process.exit(0);
 	}
 
 	const additionalContext = parts.join('\n\n');
-
-	for (const { filePath } of matchedComments) {
-		try {
-			fs.unlinkSync(filePath);
-		} catch {}
-	}
 
 	const output = {
 		hookSpecificOutput: {

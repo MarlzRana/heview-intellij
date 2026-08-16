@@ -4,6 +4,7 @@ import os
 import sys
 
 COMMENTS_DIR = os.path.join(os.path.expanduser("~"), ".heview", "comments")
+CONSUMED_DIR = os.path.join(COMMENTS_DIR, "consumed")
 
 
 def format_line_content(comment):
@@ -20,6 +21,19 @@ def is_under_cwd(p, cwd):
     np = os.path.normpath(p)
     base = os.path.normpath(cwd).rstrip("/\\")
     return np == base or np.startswith(base + os.sep)
+
+
+def claim(filepath, filename):
+    # Atomically move the file into comments/consumed/ — the single-use claim. os.replace is atomic on
+    # the same filesystem, so of two concurrent agents only the one that wins the move emits the comment;
+    # the loser (file already gone) raises and returns False. Moving rather than unlinking also leaves the
+    # intent signal heview's watcher reads to mark the thread "Seen".
+    try:
+        os.makedirs(CONSUMED_DIR, exist_ok=True)
+        os.replace(filepath, os.path.join(CONSUMED_DIR, filename))
+        return True
+    except Exception:
+        return False
 
 
 def main():
@@ -53,7 +67,7 @@ def main():
         if not abs_path or not is_under_cwd(abs_path, cwd):
             continue
 
-        matched.append((comment, filepath))
+        matched.append((comment, filepath, filename))
 
     if not matched:
         sys.exit(0)
@@ -61,10 +75,9 @@ def main():
     matched.sort(key=lambda x: x[0].get("created_at", ""))
 
     # Format each comment defensively: a matched-but-schema-incomplete file is skipped (and NOT
-    # consumed), so one bad file can't abort the batch or delete a comment it never injected.
+    # claimed), so one bad file can't abort the batch or consume a comment it never injected.
     parts = []
-    emitted = []
-    for comment, filepath in matched:
+    for comment, filepath, filename in matched:
         try:
             rel_path = os.path.relpath(comment.get("abs_path") or "", cwd)
             block = (
@@ -79,19 +92,15 @@ def main():
             )
         except Exception:
             continue
+        # Claim after formatting; emit only what we won (see claim()).
+        if not claim(filepath, filename):
+            continue
         parts.append(block)
-        emitted.append(filepath)
 
     if not parts:
         sys.exit(0)
 
     additional_context = "\n\n".join(parts)
-
-    for filepath in emitted:
-        try:
-            os.unlink(filepath)
-        except Exception:
-            pass
 
     output = {
         "hookSpecificOutput": {
