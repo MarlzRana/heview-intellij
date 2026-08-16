@@ -201,8 +201,16 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             lineEndOffset = currentLineEndOffset(editor.document, comment),
             author = author,
             onDelete = { store.delete(it.uuid) },
+            onDispose = { disposed ->
+                // If the platform disposes the inlay (e.g. its text range was deleted), drop the stale
+                // entry so a later reconcile recreates the card instead of skipping it forever.
+                rendered[editor]?.values?.remove(disposed)
+                retireAnchorIfUnused(comment.uuid)
+            },
         )
-        return if (thread.startDisplay(comment)) thread else null
+        if (thread.startDisplay(comment)) return thread
+        retireAnchorIfUnused(comment.uuid) // placement declined — don't leak the anchor just created
+        return null
     }
 
     /**
@@ -263,4 +271,8 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         anchors.values.forEach { it.dispose() }
         anchors.clear()
     }
+
+    /** Live anchor count — lets a test assert no RangeMarker leaks on the unplaceable path. */
+    @TestOnly
+    internal fun anchorCountForTest(): Int = anchors.size
 }

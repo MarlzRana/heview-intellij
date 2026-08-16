@@ -41,13 +41,23 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
             private set
         var lastOffset = -1
             private set
+        private var last: Disposable? = null
 
         override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable {
             live++
             lastOffset = lineEndOffset
-            return Disposable { live-- }
+            return Disposable { live-- }.also { last = it }
         }
 
+        override fun disposeCard(card: Disposable) = Disposer.dispose(card)
+
+        /** Simulate the platform disposing the most recently placed inlay (e.g. its text was deleted). */
+        fun disposeLastReturned() = last?.let { Disposer.dispose(it) } ?: Unit
+    }
+
+    /** A host that always declines placement (addComponentInlay returning null). */
+    private class DecliningHost : InlayCardHost {
+        override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable? = null
         override fun disposeCard(card: Disposable) = Disposer.dispose(card)
     }
 
@@ -167,6 +177,54 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         val staleOffset = e1.document.getLineEndOffset(2) // where the stale line_number would place it
         assertEquals(liveOffset, hosts.getValue(e2).lastOffset) // followed the edit, not the snapshot
         assertTrue(liveOffset != staleOffset)
+    }
+
+    fun testBlankSubmitPersistsNothingAndStaysInCompose() {
+        val (e1, _) = openLocalEditor("H.txt", "a\n")
+        manager.init()
+        val thread = manager.compose(e1) ?: error("compose card was not placed")
+        assertEquals(1, liveCards(e1))
+
+        thread.submitForTest("   ") // settled decision: blank/whitespace is dropped
+        assertEquals(0, store.all().size) // nothing persisted
+        assertEquals(1, liveCards(e1)) // still the compose card, not flipped/duplicated
+    }
+
+    fun testTwoCommentsOnSameFileBothRenderAndDeletingOneLeavesTheOther() {
+        val (e1, path) = openLocalEditor("J.txt", "a\nb\nc\n")
+        val c1 = commentAt(path, line0Based = 0, content = "one")
+        store.save(c1)
+        store.save(commentAt(path, line0Based = 2, content = "two"))
+        manager.init()
+        assertEquals(2, liveCards(e1))
+
+        store.delete(c1.uuid)
+        assertEquals(1, liveCards(e1))
+    }
+
+    fun testPlatformDisposedDisplayCardIsRecreatedOnNextReconcile() {
+        val (e1, path) = openLocalEditor("K.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x")
+        store.save(comment)
+        manager.init()
+        val host = hosts.getValue(e1)
+        assertEquals(1, host.live)
+
+        host.disposeLastReturned() // the platform disposes the inlay (e.g. its text range was deleted)
+        assertEquals(0, host.live)
+
+        store.save(comment) // any store change re-reconciles e1; the self-removed card must come back
+        assertEquals(1, host.live)
+    }
+
+    fun testUnplaceableEditorTracksNothingAndLeaksNoAnchor() {
+        val (e1, path) = openLocalEditor("L.txt", "a\n")
+        manager.hostFactory = { DecliningHost() } // host cannot place a component inlay
+        store.save(commentAt(path, line0Based = 0, content = "x"))
+        manager.init() // reconcile → displayThread → startDisplay false → null, anchor retired
+
+        assertNull(manager.compose(e1)) // compose also returns null when placement is declined
+        assertEquals(0, manager.anchorCountForTest()) // no leaked RangeMarker on the unplaceable path
     }
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0

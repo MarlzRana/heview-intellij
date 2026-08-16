@@ -113,10 +113,12 @@ internal class CommentThread(
         return input
     }
 
-    /** Persist [text] (unless blank) via the compose callback and flip to display. */
+    /** Persist [text] via the compose callback and flip to display; blank/whitespace is dropped. */
     private fun submit(text: String) {
         // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
-        if (text.isNotBlank()) renderDisplay(composeSubmit!!(text))
+        if (text.isBlank()) return
+        val persist = checkNotNull(composeSubmit) { "submit() is only valid after startCompose" }
+        renderDisplay(persist(text))
     }
 
     /** Drive the submit path without a real button click / EditorTextField (UI-lifecycle test). */
