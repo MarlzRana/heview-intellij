@@ -44,7 +44,13 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
 - Gemini CLI support removed entirely.
 - Diff-side detection deferred → v1 comments always carry `side: "file"`.
 - Claude plan feature deferred.
-- Project-close cleanup is **scoped to the closing project**, not reviewa's "delete all pending".
+- Comments are **durable across IDE sessions**: `CommentStore.hydrate()` loads the pool on startup and
+  there is **no deactivation/project-close purge**. This is a deliberate divergence — reviewa's store
+  starts empty each session and `deleteAllPendingFiles()` wipes the pool on workspace close. A comment
+  leaves the pool only on explicit Delete or single-use hook consumption (see plan.html §5, "Session
+  lifetime"). Do NOT flag missing startup-empty behavior or missing close-time cleanup.
+- Project-close cleanup is **scoped to the closing project**, not reviewa's "delete all pending" — and is
+  a deferred Phase 3 item, so its current absence is expected.
 - Root is `~/.heview/` (not `~/.reviewa/v1/`); per-agent hook dirs; `heview` marker.
 - `workspace` is the IntelliJ project base path — a v1 approximation of reviewa's git-repo root.
   Hooks match by `abs_path`/`logical_abs_path` prefix (not `workspace`), so injection is unaffected.

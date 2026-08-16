@@ -265,6 +265,54 @@
    • Deleting the last actionable comment removes the file from disk.
    • created_at bumps on reply, edit, and re-pend (drives injection ordering).</code></pre>
 
+<h3>Session lifetime — a deliberate divergence: heview comments are durable</h3>
+<div class="callout warn">
+  <b>reviewa comments are session-scoped; heview comments persist across IDE restarts.</b> This is the
+  one intentional lifecycle change, introduced by the <code>CommentInlayManager</code> increment.
+</div>
+<table>
+  <thead><tr><th></th><th>reviewa (VS Code)</th><th>heview (IntelliJ)</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>On startup</b></td>
+      <td>The in-memory store starts <b>empty</b>. The extension never reads the pool on activation — the
+        only <code>readdirSync</code> of the comments dir lives in the <i>hook</i> scripts (agent-side).
+        A comment exists in the UI only if created in the current session.</td>
+      <td><code>CommentStore.hydrate()</code> reads <code>~/.heview/comments/*.json</code> into the index
+        on startup, and <code>CommentInlayManager</code> re-renders each as an inlay on the file it
+        belongs to. <b>Comments survive a restart.</b></td>
+    </tr>
+    <tr>
+      <td><b>On close</b></td>
+      <td><code>deactivate()</code> → <code>deleteAllPendingFiles()</code>: every pending file is unlinked,
+        its thread disposed, and the store cleared (<code>commentStore.ts</code>,
+        <code>extension.ts:42</code>). Workspace close <b>purges the pool</b>.</td>
+      <td><b>No purge.</b> A comment leaves the pool only on explicit <b>Delete</b>, or when an agent hook
+        <b>consumes</b> it (single-use — unchanged from reviewa). Scoped project-close cleanup is a
+        <span class="pill later">Phase&nbsp;3</span> item, and even then will be scoped to the closing
+        project — never reviewa's blanket "delete all pending".</td>
+    </tr>
+    <tr>
+      <td><b>On-disk role</b></td>
+      <td>A <b>transient</b> IPC channel to the hooks: files exist only for the life of the session.</td>
+      <td><b>Durable</b> state that also serves as the IPC channel to the hooks.</td>
+    </tr>
+  </tbody>
+</table>
+<p><b>Why diverge.</b> An inline review note shouldn't evaporate because you restarted the IDE or closed
+the project overnight — it should wait until the agent (or you) resolves it. Persistence also means a
+comment left in one session is still injectable from a terminal you open later. This matches how a review
+comment intuitively "sticks".</p>
+<div class="callout note">
+  <b>Consequence to manage.</b> Because the pool is now durable, a comment stays eligible for injection
+  (hooks match by <code>cwd</code> prefix) across restarts until it is consumed or deleted — it does not
+  self-clear the way reviewa's session purge did. Three mechanisms keep the pool honest: the user's
+  explicit <b>Delete</b>; <b>single-use hook consumption</b>; and the <span class="pill later">Phase&nbsp;3</span>
+  consumption watcher (marks a thread <i>Seen</i> when a hook deletes its file) plus scoped project-close
+  cleanup. <b>Until Phase&nbsp;3 lands there is no automatic cleanup — by design.</b> A stale <code>.json</code>
+  can be removed by hand from <code>~/.heview/comments/</code>.
+</div>
+
 <!-- ============================================================ -->
 <h2 id="hooks">6 · Hook integration (Claude &amp; Codex)</h2>
 <p>Scripts ship as plugin resources and are extracted on startup — the IntelliJ analogue of reviewa's esbuild copy step.</p>
