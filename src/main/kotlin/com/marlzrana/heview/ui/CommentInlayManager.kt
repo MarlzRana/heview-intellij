@@ -99,16 +99,15 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     }
 
     /** Open a compose card on the caret line of [editor]; persist and track it on submit. */
-    fun compose(editor: Editor) {
+    fun compose(editor: Editor): CommentThread? {
         // The action can fire before the startup activity ran init(); this is idempotent and EDT-only.
         init()
 
         val document = editor.document
-        val absPath = localAbsPath(editor) ?: return
-        val workspace = project.basePath ?: return
+        val absPath = localAbsPath(editor) ?: return null
+        val workspace = project.basePath ?: return null
         // The caret can sit in virtual space (past the last line); clamp so getLineEndOffset is safe.
-        val line = editor.caretModel.logicalPosition.line
-            .coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+        val line = clampLine(document, editor.caretModel.logicalPosition.line)
         val lineEndOffset = document.getLineEndOffset(line)
         // Track the anchor line across edits made while composing; read it again at submit.
         val anchor = document.createRangeMarker(document.getLineStartOffset(line), lineEndOffset)
@@ -131,7 +130,7 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
         val placed = thread.startCompose { text ->
             val rawLine = if (anchor.isValid) document.getLineNumber(anchor.startOffset) else line
-            val anchorLine = rawLine.coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+            val anchorLine = clampLine(document, rawLine)
             val lineContent = document.getText(
                 TextRange(document.getLineStartOffset(anchorLine), document.getLineEndOffset(anchorLine)),
             )
@@ -157,12 +156,13 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         }
 
         if (!placed) {
-            // No inlay was placed, so onDispose never runs — release the (unpromoted) anchor here.
-            if (!promoted && anchor.isValid) anchor.dispose()
+            // startCompose only runs onSubmit after place() succeeds, so the anchor was never promoted.
+            if (anchor.isValid) anchor.dispose()
             thisLogger().warn("heview: inline comments are not available in this editor")
-            return
+            return null
         }
         composing.getOrPut(editor) { HashSet() }.add(thread)
+        return thread
     }
 
     private fun onStoreChanged() {
@@ -181,10 +181,10 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         val desired = if (path == null) emptyMap() else store.forAbsPath(path).associateBy { it.uuid }
 
         // Remove cards whose comment is gone. Drop from the map before disposing so the card's
-        // onDispose never observes a stale entry; retire the anchor once the comment is gone everywhere.
+        // onDispose never observes a stale entry; retire the anchor once no editor shows the comment.
         cards.keys.filter { it !in desired }.forEach { uuid ->
             cards.remove(uuid)?.dispose()
-            if (store.get(uuid) == null) anchors.remove(uuid)?.dispose()
+            retireAnchorIfUnused(uuid)
         }
 
         // Add cards for comments not yet shown in this editor.
@@ -217,13 +217,20 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             existing
         } else {
             existing?.dispose() // invalid, or from a previous Document instance for this file
-            val line = (comment.lineNumber - 1).coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+            val line = clampLine(document, comment.lineNumber - 1)
             document.createRangeMarker(document.getLineStartOffset(line), document.getLineEndOffset(line))
                 .also { anchors[comment.uuid] = it }
         }
-        val line = document.getLineNumber(marker.startOffset)
-            .coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
-        return document.getLineEndOffset(line)
+        return document.getLineEndOffset(clampLine(document, document.getLineNumber(marker.startOffset)))
+    }
+
+    /** Clamp a 0-based line into the document, tolerating an empty document. */
+    private fun clampLine(document: Document, line: Int): Int =
+        line.coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+
+    /** Dispose a comment's shared anchor once no open editor still displays it. */
+    private fun retireAnchorIfUnused(uuid: String) {
+        if (rendered.values.none { it.containsKey(uuid) }) anchors.remove(uuid)?.dispose()
     }
 
     private fun track(editor: Editor, uuid: String, thread: CommentThread) {
@@ -232,8 +239,12 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
     /** Drop tracking for [editor] and dispose its cards (display + any in-flight compose). No-op if untracked. */
     private fun forget(editor: Editor) {
-        composing.remove(editor)?.toList()?.forEach { it.dispose() }
-        rendered.remove(editor)?.values?.toList()?.forEach { it.dispose() }
+        // Close path: the editor is going away, so skip scroll preservation on its cards.
+        composing.remove(editor)?.toList()?.forEach { it.dispose(preserveScroll = false) }
+        val cards = rendered.remove(editor) ?: return
+        val uuids = cards.keys.toList()
+        cards.values.toList().forEach { it.dispose(preserveScroll = false) }
+        uuids.forEach { retireAnchorIfUnused(it) } // drop anchors for comments no other editor shows
     }
 
     private fun isRelevant(editor: Editor): Boolean =

@@ -19,30 +19,26 @@ import javax.swing.JComponent
  * an `EditorScrollingPositionKeeper` so adding the block inlay doesn't jump the viewport.
  */
 internal class ComponentInlayCardHost(private val editor: Editor) : InlayCardHost {
-    override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable? {
-        val properties = InlayProperties().relatesToPrecedingText(true)
-        val keeper = EditorScrollingPositionKeeper(editor)
-        try {
-            keeper.savePosition()
-            val inlay = editor.addComponentInlay(
-                lineEndOffset,
-                properties,
-                card,
-                ComponentInlayAlignment.FIT_VIEWPORT_WIDTH,
-            ) ?: return null
-            keeper.restorePosition(false)
-            return inlay
-        } finally {
-            Disposer.dispose(keeper)
-        }
+    override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable? = preserveScroll {
+        editor.addComponentInlay(
+            lineEndOffset,
+            InlayProperties().relatesToPrecedingText(true),
+            card,
+            ComponentInlayAlignment.FIT_VIEWPORT_WIDTH,
+        )
     }
 
-    override fun disposeCard(card: Disposable) {
+    override fun disposeCard(card: Disposable) = preserveScroll {
+        Disposer.dispose(card) // removing the inlay shrinks editor height
+    }
+
+    // Save/restore the viewport around a block-inlay add or remove so editor-height changes above the
+    // fold don't jump the view. Restoring on the add-null path is harmless — no inlay, no height change.
+    private inline fun <T> preserveScroll(block: () -> T): T {
         val keeper = EditorScrollingPositionKeeper(editor)
         try {
             keeper.savePosition()
-            Disposer.dispose(card) // removing the inlay shrinks editor height
-            keeper.restorePosition(false)
+            return block().also { keeper.restorePosition(false) }
         } finally {
             Disposer.dispose(keeper)
         }

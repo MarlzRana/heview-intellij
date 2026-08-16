@@ -1,6 +1,7 @@
 package com.marlzrana.heview.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.EditorKind
@@ -9,6 +10,7 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
 import java.nio.file.Files
@@ -33,13 +35,16 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
     private val hosts = HashMap<Editor, RecordingHost>()
     private val openedEditors = mutableListOf<Editor>()
 
-    /** A host that counts live cards for one editor instead of placing a real inlay. */
+    /** A host that counts live cards (and records the last placement offset) for one editor. */
     private class RecordingHost : InlayCardHost {
         var live = 0
+            private set
+        var lastOffset = -1
             private set
 
         override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable {
             live++
+            lastOffset = lineEndOffset
             return Disposable { live-- }
         }
 
@@ -119,6 +124,49 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         EditorFactory.getInstance().releaseEditor(e1)
         openedEditors.remove(e1)
         assertEquals(0, liveCards(e1)) // editorReleased → forget → dispose
+    }
+
+    fun testInitHydratesPoolFilesIntoOpenEditors() {
+        val (editor, path) = openLocalEditor("G.txt", "a\nb\n")
+        // Write a valid comment straight to the pool (not via store.save) so init() must hydrate() it.
+        val uuid = "g1"
+        Files.createDirectories(tempDir.resolve("comments"))
+        Files.writeString(
+            tempDir.resolve("comments").resolve("$uuid.json"),
+            CommentJson.encode(commentAt(path, line0Based = 0, content = "from disk").copy(uuid = uuid)),
+        )
+        manager.init()
+        assertEquals(1, liveCards(editor)) // hydrate → reconcile → rendered
+    }
+
+    fun testComposeRendersOneCardWithNoDuplicateAndSplitGetsItsOwn() {
+        val (e1, _) = openLocalEditor("E.txt", "a\nb\n")
+        manager.init()
+        val thread = manager.compose(e1) ?: error("compose card was not placed")
+        assertEquals(1, liveCards(e1)) // the compose card
+
+        thread.submitForTest("my comment")
+        assertEquals(1, liveCards(e1)) // save-triggered reconcile must not add a duplicate
+        assertEquals(1, store.all().size) // persisted
+
+        val e2 = split(e1)
+        assertEquals(1, liveCards(e2)) // the split gets its own single card
+    }
+
+    fun testSplitPlacesCardAtLiveLineAfterEditAboveComment() {
+        val (e1, path) = openLocalEditor("F.txt", "l0\nl1\nl2\nl3\n")
+        store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        // Insert a line at the very top; the shared RangeMarker should follow it down one line.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+
+        val e2 = split(e1)
+        val liveOffset = e1.document.getLineEndOffset(3) // where the comment lives now
+        val staleOffset = e1.document.getLineEndOffset(2) // where the stale line_number would place it
+        assertEquals(liveOffset, hosts.getValue(e2).lastOffset) // followed the edit, not the snapshot
+        assertTrue(liveOffset != staleOffset)
     }
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0

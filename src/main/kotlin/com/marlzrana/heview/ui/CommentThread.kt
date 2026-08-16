@@ -12,6 +12,7 @@ import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextArea
 import com.intellij.util.ui.JBUI
 import com.marlzrana.heview.model.HeviewComment
+import org.jetbrains.annotations.TestOnly
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Dimension
@@ -50,10 +51,12 @@ internal class CommentThread(
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
     private var inlay: Disposable? = null
     private var disposed = false
+    private var composeSubmit: ((text: String) -> HeviewComment)? = null
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(onSubmit: (text: String) -> HeviewComment): Boolean {
-        val input = renderCompose(onSubmit)
+        composeSubmit = onSubmit
+        val input = renderCompose()
         if (!place()) return false
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
         // and realized (next EDT tick), guarded so we never focus a torn-down card or closed project.
@@ -80,16 +83,21 @@ internal class CommentThread(
         return true
     }
 
-    /** Tear down the inlay; safe to call more than once. Triggers the registered [onDispose]. */
-    fun dispose() {
+    /**
+     * Tear down the inlay; safe to call more than once. Triggers the registered [onDispose].
+     *
+     * [preserveScroll] keeps the editor's scroll position as the inlay is removed — right for
+     * app-initiated removals (delete/reconcile/cancel) where the editor stays open. Pass `false` on
+     * the editor-close path: the editor is going away, so the scroll-model work would be wasted.
+     */
+    fun dispose(preserveScroll: Boolean = true) {
         if (disposed) return
         disposed = true
-        // Route through the host so the editor's scroll position is preserved as the inlay is removed.
-        inlay?.let { host.disposeCard(it) } // triggers the registered onDispose
+        inlay?.let { if (preserveScroll) host.disposeCard(it) else Disposer.dispose(it) } // fires onDispose
         inlay = null
     }
 
-    private fun renderCompose(onSubmit: (text: String) -> HeviewComment): EditorTextField {
+    private fun renderCompose(): EditorTextField {
         // A real embedded editor (not a JBTextArea): it owns editor actions — Backspace/Enter/arrows/
         // undo edit the comment, instead of leaking to the underlying code editor.
         val input = EditorTextField("", project, PlainTextFileType.INSTANCE).apply {
@@ -99,17 +107,21 @@ internal class CommentThread(
             preferredSize = Dimension(1, JBUI.scale(64))
             addSettingsProvider { it.settings.isUseSoftWraps = true }
         }
-        val submit = JButton("Submit").apply {
-            addActionListener {
-                val text = input.text
-                // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
-                if (text.isNotBlank()) renderDisplay(onSubmit(text))
-            }
-        }
+        val submit = JButton("Submit").apply { addActionListener { submit(input.text) } }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
         setContent(center = input, south = buttonRow(cancel, submit))
         return input
     }
+
+    /** Persist [text] (unless blank) via the compose callback and flip to display. */
+    private fun submit(text: String) {
+        // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
+        if (text.isNotBlank()) renderDisplay(composeSubmit!!(text))
+    }
+
+    /** Drive the submit path without a real button click / EditorTextField (UI-lifecycle test). */
+    @TestOnly
+    internal fun submitForTest(text: String) = submit(text)
 
     private fun renderDisplay(current: HeviewComment) {
         val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
