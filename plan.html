@@ -211,7 +211,9 @@
 <p>The directory heview-intellij owns. Comments are pooled (so whichever agent runs first consumes them); everything else is separated per coding agent.</p>
 <pre><code>~/.heview/
 ├─ comments/                                          # SHARED pool — one &lt;uuid&gt;.json per thread
-│                                                     # first-come consumption across agents
+│  └─ consumed/                                       # (Phase 3) hooks move a consumed file here (not
+│                                                     #   unlink) so the watcher can tell consumption
+│                                                     #   from a peer/user delete; first-come across agents
 ├─ claude-code/
 │  ├─ hooks/
 │  │  ├─ user_prompt_submit_insert_comments_hook.js   # comment injector (Node)
@@ -328,12 +330,17 @@ in-memory index + inlays against filesystem events:</p>
   <li><b>MODIFY</b> (a peer edited content/status, or <code>created_at</code> bumped) → re-read the file and
     refresh the card. Concurrent edits settle as <b>last-writer-wins</b> — acceptable for v1 (files are
     per-uuid, writes are atomic tmp→rename, edits are rare).</li>
-  <li><b>DELETE</b> is the hard one — three causes are <i>indistinguishable on the filesystem</i>: a hook
-    <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should vanish
-    silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set). Telling
-    consumption from peer-deletion needs an <b>intent signal</b> — e.g. hooks move consumed files into a
-    <code>~/.heview/comments/consumed/</code> dir (or drop a tombstone) instead of a bare <code>unlink</code>.
-    Absent that, fall back to: treat any unexplained delete as "gone".</li>
+  <li><b>DELETE</b> is the hard one — three causes are <i>indistinguishable on a bare <code>unlink</code></i>:
+    a hook <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should
+    vanish silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set).
+    <b>Decided (maintainer):</b> the hooks provide the intent signal by <b>moving a consumed file into
+    <code>~/.heview/comments/consumed/</code></b> instead of unlinking it. The watcher then reads the signal:
+    a file that <i>moved to <code>consumed/</code></i> → consumed → mark <i>Seen</i>; a file that simply
+    <i>vanished</i> (and isn't in the suppression set) → peer/user delete → gone. <span class="muted">Ships
+    with the Phase&nbsp;3 watcher — the hooks change from <code>unlink</code> to move-into-<code>consumed/</code>
+    then, since nothing reads <code>consumed/</code> until the watcher exists. Needs a retention/cleanup policy
+    for <code>consumed/</code> (e.g. the watcher unlinks after it marks the thread) so it doesn't grow
+    unbounded, and the renamed VS Code plugin must share the same convention.</span></li>
 </ul>
 <p class="muted">This also matters for the VS Code side: when heview-vscode adopts the durable model, both
 plugins should share one watcher contract (same events, same tombstone/consumed convention) so a comment
