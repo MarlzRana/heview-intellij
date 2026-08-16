@@ -2,7 +2,7 @@
 name: intellij-platform
 description: Reviews IntelliJ Platform correctness for heview — EDT threading, read/write actions, Disposer & inlay lifecycle, service scoping, and experimental-API usage.
 harnesses:
-  - { harness: codex, model: gpt-5.6-sol, thinking: xhigh }
+  - { harness: codex, model: gpt-5.6-terra, thinking: xhigh }
   - { harness: pi, model: xai/grok-4.6 }
   - { harness: claude-code, model: claude-opus-4-8 }
 auto-activate-paths:

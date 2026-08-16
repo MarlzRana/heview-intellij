@@ -251,6 +251,8 @@
   "intended_consumer": "claude_code"    // optional; absent = any agent
 }</code></pre>
 
+<p class="muted"><b>v1 field simplifications (sanctioned):</b> <code>side</code> is always <code>"file"</code> (diff-side detection deferred); <code>logical_abs_path == abs_path</code> (plan remap deferred); <code>workspace</code> is the IntelliJ project base path, a v1 approximation of reviewa's git-repo root (hooks match by <code>abs_path</code> prefix, so injection is unaffected).</p>
+
 <h3>State machine (UI-side, preserved)</h3>
 <pre><code>          create                     hook / copy consumes file
  (none) ─────────▶ PENDING ───────────────────────────────▶ PROCESSED ("Seen")

@@ -24,8 +24,9 @@ import javax.swing.JPanel
  *
  * Phase 1 covers the create → display → delete loop: [startCompose] shows an empty compose card;
  * Submit calls [onSubmit] (which persists and returns the stored record) and flips to display mode;
- * Delete calls [onDelete] and removes the inlay. Replies / edit / re-pend and the consumption
- * watcher arrive in later increments.
+ * Delete calls [onDelete] and removes the inlay; Cancel discards. [onDispose] runs whenever the card
+ * is torn down (Cancel/Delete), letting the caller release any resources it owns. Replies / edit /
+ * re-pend and the consumption watcher arrive in later increments.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -36,24 +37,27 @@ internal class CommentThread(
     private val author: String,
     private val onSubmit: (text: String) -> HeviewComment,
     private val onDelete: (comment: HeviewComment) -> Unit,
+    private val onDispose: () -> Unit = {},
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
     private var inlay: Disposable? = null
-    private var comment: HeviewComment? = null
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(): Boolean {
         val input = renderCompose()
         inlay = host.addCardBelow(lineEndOffset, panel) ?: return false
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
-        // and realized (next EDT tick) — otherwise the user has to click the card before typing.
-        ApplicationManager.getApplication().invokeLater {
-            IdeFocusManager.getInstance(project).requestFocus(input, true)
-        }
+        // and realized (next EDT tick). The expiry guard prevents focusing a disposed component if
+        // the project closes or the card is torn down before the tick runs.
+        ApplicationManager.getApplication().invokeLater(
+            { IdeFocusManager.getInstance(project).requestFocus(input, true) },
+            project.disposed,
+        )
         return true
     }
 
     private fun dispose() {
+        onDispose()
         inlay?.let { Disposer.dispose(it) }
         inlay = null
     }
@@ -71,25 +75,23 @@ internal class CommentThread(
         val submit = JButton("Submit").apply {
             addActionListener {
                 val text = input.text.trim()
-                if (text.isNotEmpty()) {
-                    comment = onSubmit(text)
-                    renderDisplay()
-                }
+                if (text.isNotEmpty()) renderDisplay(onSubmit(text))
             }
         }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
-        setContent(input, buttonRow(cancel, submit))
+        setContent(center = input, south = buttonRow(cancel, submit))
         return input
     }
 
-    private fun renderDisplay() {
-        val current = comment ?: return
+    private fun renderDisplay(current: HeviewComment) {
         val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
             add(JBLabel(author))
             add(JBLabel("Pending").apply { foreground = JBColor.ORANGE })
         }
         val body = JBTextArea(current.content).apply {
             isEditable = false
+            // Non-focusable so clicks don't route Backspace/Enter/arrows to the host code editor.
+            isFocusable = false
             isOpaque = false
             lineWrap = true
             wrapStyleWord = true
@@ -101,24 +103,17 @@ internal class CommentThread(
                 dispose()
             }
         }
-        panel.removeAll()
-        panel.add(header, BorderLayout.NORTH)
-        panel.add(body, BorderLayout.CENTER)
-        panel.add(buttonRow(delete), BorderLayout.SOUTH)
-        reflow()
+        setContent(center = body, south = buttonRow(delete), north = header)
     }
 
     private fun buttonRow(vararg buttons: JButton): JPanel =
         JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { buttons.forEach { add(it) } }
 
-    private fun setContent(center: Component, south: Component) {
+    private fun setContent(center: Component, south: Component, north: Component? = null) {
         panel.removeAll()
+        if (north != null) panel.add(north, BorderLayout.NORTH)
         panel.add(center, BorderLayout.CENTER)
         panel.add(south, BorderLayout.SOUTH)
-        reflow()
-    }
-
-    private fun reflow() {
         panel.revalidate()
         panel.repaint()
     }

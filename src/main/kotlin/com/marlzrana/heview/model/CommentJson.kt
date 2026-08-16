@@ -8,10 +8,11 @@ import com.google.gson.GsonBuilder
  *
  * Keys are snake_case via `@SerializedName`, so files are byte-compatible with reviewa's schema and
  * readable by the same coding-agent hooks. Gson omits null fields, so an absent `intended_consumer`
- * is left out entirely — matching reviewa's optional field.
+ * is left out entirely — matching reviewa's optional field. HTML escaping is disabled so `<`, `>`,
+ * `&`, `=`, `'` in code/comment text are emitted literally, matching reviewa's `JSON.stringify`.
  */
 object CommentJson {
-    private val gson: Gson = GsonBuilder().setPrettyPrinting().create()
+    private val gson: Gson = GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create()
 
     fun encode(comment: HeviewComment): String = gson.toJson(comment)
 

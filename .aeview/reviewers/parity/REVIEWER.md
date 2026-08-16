@@ -2,7 +2,7 @@
 name: parity
 description: Reviews faithfulness to reviewa-vscode semantics and the shared ~/.heview contract — comment lifecycle, injection format, and state transitions must match the source.
 harnesses:
-  - { harness: codex, model: gpt-5.6-sol, thinking: xhigh }
+  - { harness: codex, model: gpt-5.6-terra, thinking: xhigh }
   - { harness: pi, model: xai/grok-4.6 }
   - { harness: claude-code, model: claude-opus-4-8 }
 auto-activate-paths:
@@ -46,6 +46,8 @@ These are recorded decisions in `plan.html`; treat them as correct, not drift:
 - Claude plan feature deferred.
 - Project-close cleanup is **scoped to the closing project**, not reviewa's "delete all pending".
 - Root is `~/.heview/` (not `~/.reviewa/v1/`); per-agent hook dirs; `heview` marker.
+- `workspace` is the IntelliJ project base path — a v1 approximation of reviewa's git-repo root.
+  Hooks match by `abs_path`/`logical_abs_path` prefix (not `workspace`), so injection is unaffected.
 - The VS Code plugin is NOT being updated yet — parity means matching reviewa's *semantics/contract*,
   never calling into it.
 

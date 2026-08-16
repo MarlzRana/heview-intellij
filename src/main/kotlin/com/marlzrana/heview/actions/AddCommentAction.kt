@@ -5,24 +5,24 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.components.service
+import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.util.TextRange
-import com.marlzrana.heview.model.CommentSide
-import com.marlzrana.heview.model.CommentStatus
-import com.marlzrana.heview.model.HeviewComment
+import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
 import com.marlzrana.heview.ui.CommentThread
 import com.marlzrana.heview.ui.ComponentInlayCardHost
-import java.time.Instant
-import java.util.UUID
+import com.marlzrana.heview.util.HeviewTime
 
 /**
  * Leaves an inline review comment on the caret line: opens a compose card as an editor inlay and,
- * on submit, persists a [HeviewComment] to the shared pool via the [CommentStore] service.
+ * on submit, persists a [com.marlzrana.heview.model.HeviewComment] to the shared pool via the
+ * [CommentStore] service.
  *
- * v1 comments carry `side = FILE` (no diff-side detection yet) and `logical_abs_path == abs_path`
- * (no plan remapping yet). `workspace` is the project base path — a v1 simplification of reviewa's
- * git-repo-root; the coding-agent hooks match by `cwd` prefix, so the project base is sufficient.
+ * The line is captured through a [com.intellij.openapi.editor.RangeMarker] and read at *submit*
+ * time, so edits made while the compose card is open don't leave a stale `line_number`/`line_content`.
+ * `workspace` is the project base path — a v1 simplification of reviewa's git-repo root (plan.html);
+ * the hooks match by `cwd` prefix on `abs_path`, so the project base is sufficient.
  */
 internal class AddCommentAction : AnAction() {
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
@@ -44,11 +44,9 @@ internal class AddCommentAction : AnAction() {
 
         val document = editor.document
         val line = editor.caretModel.logicalPosition.line
-        val lineNumber = line + 1
-        val lineContent = document.getText(
-            TextRange(document.getLineStartOffset(line), document.getLineEndOffset(line)),
-        )
         val lineEndOffset = document.getLineEndOffset(line)
+        // Track the anchor line across edits made while composing; read it again at submit.
+        val anchor = document.createRangeMarker(document.getLineStartOffset(line), lineEndOffset)
 
         val store = service<CommentStore>()
         val author = System.getProperty("user.name") ?: "You"
@@ -59,21 +57,26 @@ internal class AddCommentAction : AnAction() {
             lineEndOffset = lineEndOffset,
             author = author,
             onSubmit = { text ->
-                HeviewComment(
-                    uuid = UUID.randomUUID().toString(),
-                    status = CommentStatus.PENDING,
-                    createdAt = Instant.now().toString(),
+                val anchorLine = document.getLineNumber(anchor.startOffset)
+                val lineContent = document.getText(
+                    TextRange(document.getLineStartOffset(anchorLine), document.getLineEndOffset(anchorLine)),
+                )
+                if (anchor.isValid) anchor.dispose()
+                newFileComment(
                     workspace = workspace,
                     absPath = absPath,
-                    logicalAbsPath = absPath,
-                    lineNumber = lineNumber,
+                    line0Based = anchorLine,
                     lineContent = lineContent,
-                    side = CommentSide.FILE,
                     content = text,
+                    createdAt = HeviewTime.nowIso(),
                 ).also(store::save)
             },
             onDelete = { comment -> store.delete(comment.uuid) },
+            onDispose = { if (anchor.isValid) anchor.dispose() },
         )
-        thread.startCompose()
+
+        if (!thread.startCompose()) {
+            thisLogger().warn("heview: inline comments are not available in this editor")
+        }
     }
 }

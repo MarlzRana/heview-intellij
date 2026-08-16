@@ -27,6 +27,19 @@ class CommentJsonTest {
     }
 
     @Test
+    fun `encodes processed, addition and removal as reviewa wire strings`() {
+        assertTrue(CommentJson.encode(sampleComment(status = CommentStatus.PROCESSED)).contains("\"processed\""))
+        assertTrue(CommentJson.encode(sampleComment(side = CommentSide.ADDITION)).contains("\"addition\""))
+        assertTrue(CommentJson.encode(sampleComment(side = CommentSide.REMOVAL)).contains("\"removal\""))
+    }
+
+    @Test
+    fun `does not HTML-escape angle brackets and ampersands`() {
+        val json = CommentJson.encode(sampleComment().copy(content = "a <T> && b = c"))
+        assertTrue(json.contains("a <T> && b = c"), json)
+    }
+
+    @Test
     fun `omits intended_consumer when null`() {
         val json = CommentJson.encode(sampleComment(intendedConsumer = null))
         assertFalse(json.contains("intended_consumer"), json)

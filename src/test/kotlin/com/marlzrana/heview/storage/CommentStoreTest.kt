@@ -1,5 +1,6 @@
 package com.marlzrana.heview.storage
 
+import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.sampleComment
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -12,9 +13,12 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class CommentStoreTest {
+    // Synchronous executors so the async disk path runs inline and deterministically in tests.
+    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runOnEdt = { it.run() })
+
     @Test
     fun `save writes a file and indexes the record`(@TempDir dir: Path) {
-        val store = CommentStore(dir)
+        val store = store(dir)
         store.save(sampleComment(uuid = "u1"))
         assertTrue(Files.exists(dir.resolve("u1.json")))
         assertEquals("u1", store.get("u1")?.uuid)
@@ -22,8 +26,23 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `save persists the exact shared-contract JSON`(@TempDir dir: Path) {
+        val original = sampleComment(uuid = "u1")
+        store(dir).save(original)
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(original, onDisk)
+    }
+
+    @Test
+    fun `save creates the comments directory if it does not exist`(@TempDir dir: Path) {
+        val nested = dir.resolve("does/not/exist/comments")
+        store(nested).save(sampleComment(uuid = "u1"))
+        assertTrue(Files.exists(nested.resolve("u1.json")))
+    }
+
+    @Test
     fun `pending and processed counts reflect statuses`(@TempDir dir: Path) {
-        val store = CommentStore(dir)
+        val store = store(dir)
         store.save(sampleComment(uuid = "p1", status = CommentStatus.PENDING))
         store.save(sampleComment(uuid = "p2", status = CommentStatus.PENDING))
         store.save(sampleComment(uuid = "d1", status = CommentStatus.PROCESSED))
@@ -33,7 +52,7 @@ class CommentStoreTest {
 
     @Test
     fun `save upserts an existing record in place`(@TempDir dir: Path) {
-        val store = CommentStore(dir)
+        val store = store(dir)
         store.save(sampleComment(uuid = "u1", status = CommentStatus.PENDING))
         store.save(sampleComment(uuid = "u1", status = CommentStatus.PROCESSED))
         assertEquals(1, store.all().size)
@@ -42,7 +61,7 @@ class CommentStoreTest {
 
     @Test
     fun `delete removes the file and the record`(@TempDir dir: Path) {
-        val store = CommentStore(dir)
+        val store = store(dir)
         store.save(sampleComment(uuid = "u1"))
         store.delete("u1")
         assertFalse(Files.exists(dir.resolve("u1.json")))
@@ -50,8 +69,17 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `delete of an unknown uuid is a no-op and fires no change`(@TempDir dir: Path) {
+        val store = store(dir)
+        var count = 0
+        store.addChangeListener { count++ }
+        store.delete("missing")
+        assertEquals(0, count)
+    }
+
+    @Test
     fun `change listener fires on save and delete`(@TempDir dir: Path) {
-        val store = CommentStore(dir)
+        val store = store(dir)
         var count = 0
         store.addChangeListener { count++ }
         store.save(sampleComment(uuid = "u1"))

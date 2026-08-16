@@ -2,7 +2,7 @@
 name: simplify
 description: Reviews the change for Kotlin/IntelliJ simplification — removable code, needless abstraction, and lower-LOC equivalents that preserve behavior.
 harnesses:
-  - { harness: codex, model: gpt-5.6-sol, thinking: xhigh }
+  - { harness: codex, model: gpt-5.6-terra, thinking: xhigh }
   - { harness: pi, model: xai/grok-4.6 }
 auto-activate-paths:
   - "**/*.kt"

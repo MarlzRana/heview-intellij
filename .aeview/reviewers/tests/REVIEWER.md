@@ -2,7 +2,7 @@
 name: tests
 description: Reviews test quality for heview — whether the change's real behavior (store, hooks, watcher, state machine, inlays) is actually covered.
 harnesses:
-  - { harness: codex, model: gpt-5.6-sol }
+  - { harness: codex, model: gpt-5.6-terra }
   - { harness: pi, model: xai/grok-4.6 }
   - { harness: claude-code, model: claude-opus-4-8 }
 auto-activate-paths:
