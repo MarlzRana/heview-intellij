@@ -4,9 +4,11 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.EditorKind
+import com.intellij.openapi.editor.RangeMarker
 import com.intellij.openapi.editor.event.EditorFactoryEvent
 import com.intellij.openapi.editor.event.EditorFactoryListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -32,8 +34,12 @@ import com.marlzrana.heview.util.HeviewTime
  * manager tracks the resulting thread before [CommentStore.save] fires: reconcile then sees the card
  * as already present and never renders a duplicate in the composing editor.
  *
+ * Cards are placed at a live document position, not the stored `line_number`: one [RangeMarker] per
+ * comment ([anchors]) — created on first display, or promoted from the compose anchor on submit —
+ * lets a newly opened split place the card on the comment's *current* line even after edits above it.
+ *
  * EDT-confined: [init] is invoked on the EDT and every callback (editor events, store change, the
- * hydrate hop) reaches us on the EDT, so the [rendered] map needs no locking.
+ * hydrate hop) reaches us on the EDT, so the maps need no locking.
  */
 @Service(Service.Level.PROJECT)
 internal class CommentInlayManager(private val project: Project) : Disposable {
@@ -44,6 +50,15 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     // map (even with an empty value) while open, so a later store change can render new comments
     // into an editor that currently shows none.
     private val rendered = HashMap<Editor, MutableMap<String, CommentThread>>()
+
+    // In-flight compose cards, per editor, kept out of `rendered` so reconcile never cancels them but
+    // forget()/dispose() still tear them down (a compose card open at project close / plugin unload).
+    private val composing = HashMap<Editor, MutableSet<CommentThread>>()
+
+    // One document RangeMarker per comment uuid; tracks the live line so recreated cards don't use the
+    // stale persisted line_number. Disposed when the comment leaves the store or the manager disposes.
+    private val anchors = HashMap<String, RangeMarker>()
+
     private var initialized = false
 
     /** Wire the listeners, render already-open editors, and hydrate the store. Idempotent; EDT-only. */
@@ -76,56 +91,69 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
     /** Open a compose card on the caret line of [editor]; persist and track it on submit. */
     fun compose(editor: Editor) {
+        // The action can fire before the startup activity ran init(); this is idempotent and EDT-only.
+        init()
+
         val document = editor.document
-        val file = FileDocumentManager.getInstance().getFile(document) ?: return
-        if (!file.isInLocalFileSystem) return
+        val absPath = localAbsPath(editor) ?: return
         val workspace = project.basePath ?: return
-        val absPath = file.toNioPath().toString()
         // The caret can sit in virtual space (past the last line); clamp so getLineEndOffset is safe.
         val line = editor.caretModel.logicalPosition.line
             .coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
         val lineEndOffset = document.getLineEndOffset(line)
         // Track the anchor line across edits made while composing; read it again at submit.
         val anchor = document.createRangeMarker(document.getLineStartOffset(line), lineEndOffset)
+        var promoted = false
 
-        lateinit var thread: CommentThread
-        thread = CommentThread(
+        val thread = CommentThread(
             project = project,
             host = ComponentInlayCardHost(editor),
             lineEndOffset = lineEndOffset,
             author = author,
             onDelete = { store.delete(it.uuid) },
-            onSubmit = { text ->
-                val rawLine = if (anchor.isValid) document.getLineNumber(anchor.startOffset) else line
-                val anchorLine = rawLine.coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
-                val lineContent = document.getText(
-                    TextRange(document.getLineStartOffset(anchorLine), document.getLineEndOffset(anchorLine)),
-                )
-                val comment = newFileComment(
-                    workspace = workspace,
-                    absPath = absPath,
-                    line0Based = anchorLine,
-                    lineContent = lineContent,
-                    content = text,
-                    createdAt = HeviewTime.nowIso(),
-                )
-                // Track BEFORE save: save() fires the change listener synchronously, which reconciles
-                // this editor — registering first means reconcile treats the card as already present
-                // and won't render a duplicate. Other editors on this file still get their own card.
-                track(editor, comment.uuid, thread)
-                store.save(comment)
-                comment
-            },
-            onDispose = {
-                if (anchor.isValid) anchor.dispose()
-                rendered[editor]?.values?.remove(thread)
+            onDispose = { disposed ->
+                // If the anchor was promoted into the registry it belongs to the comment now; the
+                // registry disposes it (store-removal / manager dispose), not this card's teardown.
+                if (!promoted && anchor.isValid) anchor.dispose()
+                composing[editor]?.remove(disposed)
+                rendered[editor]?.values?.remove(disposed)
             },
         )
 
-        if (!thread.startCompose()) {
-            if (anchor.isValid) anchor.dispose()
-            thisLogger().warn("heview: inline comments are not available in this editor")
+        val placed = thread.startCompose { text ->
+            val rawLine = if (anchor.isValid) document.getLineNumber(anchor.startOffset) else line
+            val anchorLine = rawLine.coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+            val lineContent = document.getText(
+                TextRange(document.getLineStartOffset(anchorLine), document.getLineEndOffset(anchorLine)),
+            )
+            val comment = newFileComment(
+                workspace = workspace,
+                absPath = absPath,
+                line0Based = anchorLine,
+                lineContent = lineContent,
+                content = text,
+                createdAt = HeviewTime.nowIso(),
+            )
+            // Promote the compose anchor (it has tracked edits since caret time) so recreated cards in
+            // other splits place on the current line, not the persisted one.
+            promoted = true
+            anchors[comment.uuid] = anchor
+            // Track BEFORE save: save() fires the change listener synchronously, which reconciles this
+            // editor — registering first means reconcile treats the card as present and won't render a
+            // duplicate. Other editors on this file still get their own card.
+            track(editor, comment.uuid, thread)
+            composing[editor]?.remove(thread)
+            store.save(comment)
+            comment
         }
+
+        if (!placed) {
+            // No inlay was placed, so onDispose never runs — release the (unpromoted) anchor here.
+            if (!promoted && anchor.isValid) anchor.dispose()
+            thisLogger().warn("heview: inline comments are not available in this editor")
+            return
+        }
+        composing.getOrPut(editor) { HashSet() }.add(thread)
     }
 
     private fun onStoreChanged() {
@@ -139,15 +167,16 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             forget(editor)
             return
         }
-        val path = FileDocumentManager.getInstance().getFile(editor.document)
-            ?.takeIf { it.isInLocalFileSystem }
-            ?.toNioPath()?.toString()
+        val path = localAbsPath(editor)
         val cards = rendered.getOrPut(editor) { LinkedHashMap() }
         val desired = if (path == null) emptyMap() else store.forAbsPath(path).associateBy { it.uuid }
 
         // Remove cards whose comment is gone. Drop from the map before disposing so the card's
-        // onDispose never observes a stale entry.
-        cards.keys.filter { it !in desired }.forEach { uuid -> cards.remove(uuid)?.dispose() }
+        // onDispose never observes a stale entry; retire the anchor once the comment is gone everywhere.
+        cards.keys.filter { it !in desired }.forEach { uuid ->
+            cards.remove(uuid)?.dispose()
+            if (store.get(uuid) == null) anchors.remove(uuid)?.dispose()
+        }
 
         // Add cards for comments not yet shown in this editor.
         for ((uuid, comment) in desired) {
@@ -157,35 +186,61 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     }
 
     private fun displayThread(editor: Editor, comment: HeviewComment): CommentThread? {
-        val document = editor.document
-        val line = (comment.lineNumber - 1).coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
-        val lineEndOffset = document.getLineEndOffset(line)
         val thread = CommentThread(
             project = project,
             host = ComponentInlayCardHost(editor),
-            lineEndOffset = lineEndOffset,
+            lineEndOffset = currentLineEndOffset(editor.document, comment),
             author = author,
             onDelete = { store.delete(it.uuid) },
         )
         return if (thread.startDisplay(comment)) thread else null
     }
 
+    /**
+     * The line-end offset where [comment]'s card should sit *now*. All editors of a file share one
+     * Document, so a single per-uuid [RangeMarker] (created here on first display, at the persisted
+     * line, and reused thereafter) follows edits — a split opened after lines were inserted above the
+     * comment places the card on the current line, not the stale `line_number`.
+     */
+    private fun currentLineEndOffset(document: Document, comment: HeviewComment): Int {
+        val existing = anchors[comment.uuid]
+        val marker = if (existing != null && existing.isValid && existing.document === document) {
+            existing
+        } else {
+            existing?.dispose() // invalid, or from a previous Document instance for this file
+            val line = (comment.lineNumber - 1).coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+            document.createRangeMarker(document.getLineStartOffset(line), document.getLineEndOffset(line))
+                .also { anchors[comment.uuid] = it }
+        }
+        val line = document.getLineNumber(marker.startOffset)
+            .coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
+        return document.getLineEndOffset(line)
+    }
+
     private fun track(editor: Editor, uuid: String, thread: CommentThread) {
         rendered.getOrPut(editor) { LinkedHashMap() }[uuid] = thread
     }
 
-    /** Drop tracking for [editor] and dispose its cards. No-op if the editor was never tracked. */
+    /** Drop tracking for [editor] and dispose its cards (display + any in-flight compose). No-op if untracked. */
     private fun forget(editor: Editor) {
-        val cards = rendered.remove(editor) ?: return
-        cards.values.toList().forEach { it.dispose() }
+        composing.remove(editor)?.toList()?.forEach { it.dispose() }
+        rendered.remove(editor)?.values?.toList()?.forEach { it.dispose() }
     }
 
     private fun isRelevant(editor: Editor): Boolean =
         editor.project == project &&
             editor.editorKind == EditorKind.MAIN_EDITOR &&
-            FileDocumentManager.getInstance().getFile(editor.document)?.isInLocalFileSystem == true
+            localAbsPath(editor) != null
+
+    /** This editor's file as an absolute OS path, or null if it isn't a local file. */
+    private fun localAbsPath(editor: Editor): String? =
+        FileDocumentManager.getInstance().getFile(editor.document)
+            ?.takeIf { it.isInLocalFileSystem }
+            ?.toNioPath()?.toString()
 
     override fun dispose() {
-        rendered.keys.toList().forEach { forget(it) }
+        (rendered.keys + composing.keys).toSet().forEach { forget(it) }
+        anchors.values.forEach { it.dispose() }
+        anchors.clear()
     }
 }

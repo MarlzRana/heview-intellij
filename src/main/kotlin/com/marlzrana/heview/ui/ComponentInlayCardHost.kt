@@ -36,4 +36,15 @@ internal class ComponentInlayCardHost(private val editor: Editor) : InlayCardHos
             Disposer.dispose(keeper)
         }
     }
+
+    override fun disposeCard(card: Disposable) {
+        val keeper = EditorScrollingPositionKeeper(editor)
+        try {
+            keeper.savePosition()
+            Disposer.dispose(card) // removing the inlay shrinks editor height
+            keeper.restorePosition(false)
+        } finally {
+            Disposer.dispose(keeper)
+        }
+    }
 }

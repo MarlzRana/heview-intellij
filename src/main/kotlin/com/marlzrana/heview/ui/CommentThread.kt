@@ -23,17 +23,19 @@ import javax.swing.JPanel
  * A single comment thread rendered as an editor inlay card via [InlayCardHost].
  *
  * Two entry points, mutually exclusive per instance:
- * - [startCompose] opens an empty compose card; Submit calls [onSubmit] (which persists and returns
- *   the stored record) and flips to display; Delete calls [onDelete] and removes the inlay; Cancel
- *   discards. Used for the create flow.
+ * - [startCompose] opens an empty compose card; its `onSubmit` argument persists and returns the
+ *   stored record, then the card flips to display; Delete calls [onDelete] and removes the inlay;
+ *   Cancel discards. Used for the create flow. `onSubmit` lives on the method (not the constructor)
+ *   so display cards can't be handed a compose callback they must never use.
  * - [startDisplay] renders an already-persisted comment straight in display mode (no compose step).
  *   Used by the [com.marlzrana.heview.ui.CommentInlayManager] when hydrating existing comments into
  *   newly opened editors.
  *
  * [onDispose] is registered on the inlay, so it runs on *any* teardown — Cancel/Delete or the
  * platform disposing the inlay when the editor closes — letting the caller release resources it
- * owns (e.g. the line anchor) and drop its bookkeeping. Replies / edit / re-pend and the consumption
- * watcher arrive in later increments.
+ * owns (e.g. the line anchor) and drop its bookkeeping. It receives this thread so the owner can
+ * identify which card was torn down. Replies / edit / re-pend and the consumption watcher arrive in
+ * later increments.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -43,16 +45,15 @@ internal class CommentThread(
     private val lineEndOffset: Int,
     private val author: String,
     private val onDelete: (comment: HeviewComment) -> Unit,
-    private val onSubmit: (text: String) -> HeviewComment = { error("CommentThread has no compose callback") },
-    private val onDispose: () -> Unit = {},
+    private val onDispose: (thread: CommentThread) -> Unit = {},
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
     private var inlay: Disposable? = null
     private var disposed = false
 
     /** Place the compose card below the target line. Returns false if the host could not place it. */
-    fun startCompose(): Boolean {
-        val input = renderCompose()
+    fun startCompose(onSubmit: (text: String) -> HeviewComment): Boolean {
+        val input = renderCompose(onSubmit)
         if (!place()) return false
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
         // and realized (next EDT tick), guarded so we never focus a torn-down card or closed project.
@@ -75,7 +76,7 @@ internal class CommentThread(
         inlay = placed
         // Run onDispose on any teardown, including the platform disposing the inlay on editor close;
         // set `disposed` so queued UI callbacks (focus, delete-enable) become no-ops.
-        Disposer.register(placed, Disposable { disposed = true; onDispose() })
+        Disposer.register(placed, Disposable { disposed = true; onDispose(this@CommentThread) })
         return true
     }
 
@@ -83,11 +84,12 @@ internal class CommentThread(
     fun dispose() {
         if (disposed) return
         disposed = true
-        inlay?.let { Disposer.dispose(it) } // triggers the registered onDispose
+        // Route through the host so the editor's scroll position is preserved as the inlay is removed.
+        inlay?.let { host.disposeCard(it) } // triggers the registered onDispose
         inlay = null
     }
 
-    private fun renderCompose(): EditorTextField {
+    private fun renderCompose(onSubmit: (text: String) -> HeviewComment): EditorTextField {
         // A real embedded editor (not a JBTextArea): it owns editor actions — Backspace/Enter/arrows/
         // undo edit the comment, instead of leaking to the underlying code editor.
         val input = EditorTextField("", project, PlainTextFileType.INSTANCE).apply {

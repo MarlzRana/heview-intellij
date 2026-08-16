@@ -20,4 +20,13 @@ internal interface InlayCardHost {
      *   `null` if the host could not place it (e.g. the editor does not support component inlays).
      */
     fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable?
+
+    /**
+     * Dispose a [card] previously returned by [addCardBelow], preserving the editor's scroll position.
+     *
+     * Removing a block inlay changes editor height; if the card sits above the viewport this would jump
+     * the view. Use this for app-initiated removals (delete / reconcile). Platform-initiated disposal on
+     * editor close does not need it — the editor is going away — so it can dispose the handle directly.
+     */
+    fun disposeCard(card: Disposable)
 }
