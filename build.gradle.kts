@@ -1,3 +1,5 @@
+import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+
 plugins {
     java
     alias(libs.plugins.kotlin)
@@ -22,6 +24,8 @@ dependencies {
         )
         pluginVerifier()
         zipSigner()
+        // Platform test framework → BasePlatformTestCase for the CommentInlayManager UI-lifecycle test.
+        testFramework(TestFrameworkType.Platform)
     }
 
     // Bundled with the plugin: the IntelliJ Platform does not expose Gson on the plugin classpath,
@@ -33,6 +37,10 @@ dependencies {
 
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    // BasePlatformTestCase extends junit.framework.TestCase (JUnit3/4): the JUnit4 jar is needed at
+    // compile time, and the vintage engine runs it under useJUnitPlatform() beside the Jupiter tests.
+    testImplementation("junit:junit:4.13.2")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
 }
 
 kotlin {

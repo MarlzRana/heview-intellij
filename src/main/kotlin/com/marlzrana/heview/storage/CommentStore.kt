@@ -196,9 +196,10 @@ class CommentStore(
     companion object {
         private val LOG = logger<CommentStore>()
 
-        // Single-threaded so disk writes/deletes for the same comment can't race.
+        // Single-threaded so disk writes/deletes for the same comment can't race. The platform
+        // requires a capitalized pool name (BoundedTaskExecutor asserts this).
         private val IO_POOL by lazy {
-            AppExecutorUtil.createBoundedApplicationPoolExecutor("heview-comment-io", 1)
+            AppExecutorUtil.createBoundedApplicationPoolExecutor("Heview comment IO", 1)
         }
     }
 }

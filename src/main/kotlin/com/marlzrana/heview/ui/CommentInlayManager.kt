@@ -19,6 +19,7 @@ import com.marlzrana.heview.model.HeviewComment
 import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
 import com.marlzrana.heview.util.HeviewTime
+import org.jetbrains.annotations.TestOnly
 
 /**
  * Owns the inlay cards for a project: it is the single controller that creates, tracks and disposes
@@ -43,7 +44,10 @@ import com.marlzrana.heview.util.HeviewTime
  */
 @Service(Service.Level.PROJECT)
 internal class CommentInlayManager(private val project: Project) : Disposable {
-    private val store: CommentStore get() = service()
+    // A test can point the manager at a temp-dir store instead of the shared application service.
+    @set:TestOnly
+    internal var storeOverride: CommentStore? = null
+    private val store: CommentStore get() = storeOverride ?: service()
     private val author: String get() = System.getProperty("user.name") ?: "You"
 
     // Every relevant open editor -> its display cards keyed by comment uuid. An editor stays in the
@@ -60,6 +64,11 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     private val anchors = HashMap<String, RangeMarker>()
 
     private var initialized = false
+
+    // Which InlayCardHost backs a given editor. Real code uses the experimental component-inlay host;
+    // the UI-lifecycle test swaps in a fake so it can assert reconcile/tracking without a live inlay.
+    @set:TestOnly
+    internal var hostFactory: (Editor) -> InlayCardHost = { ComponentInlayCardHost(it) }
 
     /** Wire the listeners, render already-open editors, and hydrate the store. Idempotent; EDT-only. */
     fun init() {
@@ -107,7 +116,7 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
         val thread = CommentThread(
             project = project,
-            host = ComponentInlayCardHost(editor),
+            host = hostFactory(editor),
             lineEndOffset = lineEndOffset,
             author = author,
             onDelete = { store.delete(it.uuid) },
@@ -188,7 +197,7 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     private fun displayThread(editor: Editor, comment: HeviewComment): CommentThread? {
         val thread = CommentThread(
             project = project,
-            host = ComponentInlayCardHost(editor),
+            host = hostFactory(editor),
             lineEndOffset = currentLineEndOffset(editor.document, comment),
             author = author,
             onDelete = { store.delete(it.uuid) },

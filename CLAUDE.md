@@ -16,7 +16,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 32 JUnit5 unit tests — the gate
+    ./gradlew test          # 43 tests — the gate (JUnit5 unit tests + a JUnit3/4 BasePlatformTestCase via the vintage engine)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -66,11 +66,18 @@ and the action. `CommentInlayManager` is a light `@Service` — intentionally NO
 
 <conventions>
 - Keep the experimental inlay call ONLY inside `ComponentInlayCardHost`; everything else goes through `InlayCardHost`.
-- Tests: JUnit5 (`tasks.test { useJUnitPlatform() }`). Pure logic is tested against a `@TempDir` + an
-  injected synchronous executor: `CommentStore(dir, runIo = { it.run() })`. Shared factory
-  `sampleComment(...)` in `src/test/.../Factories.kt`. Platform-fixture tests (BasePlatformTestCase) for
-  the inlay/action UI path are deferred to the CommentInlayManager increment. Every change adds/updates
-  tests; `./gradlew test` must be green before considering a change done.
+- Tests: JUnit5 (`tasks.test { useJUnitPlatform() }`) for pure logic — tested against a `@TempDir` + an
+  injected synchronous executor: `CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() })`. Shared
+  factory `sampleComment(...)` in `src/test/.../Factories.kt`.
+- UI-lifecycle tests use a **JUnit3/4 `BasePlatformTestCase`** (`ui/CommentInlayManagerTest.kt`), run under
+  the same `useJUnitPlatform()` via the **junit-vintage** engine; the platform test framework comes from
+  `intellijPlatform { testFramework(TestFrameworkType.Platform) }` + `junit:junit` on the test classpath.
+  Pattern: construct a dedicated `CommentInlayManager(project)` (NOT the service singleton — the real
+  startup activity drives that), inject a temp-dir store via `manager.storeOverride` and a fake
+  `manager.hostFactory` (records live-card counts, avoids the experimental inlay API), and drive real
+  local-file editors via `EditorFactory.createEditor(...)`. Whitelist the temp dir with
+  `VfsRootAccess.allowRootAccess(testRootDisposable, tempDir.toRealPath().toString())` (macOS /var→/private/var).
+- Every change adds/updates tests; `./gradlew test` must be green before considering a change done.
 - Commits: conventional prefixes (feat/fix/refactor/nit), imperative; use the `commit` skill's message
   guidance; end EVERY message with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Commit
   directly to `main`, incrementally ("commit as you go"). The maintainer runs pushes — don't push unless asked.

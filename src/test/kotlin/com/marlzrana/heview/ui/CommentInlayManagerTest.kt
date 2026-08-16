@@ -1,0 +1,155 @@
+package com.marlzrana.heview.ui
+
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.editor.EditorKind
+import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
+import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.marlzrana.heview.model.newFileComment
+import com.marlzrana.heview.storage.CommentStore
+import java.nio.file.Files
+import java.nio.file.Path
+import javax.swing.JComponent
+
+/**
+ * Platform-fixture coverage for [CommentInlayManager]'s editor/store lifecycle — the increment's core
+ * behavior, which the pure JUnit5 store tests can't see (addresses aeview finding [1]).
+ *
+ * The manager gates on local files (`isInLocalFileSystem`), so these use real temp files and real
+ * [Editor]s created via [EditorFactory]. A fake [InlayCardHost] (injected through the manager's
+ * test-only `hostFactory`) records live-card counts per editor, so the assertions test reconcile /
+ * tracking / teardown without depending on the experimental component-inlay API or a visible editor.
+ * The application [CommentStore] is replaced with a synchronous, temp-dir-backed instance so the real
+ * `~/.heview` pool is never touched.
+ */
+class CommentInlayManagerTest : BasePlatformTestCase() {
+    private lateinit var tempDir: Path
+    private lateinit var store: CommentStore
+    private lateinit var manager: CommentInlayManager
+    private val hosts = HashMap<Editor, RecordingHost>()
+    private val openedEditors = mutableListOf<Editor>()
+
+    /** A host that counts live cards for one editor instead of placing a real inlay. */
+    private class RecordingHost : InlayCardHost {
+        var live = 0
+            private set
+
+        override fun addCardBelow(lineEndOffset: Int, card: JComponent): Disposable {
+            live++
+            return Disposable { live-- }
+        }
+
+        override fun disposeCard(card: Disposable) = Disposer.dispose(card)
+    }
+
+    override fun setUp() {
+        super.setUp()
+        // toRealPath so the whitelisted root matches the VFS's canonical path (macOS /var → /private/var).
+        tempDir = Files.createTempDirectory("heview-fixture").toRealPath()
+        // The fixture guards VFS access to a few allowed roots; our temp files live outside them.
+        VfsRootAccess.allowRootAccess(testRootDisposable, tempDir.toString())
+        store = CommentStore(tempDir.resolve("comments"), runIo = { it.run() }, runEdt = { it.run() })
+        // A dedicated manager instance (not the project-service singleton the real startup activity
+        // drives) with an injected temp-dir store and fake host, so the test is fully isolated.
+        manager = CommentInlayManager(project)
+        Disposer.register(testRootDisposable, manager)
+        manager.storeOverride = store
+        manager.hostFactory = { editor -> hosts.getOrPut(editor) { RecordingHost() } }
+    }
+
+    override fun tearDown() {
+        try {
+            openedEditors.toList().forEach {
+                if (!it.isDisposed) EditorFactory.getInstance().releaseEditor(it)
+            }
+            openedEditors.clear()
+        } finally {
+            super.tearDown()
+        }
+    }
+
+    fun testInitRendersCardOnAlreadyOpenEditorAndIsIdempotent() {
+        val (editor, path) = openLocalEditor("A.txt", "line0\nline1\nline2\n")
+        store.save(commentAt(path, line0Based = 0, content = "hi"))
+
+        manager.init() // reopened-project path: editor was open before listeners were wired
+        assertEquals(1, liveCards(editor))
+
+        manager.init() // idempotent — no second card
+        assertEquals(1, liveCards(editor))
+    }
+
+    fun testSplitGetsCardAndDeleteRemovesItFromEverySplit() {
+        val (e1, path) = openLocalEditor("B.txt", "a\nb\nc\n")
+        val comment = commentAt(path, line0Based = 1, content = "look here")
+        store.save(comment)
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        val e2 = split(e1) // editorCreated → reconcile the new split
+        assertEquals(1, liveCards(e2))
+        assertEquals(1, liveCards(e1))
+
+        store.delete(comment.uuid) // store change → reconcile every split
+        assertEquals(0, liveCards(e1))
+        assertEquals(0, liveCards(e2))
+    }
+
+    fun testReconcileDoesNotDuplicateAnExistingCard() {
+        val (e1, path) = openLocalEditor("C.txt", "x\ny\n")
+        store.save(commentAt(path, line0Based = 0, content = "one"))
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        // An unrelated change re-reconciles e1; the existing card must not be rendered twice.
+        store.save(commentAt("/somewhere/else.txt", line0Based = 0, content = "other file"))
+        assertEquals(1, liveCards(e1))
+    }
+
+    fun testReleasingAnEditorDisposesItsCards() {
+        val (e1, path) = openLocalEditor("D.txt", "p\nq\n")
+        store.save(commentAt(path, line0Based = 0, content = "bye"))
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        EditorFactory.getInstance().releaseEditor(e1)
+        openedEditors.remove(e1)
+        assertEquals(0, liveCards(e1)) // editorReleased → forget → dispose
+    }
+
+    private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0
+
+    private fun commentAt(absPath: String, line0Based: Int, content: String) =
+        newFileComment(
+            workspace = project.basePath ?: tempDir.toString(),
+            absPath = absPath,
+            line0Based = line0Based,
+            lineContent = "",
+            content = content,
+            createdAt = "2026-01-01T00:00:00.000Z",
+        )
+
+    private fun openLocalEditor(name: String, text: String): Pair<Editor, String> {
+        val file = tempDir.resolve(name)
+        Files.writeString(file, text)
+        val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(file)
+            ?: error("could not locate $file in the VFS")
+        val document = FileDocumentManager.getInstance().getDocument(vf) ?: error("no document for $file")
+        val editor = EditorFactory.getInstance()
+            .createEditor(document, project, vf, false, EditorKind.MAIN_EDITOR)
+        openedEditors += editor
+        return editor to vf.toNioPath().toString()
+    }
+
+    private fun split(editor: Editor): Editor {
+        val vf = FileDocumentManager.getInstance().getFile(editor.document)!!
+        val e = EditorFactory.getInstance()
+            .createEditor(editor.document, project, vf, false, EditorKind.MAIN_EDITOR)
+        openedEditors += e
+        return e
+    }
+}
