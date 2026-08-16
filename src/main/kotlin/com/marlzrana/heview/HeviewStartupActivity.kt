@@ -9,6 +9,8 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.marlzrana.heview.hooks.HookInstaller
 import com.marlzrana.heview.ui.CommentInlayManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -34,14 +36,17 @@ internal class HeviewStartupActivity : ProjectActivity {
         installHooksOncePerApp()
     }
 
-    private fun installHooksOncePerApp() {
+    private suspend fun installHooksOncePerApp() {
         val app = ApplicationManager.getApplication()
         if (app.isUnitTestMode || app.isHeadlessEnvironment) return
         if (!HOOKS_INSTALLED.compareAndSet(false, true)) return
-        try {
-            HookInstaller(warn = ::notifyHookWarning).installAll()
-        } catch (e: Exception) {
-            thisLogger().warn("heview: hook installation failed", e)
+        // PATH scan + config reads/writes are blocking I/O → the IO dispatcher, not the startup default.
+        withContext(Dispatchers.IO) {
+            try {
+                HookInstaller(warn = ::notifyHookWarning).installAll()
+            } catch (e: Exception) {
+                thisLogger().warn("heview: hook installation failed", e)
+            }
         }
     }
 
