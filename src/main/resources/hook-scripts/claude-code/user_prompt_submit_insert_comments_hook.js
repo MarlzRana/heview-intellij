@@ -12,8 +12,10 @@ function formatLineContent(comment) {
 }
 
 // Match on directory boundaries so cwd `/a/app` does not capture `/a/app-backend`.
+// Strip trailing separators first so cwd `/a/app/` (or `/`) still matches its descendants.
 function isUnderCwd(p, cwd) {
-	return p === cwd || p.startsWith(cwd + path.sep);
+	const base = cwd.replace(/[/\\]+$/, '');
+	return p === base || p.startsWith(base + path.sep);
 }
 
 async function main() {

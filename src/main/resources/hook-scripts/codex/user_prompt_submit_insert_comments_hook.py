@@ -14,7 +14,9 @@ def format_line_content(comment):
 
 def is_under_cwd(p, cwd):
     # Match on directory boundaries so cwd /a/app does not capture /a/app-backend.
-    return p == cwd or p.startswith(cwd + os.sep)
+    # Strip trailing separators so cwd /a/app/ (or /) still matches its descendants.
+    base = cwd.rstrip("/\\")
+    return p == base or p.startswith(base + os.sep)
 
 
 def main():
@@ -35,7 +37,7 @@ def main():
     for filename in files:
         filepath = os.path.join(COMMENTS_DIR, filename)
         try:
-            with open(filepath, "r") as fh:
+            with open(filepath, "r", encoding="utf-8") as fh:
                 comment = json.load(fh)
         except Exception:
             continue
@@ -57,17 +59,18 @@ def main():
 
     parts = []
     for comment, _ in matched:
-        rel_path = os.path.relpath(comment["abs_path"], cwd)
+        # Lenient reads: a matched-but-schema-incomplete file must not abort the whole batch.
+        rel_path = os.path.relpath(comment.get("abs_path", ""), cwd)
         formatted = format_line_content(comment)
         parts.append(
             "In `"
             + rel_path
             + "` at line "
-            + str(comment["line_number"])
+            + str(comment.get("line_number", ""))
             + ":\n```\n"
             + formatted
             + "\n```\n"
-            + comment["content"]
+            + comment.get("content", "")
         )
 
     additional_context = "\n\n".join(parts)

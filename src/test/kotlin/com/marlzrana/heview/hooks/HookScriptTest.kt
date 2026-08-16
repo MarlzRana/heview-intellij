@@ -3,6 +3,7 @@ package com.marlzrana.heview.hooks
 import com.google.gson.JsonParser
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -44,11 +45,11 @@ class HookScriptTest {
         return home
     }
 
-    private fun seed(home: Path, uuid: String, absPath: String, line: Int, lineContent: String, content: String, createdAt: String = "2026-01-01T00:00:00.000Z", consumer: String? = null) {
+    private fun seed(home: Path, uuid: String, absPath: String, line: Int, lineContent: String, content: String, createdAt: String = "2026-01-01T00:00:00.000Z", consumer: String? = null, logicalAbsPath: String = absPath) {
         val consumerField = if (consumer == null) "" else ",\"intended_consumer\":\"$consumer\""
         Files.writeString(
             home.resolve(".heview/comments/$uuid.json"),
-            """{"uuid":"$uuid","status":"pending","created_at":"$createdAt","workspace":"/tmp/proj","abs_path":"$absPath","logical_abs_path":"$absPath","line_number":$line,"line_content":"$lineContent","side":"file","content":"$content"$consumerField}""",
+            """{"uuid":"$uuid","status":"pending","created_at":"$createdAt","workspace":"/tmp/proj","abs_path":"$absPath","logical_abs_path":"$logicalAbsPath","line_number":$line,"line_content":"$lineContent","side":"file","content":"$content"$consumerField}""",
         )
     }
 
@@ -136,5 +137,50 @@ class HookScriptTest {
         seed(home, "early", "/tmp/proj/a.kt", 1, "a", "first", createdAt = "2026-01-01T00:00:00.000Z")
         val out = additionalContext(run(claudeCmd(home), home, "/tmp/proj"))!!
         assertTrue(out.indexOf("first") < out.indexOf("second")) // created_at ascending
+    }
+
+    @Test
+    fun `a cwd with a trailing slash still matches and consumes`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("ts-$name"))
+            seed(home, "t1", "/tmp/proj/f.kt", 1, "x", "note")
+            val out = additionalContext(run(cmd(home), home, "/tmp/proj/")) // note the trailing slash
+            assertNotNull(out)
+            assertFalse(Files.exists(home.resolve(".heview/comments/t1.json"))) // matched + consumed
+        }
+    }
+
+    @Test
+    fun `a corrupt pool file is skipped while a valid comment is still injected`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("cp-$name"))
+            Files.writeString(home.resolve(".heview/comments/bad.json"), "{ not json")
+            seed(home, "ok", "/tmp/proj/f.kt", 1, "x", "note")
+            val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
+            assertEquals("In `f.kt` at line 1:\n```\nx\n```\nnote", out) // valid one still injected
+            assertFalse(Files.exists(home.resolve(".heview/comments/ok.json"))) // valid consumed
+            assertTrue(Files.exists(home.resolve(".heview/comments/bad.json"))) // corrupt left alone
+        }
+    }
+
+    @Test
+    fun `claude matches logical_abs_path while codex matches only abs_path`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        // abs_path is OUTSIDE cwd; logical_abs_path is INSIDE.
+        val hc = setupHome(dir.resolve("lp-claude"))
+        seed(hc, "l1", "/tmp/other/x.kt", 5, "code", "note", logicalAbsPath = "/tmp/proj/x.kt")
+        val claudeOut = additionalContext(run(claudeCmd(hc), hc, "/tmp/proj"))
+        assertNotNull(claudeOut) // Claude matches via logical_abs_path
+        assertTrue(claudeOut!!.contains("/tmp/other/x.kt")) // display uses abs_path (absolute, since outside cwd)
+        assertFalse(Files.exists(hc.resolve(".heview/comments/l1.json"))) // consumed by Claude
+
+        val hx = setupHome(dir.resolve("lp-codex"))
+        seed(hx, "l1", "/tmp/other/x.kt", 5, "code", "note", logicalAbsPath = "/tmp/proj/x.kt")
+        assertNull(additionalContext(run(codexCmd(hx), hx, "/tmp/proj"))) // Codex matches abs_path only
+        assertTrue(Files.exists(hx.resolve(".heview/comments/l1.json"))) // NOT consumed by Codex
     }
 }
