@@ -16,7 +16,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 85 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 97 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -40,17 +40,20 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
 - `model/CommentJson.kt` — Gson encode/decode (`disableHtmlEscaping`; nulls omitted).
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
 - `util/HeviewTime.kt` — `nowIso()`: fixed 3-digit-millis ASCII ISO (matches JS `toISOString` so ordering matches reviewa).
-- `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`.
+- `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`; `consumedDir` = `comments/consumed` (nested
+  so the pool's `*.json` glob skips it), where a hook claims a consumed comment.
 - `storage/CommentStore.kt` — in-memory index + JSON persistence; registered as an **application** service
   (the pool is shared). EDT-confined; disk I/O offloaded to a serial background executor (`runIo`, injectable).
   `hydrate()` loads the pool from disk once (read on `runIo`, apply on `runEdt` — both injectable → sync in
   tests); `forAbsPath(path)` returns a file's comments (normalized-path match); `addChangeListener` returns a
-  `Disposable` to unregister.
+  `Disposable` to unregister. `markProcessed(uuid)` (→ Seen) / `evict(uuid)` (peer/user delete) mutate the
+  index **in memory only, no disk write** — for the watcher; both idempotent.
 - `ui/InlayCardHost.kt` — THE seam isolating the experimental inlay API (the ONE swap point).
 - `ui/ComponentInlayCardHost.kt` — backs it via `Editor.addComponentInlay(offset, InlayProperties().relatesToPrecedingText(true), card, FIT_VIEWPORT_WIDTH)`, wrapped in `EditorScrollingPositionKeeper`. Verified present on 2024.2.
 - `ui/CommentThread.kt` — the inlay card. Two entry points: `startCompose()` (an `EditorTextField`, so it owns
-  editor keys) for the create flow, and `startDisplay(comment)` for an already-persisted comment. EDT-only;
-  `onDispose` parented to the inlay; `dispose()` is idempotent.
+  editor keys) for the create flow, and `startDisplay(comment)` for an already-persisted comment. Renders a
+  status chip (orange **Pending** / green **Seen**); `refreshDisplay(comment)` relabels a shown card in place
+  (no-op while composing/unchanged). EDT-only; `onDispose` parented to the inlay; `dispose()` is idempotent.
 - `ui/CommentInlayManager.kt` — **project** light `@Service`; the single controller that owns every
   `CommentThread`. Renders/disposes display cards per `Editor` on open/split/reopen/close (`EditorFactoryListener`),
   and reconciles all open editors on any `CommentStore` change so a comment appears/disappears in every split.
@@ -68,10 +71,18 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   follow a symlink to its real target. `installAll()` returns a success Boolean (per-agent isolated) so the
   startup once-guard can re-arm and retry. All paths/`PATH`/warn injectable → unit-tested against temp dirs.
   Bundled injector scripts (`src/main/resources/hook-scripts/{claude-code,codex}/`) match by directory
-  boundary + normalize paths, are UTF-8 + null-tolerant, and single-use-`unlink` (→ move-to-`consumed/` in Phase 3).
-- `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and runs
-  `HookInstaller.installAll()` on the background coroutine (off-EDT), **once per app** and **skipped in
-  unit-test/headless mode** so tests never touch the real `~/.claude` / `~/.codex`.
+  boundary + normalize paths, are UTF-8 + null-tolerant, and consume by an atomic **CLAIM** — move-then-emit
+  into `comments/consumed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher reads.
+- `watch/CommentsPoolWatcher.kt` — Phase 3 application `@Service` (`Disposable`): a daemon NIO WatchService on
+  `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `consumed/` means an agent hook consumed
+  it → `CommentStore.markProcessed` (Seen) + delete the tombstone (retention); a bare vanish → `evict` (peer/user
+  delete). Store calls hop to the EDT. The `consumed/` move replaces reviewa's suppression set (idempotent evict
+  absorbs our own `delete`); a startup `sweepConsumed()` clears offline tombstones. Classification + FS effects
+  are unit-tested directly (temp dirs, sync dispatch); the live WatchService thread is dogfood-only.
+- `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and on an
+  **application-pooled** thread (off-EDT) starts the `CommentsPoolWatcher` (idempotent) and runs
+  `HookInstaller.installAll()` **once per app** — both **skipped in unit-test/headless mode** so tests never
+  spin a real watch thread or touch the real `~/.claude` / `~/.codex`.
 `src/main/resources/META-INF/plugin.xml` registers the postStartupActivity, the CommentStore application service,
 the action, and the `heview` notificationGroup (hook warnings). `CommentInlayManager` is a light `@Service` —
 intentionally NOT in plugin.xml.
@@ -115,8 +126,12 @@ context-blind reviewer will keep raising them:
   untouched**, not overwritten fresh; (4) Codex flag is canonical `[features] hooks = true` (`codex_hooks`
   deprecated) and heview **never edits an existing `config.toml`** (hooks default-on → create-if-absent +
   warn-on-`false` only). These three (backtick, sibling-prefix, config-wipe) are latent bugs in reviewa too.
-- Phase 3 will switch injector `unlink` → move into `~/.heview/comments/consumed/` so the watcher can tell
-  consumption (→ mark Seen) from a peer/user delete (→ gone); the renamed VS Code plugin shares that contract.
+- **Built (Phase 3 consumption slice):** injectors CLAIM a consumed comment by an atomic move into
+  `~/.heview/comments/consumed/` (move-then-emit ⇒ single-use) rather than `unlink`; `CommentsPoolWatcher`
+  marks a thread *Seen* on that signal vs `evict`s on a bare vanish — the `consumed/` move replaces reviewa's
+  suppression set. `markProcessed`/`evict` never persist (a processed comment isn't written; its file already
+  left the pool). The eager tombstone-delete has a multi-client race (a 2nd live watcher could miss the
+  signal) → age-based sweep in the shared VS Code contract, deferred (v1 is single-watcher, so correct now).
 </settled-decisions>
 
 <review>
@@ -132,21 +147,24 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 
 <status>
 Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment + **Phase 2 — agent
-hooks** are DONE — each dogfooded and taken through `/aeview-loop` to convergence. The end-to-end loop is
-**proven live**: a comment left in the IDE is injected into Claude Code / Codex on `UserPromptSubmit` (exact
-plan-§6 block) and its `<uuid>.json` is consumed. Gate green: **85 tests** (JUnit5 unit + a JUnit3/4
-`BasePlatformTestCase` + node/python behavioral hook-script tests), build clean.
+hooks** + **Phase 3 — consumption watcher (consumed-dir slice)** are DONE. Phases 1–2 were each dogfooded
+and taken through `/aeview-loop` to convergence; the end-to-end loop is **proven live** (a comment left in
+the IDE is injected into Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block and its
+`<uuid>.json` is consumed). Gate green: **97 tests** (JUnit5 unit + a JUnit3/4 `BasePlatformTestCase` +
+node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
-The maintainer normally runs pushes — only push when asked.
+The maintainer normally runs pushes — only push when asked. **The Phase-3 commits (`e2a8b64`..`04e29c7`)
+are LOCAL / unpushed.**
 
-Next increment (approved): **Phase 3 — consumption watcher (consumed-dir design).** A NIO watcher on
-`~/.heview/comments/`: a hook that MOVES a consumed file into `~/.heview/comments/consumed/` flips its thread
-to *Seen* (vs a bare vanish = peer/user delete = gone; a UI delete is suppression-set suppressed). This
-delivers the missing "mark Seen" UX (today a consumed comment stays "Pending" live, vanishes on restart) AND
-resolves the deferred single-use race (the atomic rename IS the claim). Ship the hook change with it (all
-injectors `unlink` → move-into-`consumed/`) + a `consumed/` retention policy. Alt: the Phase 1
-reply/edit/re-pend→processed state machine (also the status-aware label — the card header still hard-codes
-"Pending"). Full deferred backlog (Phase-2 items, durable-anchor line-number writeback, external-reload
-listener, `CommentJson.decode` validation, GitHub identity, …) is in `implementation_log.local.md`.
+Phase 3 just shipped (see `implementation_log.local.md` "Phase 3" + plan §4/§5/§8/§9): injectors CLAIM a
+consumed comment by an atomic move into `comments/consumed/` (single-use); `CommentsPoolWatcher` flips a
+thread *Seen* on that signal vs `evict`s on a bare vanish; `CommentThread` shows a Pending/Seen chip and
+relabels in place. **Immediate next actions for this increment: (1) run `/aeview-loop`
+(`range:8a69734..HEAD`) — Phase 3 touches concurrency + a background thread + FS races, so expect real
+findings; (2) hand to the maintainer to dogfood in `runIde`.** THEN pick the next increment: remaining
+Phase 3 (comment tool window, status-bar pending-count widget, copy actions, settings page incl. Seen
+auto-collapse, scoped project-close cleanup) OR the Phase 1 reply/edit/re-pend→processed state machine.
+Full deferred backlog (durable-anchor line-number writeback, external-reload listener, `CommentJson.decode`
+validation, multi-client CREATE/MODIFY sync, GitHub identity, …) is in `implementation_log.local.md`.
 </status>
