@@ -49,8 +49,9 @@ internal class CommentThread(
         val input = renderCompose()
         val placed = host.addCardBelow(lineEndOffset, panel) ?: return false
         inlay = placed
-        // Run onDispose on any teardown, including the platform disposing the inlay on editor close.
-        Disposer.register(placed, Disposable { onDispose() })
+        // Run onDispose on any teardown, including the platform disposing the inlay on editor close;
+        // set `disposed` so queued UI callbacks (focus, delete-enable) become no-ops.
+        Disposer.register(placed, Disposable { disposed = true; onDispose() })
         // The EditorTextField creates its editor only once shown, so focus after the inlay is placed
         // and realized (next EDT tick), guarded so we never focus a torn-down card or closed project.
         ApplicationManager.getApplication().invokeLater(

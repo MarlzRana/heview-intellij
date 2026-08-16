@@ -16,8 +16,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class CommentStoreTest {
-    // Synchronous executors so the async disk path runs inline and deterministically in tests.
-    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runOnEdt = { it.run() })
+    // Synchronous IO executor so the async disk path runs inline and deterministically in tests.
+    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() })
 
     /** Make [dir] non-writable; skip the test if the platform doesn't enforce it (e.g. running as root). */
     private fun makeReadOnlyOrSkip(dir: Path) {
@@ -137,13 +137,14 @@ class CommentStoreTest {
     }
 
     @Test
-    fun `delete keeps the record visible when the file cannot be deleted`(@TempDir dir: Path) {
+    fun `delete removes the record even if the on-disk file cannot be deleted`(@TempDir dir: Path) {
         val store = store(dir)
         store.save(sampleComment(uuid = "u1"))
         makeReadOnlyOrSkip(dir)
         try {
+            // reviewa parity: the thread leaves the UI regardless; the unlink is best-effort.
             store.delete("u1")
-            assertNotNull(store.get("u1"))
+            assertNull(store.get("u1"))
         } finally {
             dir.toFile().setWritable(true)
         }

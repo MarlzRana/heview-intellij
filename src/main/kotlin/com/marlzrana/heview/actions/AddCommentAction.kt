@@ -31,7 +31,7 @@ internal class AddCommentAction : AnAction() {
         val file = e.getData(CommonDataKeys.VIRTUAL_FILE)
         e.presentation.isEnabled = e.getData(CommonDataKeys.EDITOR) != null &&
             file != null && file.isInLocalFileSystem &&
-            e.project != null
+            e.project?.basePath != null
     }
 
     override fun actionPerformed(e: AnActionEvent) {
@@ -43,7 +43,9 @@ internal class AddCommentAction : AnAction() {
         val absPath = file.toNioPath().toString()
 
         val document = editor.document
+        // The caret can sit in virtual space (past the last line); clamp so getLineEndOffset is safe.
         val line = editor.caretModel.logicalPosition.line
+            .coerceIn(0, (document.lineCount - 1).coerceAtLeast(0))
         val lineEndOffset = document.getLineEndOffset(line)
         // Track the anchor line across edits made while composing; read it again at submit.
         val anchor = document.createRangeMarker(document.getLineStartOffset(line), lineEndOffset)
