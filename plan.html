@@ -211,9 +211,10 @@
 <p>The directory heview-intellij owns. Comments are pooled (so whichever agent runs first consumes them); everything else is separated per coding agent.</p>
 <pre><code>~/.heview/
 ├─ comments/                                          # SHARED pool — one &lt;uuid&gt;.json per thread
-│  └─ consumed/                                       # (Phase 3) hooks move a consumed file here (not
+│  └─ consumed/                                       # hooks CLAIM a comment by moving it here (not
 │                                                     #   unlink) so the watcher can tell consumption
-│                                                     #   from a peer/user delete; first-come across agents
+│                                                     #   from a peer/user delete; the watcher deletes
+│                                                     #   the tombstone after marking Seen (retention)
 ├─ claude-code/
 │  ├─ hooks/
 │  │  ├─ user_prompt_submit_insert_comments_hook.js   # comment injector (Node)
@@ -309,10 +310,11 @@ comment intuitively "sticks".</p>
   <b>Consequence to manage.</b> Because the pool is now durable, a comment stays eligible for injection
   (hooks match by <code>cwd</code> prefix) across restarts until it is consumed or deleted — it does not
   self-clear the way reviewa's session purge did. Three mechanisms keep the pool honest: the user's
-  explicit <b>Delete</b>; <b>single-use hook consumption</b>; and the <span class="pill later">Phase&nbsp;3</span>
-  consumption watcher (marks a thread <i>Seen</i> when a hook deletes its file) plus scoped project-close
-  cleanup. <b>Until Phase&nbsp;3 lands there is no automatic cleanup — by design.</b> A stale <code>.json</code>
-  can be removed by hand from <code>~/.heview/comments/</code>.
+  explicit <b>Delete</b>; <b>single-use hook consumption</b> (now a <i>claim-by-move</i> into
+  <code>consumed/</code>); and the <b>consumption watcher</b> — <span class="pill v1">built</span> — which
+  flips a thread to <i>Seen</i> when its file is consumed and reclaims the <code>consumed/</code> tombstone.
+  Still pending: <b>scoped project-close cleanup</b> (a stale <code>.json</code> can meanwhile be removed
+  by hand from <code>~/.heview/comments/</code>).
 </div>
 
 <h3>Multi-client sync — the durable pool can have ≥2 live editors <span class="pill later">Later</span></h3>
@@ -333,14 +335,19 @@ in-memory index + inlays against filesystem events:</p>
   <li><b>DELETE</b> is the hard one — three causes are <i>indistinguishable on a bare <code>unlink</code></i>:
     a hook <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should
     vanish silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set).
-    <b>Decided (maintainer):</b> the hooks provide the intent signal by <b>moving a consumed file into
-    <code>~/.heview/comments/consumed/</code></b> instead of unlinking it. The watcher then reads the signal:
-    a file that <i>moved to <code>consumed/</code></i> → consumed → mark <i>Seen</i>; a file that simply
-    <i>vanished</i> (and isn't in the suppression set) → peer/user delete → gone. <span class="muted">Ships
-    with the Phase&nbsp;3 watcher — the hooks change from <code>unlink</code> to move-into-<code>consumed/</code>
-    then, since nothing reads <code>consumed/</code> until the watcher exists. Needs a retention/cleanup policy
-    for <code>consumed/</code> (e.g. the watcher unlinks after it marks the thread) so it doesn't grow
-    unbounded, and the renamed VS Code plugin must share the same convention.</span></li>
+    <b>Decided (maintainer) — and now built:</b> the hooks provide the intent signal by <b>claiming a
+    consumed file (an atomic move into <code>~/.heview/comments/consumed/</code>)</b> instead of unlinking
+    it. <code>CommentsPoolWatcher</code> reads the signal on each <code>comments/*.json</code> delete: a
+    file present in <code>consumed/</code> → consumed → <code>markProcessed</code> (mark <i>Seen</i>) then
+    delete the tombstone (retention); a file that simply <i>vanished</i> → peer/user delete → <code>evict</code>.
+    Both store calls are idempotent, so a self-delete the watcher later observes is a no-op — <b>the
+    <code>consumed/</code> move replaces reviewa's suppression set</b>. A startup sweep clears tombstones
+    left by consumption that happened while no IDE was running. <span class="muted"><b>Making the claim the
+    single-use guarantee:</b> each injector now moves-then-emits (emits only files it won the rename for),
+    so two concurrent agents can't double-inject. <b>Still Later:</b> CREATE/MODIFY reconciliation for true
+    multi-client sync; and the immediate retention delete has a multi-client race (a second live watcher
+    could miss the signal) that the renamed VS Code plugin's shared contract must address (e.g. age-based
+    sweep instead of eager delete).</span></li>
 </ul>
 <p class="muted">This also matters for the VS Code side: when heview-vscode adopts the durable model, both
 plugins should share one watcher contract (same events, same tombstone/consumed convention) so a comment
@@ -467,7 +474,7 @@ Your comment here</code></pre>
   <div class="card">
     <h3>Watch &amp; surfaces</h3>
     <ul>
-      <li><code>CommentsWatcher</code> — NIO WatchService → mark Seen/collapse.</li>
+      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>consumed/</code> means an agent hook consumed it (→ <code>markProcessed</code>, then delete the tombstone) vs a bare vanish → <code>evict</code>. CREATE/MODIFY + the full multi-client sync are <span class="pill later">Later</span>.</li>
       <li><code>HeviewToolWindowFactory</code> + tree model.</li>
       <li><code>PendingCountWidget</code> (status bar).</li>
       <li><code>HeviewSettings</code> + <code>HeviewConfigurable</code>.</li>
@@ -483,7 +490,7 @@ Your comment here</code></pre>
     <tr><td class="num">0</td><td>Scaffold: Gradle + IntelliJ Platform Gradle Plugin 2.x, Kotlin, <code>plugin.xml</code>, min 2024.2. <b>Done when</b> <code>./gradlew runIde</code> launches a sandbox IDE with heview loaded, and <code>buildPlugin</code> + <code>verifyPlugin</code> are wired (see §11).</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">1</td><td>Core file commenting: schema + JSON store, inlay thread UI, full pending/repending/processed state machine, in-memory store + events. <b>Starts with an inlay spike</b> behind the <code>InlayCardHost</code> adapter, validated on the 2024.2 baseline before building on it.</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">2</td><td>Hook install &amp; registration for Claude + Codex (extract scripts, edit config files, CLI detection, config.toml flag).</td><td><span class="pill v1">v1</span></td></tr>
-    <tr><td class="num">3</td><td>Consumption watcher (mark Seen/collapse), scoped project-close cleanup, comment tool window, status-bar widget, copy actions, settings page.</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">3</td><td><b>Consumption watcher (mark Seen) — done</b> (<code>CommentsPoolWatcher</code>; injectors claim-by-move into <code>consumed/</code>; card relabels Pending→Seen in place; <code>consumed/</code> retention + startup sweep). Remaining: scoped project-close cleanup, comment tool window, status-bar widget, copy actions, settings page (incl. auto-collapse of Seen).</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">4</td><td>Diff-view commenting: addition/removal/context detection inside IntelliJ's diff viewer.</td><td><span class="pill later">Later</span></td></tr>
     <tr><td class="num">5</td><td>Claude plan feature: <code>PostToolUse:Write</code> plan hook, plan-metadata watcher, auto-open, plan-file commenting, Plans view.</td><td><span class="pill later">Later</span></td></tr>
     <tr><td class="num">6</td><td>Polish: GitHub identity + avatar, richer markdown rendering, Windows support investigation.</td><td><span class="pill later">Later</span></td></tr>
