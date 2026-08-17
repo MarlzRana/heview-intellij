@@ -382,9 +382,11 @@ class CommentStore(
     /** Drop the record and fire immediately; unlink the pool file (and any tombstone) in the background. */
     fun delete(uuid: String) {
         if (index.remove(uuid) == null) return
-        persisted.remove(uuid)
         fireChanged()
         runIo {
+            // On the serial IO executor so it orders AFTER any in-flight save's persisted.add for this uuid
+            // (an EDT-side remove could be undone by a late save completion; harmless but a leak).
+            persisted.remove(uuid)
             try {
                 Files.deleteIfExists(fileFor(uuid))
             } catch (e: IOException) {

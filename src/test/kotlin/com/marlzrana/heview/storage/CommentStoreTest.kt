@@ -896,6 +896,44 @@ class CommentStoreTest {
         assertEquals(listOf("a", "b-edited"), store.get("f")?.replies?.map { it.content })
     }
 
+    @Test
+    fun `deleting the final reply of a consumed thread also removes its tombstone`(@TempDir dir: Path) {
+        val store = store(dir)
+        val only = sampleReply(content = "x")
+        store.save(sampleComment(uuid = "u1", replies = listOf(only)))
+        val tomb = tombstone(dir, "u1") // the thread had been consumed at some point
+
+        store.deleteReply("u1", only) // last reply → whole thread deleted
+
+        assertNull(store.get("u1"))
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // pool file gone
+        assertFalse(Files.exists(tomb)) // …and the restorable tombstone too (explicit delete = gone)
+    }
+
+    @Test
+    fun `hydrate assigns distinct ids to duplicate foreign reply ids and routes edits correctly`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        // Two replies deliberately sharing an id "dup" (a malformed foreign file).
+        Files.writeString(
+            dir.resolve("d.json"),
+            """
+            {"uuid":"d","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+             "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":42,
+             "line_content":"x","side":"file","content":"a\n\nb",
+             "replies":[{"content":"a","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z","id":"dup"},
+                        {"content":"b","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z","id":"dup"}]}
+            """.trimIndent(),
+        )
+        val store = store(dir)
+        store.hydrate()
+
+        val replies = store.get("d")!!.replies!!
+        assertTrue(replies[0].id != replies[1].id) // the duplicate id was backfilled to a distinct one
+
+        store.editReply("d", replies[1], "b-edited", laterTs) // edit the second row
+        assertEquals(listOf("a", "b-edited"), store.get("d")?.replies?.map { it.content }) // only it changed
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))

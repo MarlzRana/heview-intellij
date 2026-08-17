@@ -9,6 +9,7 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
+import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
@@ -443,8 +444,73 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         manager.cardForTest(e1, comment.uuid)!!.replyForTest("second") // two replies
         assertEquals(2, store.get(comment.uuid)?.replies?.size)
 
+        // Delete starts disabled (double-click guard); flush the enable-later before clicking it.
+        PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue()
         assertTrue(hosts.getValue(e1).clickButton("Delete")) // a real click on the first row's Delete icon
         assertEquals(1, store.get(comment.uuid)?.replies?.size) // listener wired through → a reply removed
+    }
+
+    fun testDoubleClickingDeleteRemovesOnlyOneReply() {
+        val (e1, path) = openLocalEditor("X2.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "first")
+        store.save(comment)
+        manager.init()
+        manager.cardForTest(e1, comment.uuid)!!.replyForTest("second")
+        manager.cardForTest(e1, comment.uuid)!!.replyForTest("third") // three replies
+        assertEquals(3, store.get(comment.uuid)?.replies?.size)
+
+        // Simulate a double-click WITHOUT flushing between: the first click deletes + rebuilds; the second
+        // press lands on the freshly-rendered (still-disabled) Delete and must be a no-op.
+        val host = hosts.getValue(e1)
+        PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue() // enable the initial Delete
+        host.clickButton("Delete") // first click → deletes one, rebuilds (new Delete starts disabled)
+        host.clickButton("Delete") // second click of the double → the new Delete is disabled → no-op
+
+        assertEquals(2, store.get(comment.uuid)?.replies?.size) // exactly one removed, not two
+    }
+
+    fun testClickingTheRependIconWiresThroughToTheStore() {
+        val (e1, path) = openLocalEditor("Z.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x")
+        store.save(comment)
+        manager.init()
+        store.markProcessed(comment.uuid) // Seen → the row shows the Re-pend clock
+        assertEquals(CommentStatus.PROCESSED, store.get(comment.uuid)?.status)
+
+        assertTrue(hosts.getValue(e1).clickButton("Re-pend")) // a real click on the Re-pend icon
+        assertEquals(CommentStatus.PENDING, store.get(comment.uuid)?.status) // wired through → re-pended
+    }
+
+    fun testReplyDraftSurvivesARebuildAndClearsOnSubmit() {
+        val (e1, path) = openLocalEditor("D1.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "first")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        card.setReplyDraftForTest("half-typed reply")
+
+        store.markProcessed(comment.uuid) // an unrelated change rebuilds the card
+        assertEquals("half-typed reply", card.replyDraftForTest()) // draft carried across the rebuild
+
+        card.replyForTest("done") // submitting a reply
+        assertEquals("", card.replyDraftForTest()) // clears the box (not re-seeded on the ensuing rebuild)
+    }
+
+    fun testSavingAnEditWhoseReplyWasDeletedLeavesEditMode() {
+        val (e1, path) = openLocalEditor("D2.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "first")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        card.replyForTest("second") // two replies
+        val reply0 = store.get(comment.uuid)!!.replies!![0]
+        card.startEditForTest(0)
+        store.deleteReply(comment.uuid, reply0) // the edited reply is deleted; the thread keeps "second"
+
+        card.submitEditForTest(reply0, "edited") // save an edit that now matches nothing
+
+        assertFalse(card.isEditingForTest()) // no-op save still returns to display mode
+        assertEquals(listOf("second"), store.get(comment.uuid)?.replies?.map { it.content }) // unchanged
     }
 
     fun testCancellingAnInlineEditReturnsToDisplayShowingTheLatest() {

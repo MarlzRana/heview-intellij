@@ -203,7 +203,10 @@ internal class CommentThread(
     // reply VALUE so a concurrent list change can't misroute them to the wrong reply.
     private fun rowActions(index: Int, reply: HeviewReply): JPanel =
         JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
-            add(iconButton(AllIcons.Actions.GC, "Delete") { deleteReply(reply) })
+            // Delete guards against a double-click: deleting a reply rebuilds the stack, shifting the next
+            // row's Delete under the cursor; the freshly-rendered button starts disabled so a stray second
+            // press can't delete it too (re-enabled after the event burst).
+            add(iconButton(AllIcons.Actions.GC, "Delete", guardDoubleClick = true) { deleteReply(reply) })
             add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit(index) })
             if (reply.status == CommentStatus.PROCESSED) {
                 add(iconButton(AllIcons.Vcs.History, "Re-pend") { rependReply(reply) })
@@ -257,9 +260,9 @@ internal class CommentThread(
         // be allowed through to rebuild the stack back into display mode with the new content.
         editingIndex = null
         onEditReply(current, reply, text)
-        // Ensure we leave edit mode even if the op was a no-op (the target reply was deleted/changed away
-        // and matched nothing): render the latest thread. A harmless refresh if onEditReply already did.
-        displayed?.let { renderThread(it) }
+        // If onEditReply changed the store it already re-rendered (displayed advanced to a new object); only
+        // when it was a no-op (target deleted/changed away, displayed unchanged) do we render to leave edit mode.
+        if (displayed === current) renderThread(current)
     }
 
     private fun cancelEdit() {
@@ -289,6 +292,10 @@ internal class CommentThread(
         submitEdit(replyAt(index) ?: return, text)
     }
 
+    /** Submit an edit for a specific (possibly now-absent) reply — for the no-op-save-leaves-edit test. */
+    @TestOnly
+    internal fun submitEditForTest(reply: HeviewReply, text: String) = submitEdit(reply, text)
+
     @TestOnly
     internal fun deleteReplyForTest(index: Int) = replyAt(index)?.let { deleteReply(it) }
 
@@ -306,6 +313,15 @@ internal class CommentThread(
     /** Whether an inline edit is currently open — lets a test assert the card returned to display mode. */
     @TestOnly
     internal fun isEditingForTest(): Boolean = editingIndex != null
+
+    /** The current reply-box draft text — lets a test assert draft carry-over / clear-on-submit. */
+    @TestOnly
+    internal fun replyDraftForTest(): String = replyInput?.text.orEmpty()
+
+    @TestOnly
+    internal fun setReplyDraftForTest(text: String) {
+        replyInput?.text = text
+    }
 
     private fun replyAt(index: Int): HeviewReply? = displayed?.normalizedReplies(author)?.getOrNull(index)
 
@@ -327,7 +343,7 @@ internal class CommentThread(
         }
 
     /** A borderless header action button — just its icon and a tooltip. */
-    private fun iconButton(icon: Icon, tooltip: String, onClick: () -> Unit): JButton =
+    private fun iconButton(icon: Icon, tooltip: String, guardDoubleClick: Boolean = false, onClick: () -> Unit): JButton =
         JButton(icon).apply {
             toolTipText = tooltip
             isBorderPainted = false
@@ -342,7 +358,19 @@ internal class CommentThread(
             preferredSize = dim
             minimumSize = dim
             addActionListener { onClick() }
+            if (guardDoubleClick) {
+                isEnabled = false // enabled after the current event burst, so a double-click can't re-fire
+                enableLater(this)
+            }
         }
+
+    /** Re-enable [button] on the next EDT tick (after the current event burst), guarded against teardown. */
+    private fun enableLater(button: JButton) {
+        ApplicationManager.getApplication().invokeLater(
+            { if (!disposed) button.isEnabled = true },
+            project.disposed,
+        )
+    }
 
     /** Request focus on [component] after the inlay is placed and realized (next EDT tick). */
     private fun focusLater(component: Component) {
