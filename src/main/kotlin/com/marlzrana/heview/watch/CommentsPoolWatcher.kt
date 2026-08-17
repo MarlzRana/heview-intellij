@@ -25,17 +25,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * the way reviewa's session purge did, so this is what tells a live card its comment was picked up.
  *
  * A disappearance from `comments/` has two causes that a bare `unlink` can't tell apart, so the
- * injector hooks encode the intent by **moving** a consumed file into `comments/consumed/` instead of
+ * injector hooks encode the intent by **moving** a consumed file into `comments/processed/` instead of
  * unlinking it (see the bundled scripts). The move is an atomic rename, so whenever the pending file's
  * `ENTRY_DELETE` is observed the tombstone already exists. This watcher reads that signal:
- * - the file now exists in `consumed/`  → an agent hook consumed it → [CommentStore.markProcessed]
+ * - the file now exists in `processed/`  → an agent hook consumed it → [CommentStore.markProcessed]
  *   flips the thread to *Seen*. The tombstone is **left in place** — it is the consumed comment itself
  *   (so a future "restore" action can revive it) and every other live client (e.g. heview-vscode) must
  *   observe it to reach the same verdict; an eager per-client delete would starve a slower peer of the
- *   signal. Tombstones are reclaimed by age instead ([sweepConsumed], [TOMBSTONE_RETENTION]).
+ *   signal. Tombstones are reclaimed by age instead ([sweepProcessed], [TOMBSTONE_RETENTION]).
  * - the file simply vanished           → a peer/user delete (or our own [CommentStore.delete] already
  *   applied) → [CommentStore.evict] drops it. Both store calls are idempotent, so a self-delete the
- *   watcher later observes is a no-op — no suppression set is needed (the `consumed/` move replaces it).
+ *   watcher later observes is a no-op — no suppression set is needed (the `processed/` move replaces it).
  *
  * Threading: a single daemon thread owns the blocking [WatchService]; every store mutation hops to the
  * EDT via [runEdt] (the store is EDT-confined). Sweep deletes run on the watch thread (already off-EDT).
@@ -50,18 +50,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Service(Service.Level.APP)
 internal class CommentsPoolWatcher(
     private val commentsDir: Path,
-    private val consumedDir: Path,
+    private val processedDir: Path,
     private val storeProvider: () -> CommentStore,
     private val runEdt: (Runnable) -> Unit = { ApplicationManager.getApplication().invokeLater(it) },
 ) : Disposable {
     /** Application-service constructor — binds to the shared pool + the shared [CommentStore]. */
     @Suppress("unused")
-    constructor() : this(HeviewPaths.commentsDir, HeviewPaths.consumedDir, { service() })
+    constructor() : this(HeviewPaths.commentsDir, HeviewPaths.processedDir, { service() })
 
     /** Test constructor: a temp-dir pool, an explicit store, and synchronous EDT dispatch. */
     @TestOnly
-    constructor(commentsDir: Path, consumedDir: Path, store: CommentStore) :
-        this(commentsDir, consumedDir, { store }, { it.run() })
+    constructor(commentsDir: Path, processedDir: Path, store: CommentStore) :
+        this(commentsDir, processedDir, { store }, { it.run() })
 
     private val store: CommentStore get() = storeProvider()
 
@@ -89,9 +89,9 @@ internal class CommentsPoolWatcher(
             LOG.warn("heview: cannot create the comments dir to watch $commentsDir", e)
             return
         }
-        // Reclaim tombstones older than the retention window so consumed/ can't grow without bound,
+        // Reclaim tombstones older than the retention window so processed/ can't grow without bound,
         // while leaving recent ones for live peers + a future restore action.
-        sweepConsumed()
+        sweepProcessed()
         val ws = try {
             FileSystems.getDefault().newWatchService().also {
                 commentsDir.register(it, StandardWatchEventKinds.ENTRY_DELETE)
@@ -122,10 +122,10 @@ internal class CommentsPoolWatcher(
             for (event in key.pollEvents()) {
                 if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue
                 // For a directory watch the context is the entry's relative name (a single component),
-                // so there is no path-separator to worry about when resolving into consumed/.
+                // so there is no path-separator to worry about when resolving into processed/.
                 val name = event.context() as? Path ?: continue
                 val fileName = name.toString()
-                if (!fileName.endsWith(".json")) continue // skips the consumed/ subdir entry itself
+                if (!fileName.endsWith(".json")) continue // skips the processed/ subdir entry itself
                 onCommentFileDeleted(fileName.removeSuffix(".json"))
             }
             if (!key.reset()) break // the watched dir is gone/inaccessible — stop the loop
@@ -133,13 +133,13 @@ internal class CommentsPoolWatcher(
     }
 
     /**
-     * Classify a `<uuid>.json` that left `comments/`: a matching file in `consumed/` means an agent
-     * hook consumed it (→ *Seen* + delete the tombstone), otherwise it was deleted (→ evict). Invoked
-     * on the watch thread; store mutations hop to the EDT. Visible for direct unit testing.
+     * Classify a `<uuid>.json` that left `comments/`: a matching file in `processed/` means an agent
+     * hook consumed it (→ *Seen*, tombstone left for peers + age-sweep), otherwise it was deleted
+     * (→ evict). Invoked on the watch thread; store mutations hop to the EDT. Visible for unit testing.
      */
     fun onCommentFileDeleted(uuid: String) {
-        val consumed = consumedDir.resolve("$uuid.json")
-        if (Files.exists(consumed)) {
+        val tombstone = processedDir.resolve("$uuid.json")
+        if (Files.exists(tombstone)) {
             // Consumed: mark Seen, but LEAVE the tombstone — other live clients each need to observe it,
             // and it is the consumed comment itself (a future restore reads it back). Age-swept, never
             // eager-deleted (an eager delete would starve a slower peer of the signal).
@@ -152,13 +152,13 @@ internal class CommentsPoolWatcher(
     /**
      * Reclaim consumed tombstones older than [TOMBSTONE_RETENTION]; recent ones are kept so every live
      * client can read the consumption signal and a consumed comment stays restorable. Bounds the growth
-     * of consumed/. Visible for direct unit testing.
+     * of processed/. Visible for direct unit testing.
      */
-    fun sweepConsumed() {
-        if (!Files.isDirectory(consumedDir)) return
+    fun sweepProcessed() {
+        if (!Files.isDirectory(processedDir)) return
         val cutoff = Instant.now().minus(TOMBSTONE_RETENTION)
         try {
-            Files.newDirectoryStream(consumedDir, "*.json").use { stream ->
+            Files.newDirectoryStream(processedDir, "*.json").use { stream ->
                 stream.forEach { path ->
                     val mtime = try {
                         Files.getLastModifiedTime(path).toInstant()
@@ -169,7 +169,7 @@ internal class CommentsPoolWatcher(
                 }
             }
         } catch (e: IOException) {
-            LOG.warn("heview: failed to sweep the consumed dir $consumedDir", e)
+            LOG.warn("heview: failed to sweep the processed dir $processedDir", e)
         }
     }
 

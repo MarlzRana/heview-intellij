@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const COMMENTS_DIR = path.join(require('os').homedir(), '.heview', 'comments');
-const CONSUMED_DIR = path.join(COMMENTS_DIR, 'consumed');
+const PROCESSED_DIR = path.join(COMMENTS_DIR, 'processed');
 
 function formatLineContent(comment) {
 	const prefix = comment.side === 'addition' ? '+' : comment.side === 'removal' ? '-' : '';
@@ -22,16 +22,16 @@ function isUnderCwd(p, cwd) {
 	return np === base || np.startsWith(base + path.sep);
 }
 
-// Claim a comment by atomically moving its file into `comments/consumed/`. The move IS the single-use
+// Claim a comment by atomically moving its file into `comments/processed/`. The move IS the single-use
 // claim: renameSync is atomic on the same filesystem, so of two concurrent agents only the one that
 // wins the rename emits the comment — the loser's rename throws (ENOENT) and it skips. Moving (rather
 // than unlinking) also leaves the intent signal heview's watcher reads to mark the thread "Seen".
 // Having won the claim, rewrite the tombstone with status:"processed" so the consumed file reads back as
 // Seen (best-effort — the move already consumed it, so a failed rewrite just leaves it as pending).
 function claim(comment, filePath, filename) {
-	const dest = path.join(CONSUMED_DIR, filename);
+	const dest = path.join(PROCESSED_DIR, filename);
 	try {
-		fs.mkdirSync(CONSUMED_DIR, { recursive: true });
+		fs.mkdirSync(PROCESSED_DIR, { recursive: true });
 		fs.renameSync(filePath, dest);
 	} catch {
 		return false;

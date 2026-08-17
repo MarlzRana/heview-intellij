@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit
  * tests can't see: actually run node / python3 against a seeded `~/.heview/comments` pool and assert the
  * injected `additionalContext`, clean backticks, cwd directory-boundary matching, consumer routing, and
  * single-use consumption. Consumption is a **claim-by-move**: a consumed file is atomically moved into
- * `comments/consumed/` (the intent signal the watcher reads), not unlinked. Skips gracefully where
+ * `comments/processed/` (the intent signal the watcher reads), not unlinked. Skips gracefully where
  * node / python3 aren't installed.
  */
 class HookScriptTest {
@@ -75,18 +75,18 @@ class HookScriptTest {
 
     private fun pending(home: Path, uuid: String) = Files.exists(home.resolve(".heview/comments/$uuid.json"))
 
-    private fun consumed(home: Path, uuid: String) =
-        Files.exists(home.resolve(".heview/comments/consumed/$uuid.json"))
+    private fun inProcessed(home: Path, uuid: String) =
+        Files.exists(home.resolve(".heview/comments/processed/$uuid.json"))
 
     /** The `status` field inside the consumed tombstone (the hook rewrites it to "processed"). */
-    private fun consumedStatus(home: Path, uuid: String): String? {
-        val f = home.resolve(".heview/comments/consumed/$uuid.json")
+    private fun processedStatus(home: Path, uuid: String): String? {
+        val f = home.resolve(".heview/comments/processed/$uuid.json")
         if (!Files.exists(f)) return null
         return JsonParser.parseString(Files.readString(f)).asJsonObject.get("status")?.asString
     }
 
-    private fun consumedRaw(home: Path, uuid: String): String =
-        Files.readString(home.resolve(".heview/comments/consumed/$uuid.json"))
+    private fun processedRaw(home: Path, uuid: String): String =
+        Files.readString(home.resolve(".heview/comments/processed/$uuid.json"))
 
     private fun additionalContext(stdout: String): String? {
         if (stdout.isBlank()) return null
@@ -105,21 +105,21 @@ class HookScriptTest {
         assertEquals(expected, claudeOut)
         assertFalse(claudeOut!!.contains("\\`")) // clean backticks, no literal backslash
         assertFalse(pending(h1, "c1")) // left the pending pool…
-        assertTrue(consumed(h1, "c1")) // …by moving into consumed/ (single-use claim)
-        assertEquals("processed", consumedStatus(h1, "c1")) // tombstone rewritten to Seen
+        assertTrue(inProcessed(h1, "c1")) // …by moving into processed/ (single-use claim)
+        assertEquals("processed", processedStatus(h1, "c1")) // tombstone rewritten to Seen
 
         val h2 = setupHome(dir.resolve("b"))
         seed(h2, "c1", "/tmp/proj/sub/Foo.kt", 3, "val x = 1", "make it const")
         val codexOut = additionalContext(run(codexCmd(h2), h2, "/tmp/proj"))
         assertEquals(expected, codexOut) // byte-identical to Claude
         assertFalse(pending(h2, "c1"))
-        assertTrue(consumed(h2, "c1"))
-        assertEquals("processed", consumedStatus(h2, "c1"))
+        assertTrue(inProcessed(h2, "c1"))
+        assertEquals("processed", processedStatus(h2, "c1"))
 
         // Tombstone is pretty-printed (one property per line, like an IDE-written comment) and the two
         // injectors produce byte-identical output.
-        assertTrue(consumedRaw(h1, "c1").contains("\n  \"uuid\""))
-        assertEquals(consumedRaw(h1, "c1"), consumedRaw(h2, "c1"))
+        assertTrue(processedRaw(h1, "c1").contains("\n  \"uuid\""))
+        assertEquals(processedRaw(h1, "c1"), processedRaw(h2, "c1"))
     }
 
     @Test
@@ -130,8 +130,8 @@ class HookScriptTest {
             val home = setupHome(dir.resolve("rerun-$name"))
             seed(home, "c1", "/tmp/proj/f.kt", 1, "x", "note")
             assertNotNull(additionalContext(run(cmd(home), home, "/tmp/proj"))) // injected once
-            assertTrue(consumed(home, "c1"))                                    // claimed into consumed/
-            // The claimed file lives under consumed/, which the pool listing (*.json only) skips, so a
+            assertTrue(inProcessed(home, "c1"))                                    // claimed into processed/
+            // The claimed file lives under processed/, which the pool listing (*.json only) skips, so a
             // second UserPromptSubmit finds nothing to inject — single-use holds across invocations.
             assertNull(additionalContext(run(cmd(home), home, "/tmp/proj")))
         }
@@ -190,7 +190,7 @@ class HookScriptTest {
             val out = additionalContext(run(cmd(home), home, "/tmp/proj/")) // note the trailing slash
             assertNotNull(out)
             assertFalse(pending(home, "t1")) // matched + consumed
-            assertTrue(consumed(home, "t1")) // claimed into consumed/
+            assertTrue(inProcessed(home, "t1")) // claimed into processed/
         }
     }
 
@@ -205,7 +205,7 @@ class HookScriptTest {
             val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
             assertEquals("In `f.kt` at line 1:\n```\nx\n```\nnote", out) // valid one still injected
             assertFalse(pending(home, "ok")) // valid consumed…
-            assertTrue(consumed(home, "ok")) // …by moving into consumed/
+            assertTrue(inProcessed(home, "ok")) // …by moving into processed/
             assertTrue(Files.exists(home.resolve(".heview/comments/bad.json"))) // corrupt left alone
         }
     }
@@ -220,7 +220,7 @@ class HookScriptTest {
         assertNotNull(claudeOut) // Claude matches via logical_abs_path
         assertTrue(claudeOut!!.contains("/tmp/other/x.kt")) // display uses abs_path (absolute, since outside cwd)
         assertFalse(pending(hc, "l1")) // consumed by Claude…
-        assertTrue(consumed(hc, "l1")) // …moved into consumed/
+        assertTrue(inProcessed(hc, "l1")) // …moved into processed/
 
         val hx = setupHome(dir.resolve("lp-codex"))
         seed(hx, "l1", "/tmp/other/x.kt", 5, "code", "note", logicalAbsPath = "/tmp/proj/x.kt")

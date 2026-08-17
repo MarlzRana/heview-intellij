@@ -17,7 +17,7 @@ import java.time.Instant
 
 /**
  * Deterministic coverage for the consumption watcher's classification + filesystem effects, driven by
- * calling [CommentsPoolWatcher.onCommentFileDeleted] / [CommentsPoolWatcher.sweepConsumed] directly
+ * calling [CommentsPoolWatcher.onCommentFileDeleted] / [CommentsPoolWatcher.sweepProcessed] directly
  * against temp dirs and a synchronous store — no live [java.nio.file.WatchService] (that glue is thin
  * and dogfooded in `runIde`). Uses the test constructor, which runs EDT dispatch inline.
  */
@@ -26,10 +26,10 @@ class CommentsPoolWatcherTest {
     private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() })
 
     private fun watcher(comments: Path, store: CommentStore) =
-        CommentsPoolWatcher(comments, comments.resolve("consumed"), store)
+        CommentsPoolWatcher(comments, comments.resolve("processed"), store)
 
-    private fun seedConsumedTombstone(comments: Path, uuid: String) {
-        val consumed = Files.createDirectories(comments.resolve("consumed"))
+    private fun seedProcessedTombstone(comments: Path, uuid: String) {
+        val consumed = Files.createDirectories(comments.resolve("processed"))
         Files.writeString(consumed.resolve("$uuid.json"), "{}") // presence is the signal; content unused
     }
 
@@ -38,8 +38,8 @@ class CommentsPoolWatcherTest {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val store = store(comments)
         store.save(sampleComment(uuid = "u1")) // pending, present in the index
-        // Simulate the hook's claim: the pool file has moved into consumed/.
-        seedConsumedTombstone(comments, "u1")
+        // Simulate the hook's claim: the pool file has moved into processed/.
+        seedProcessedTombstone(comments, "u1")
         Files.deleteIfExists(comments.resolve("u1.json"))
 
         watcher(comments, store).onCommentFileDeleted("u1")
@@ -47,7 +47,7 @@ class CommentsPoolWatcherTest {
         assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status) // Seen (still indexed)
         // NOT eager-deleted: other live clients must observe the same tombstone (and it's the restore
         // source). It is reclaimed later by the age-based sweep, not here.
-        assertTrue(Files.exists(comments.resolve("consumed/u1.json")))
+        assertTrue(Files.exists(comments.resolve("processed/u1.json")))
     }
 
     @Test
@@ -74,9 +74,9 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `sweepConsumed reclaims only tombstones older than the retention window`(@TempDir dir: Path) {
+    fun `sweepProcessed reclaims only tombstones older than the retention window`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
-        val consumed = Files.createDirectories(comments.resolve("consumed"))
+        val consumed = Files.createDirectories(comments.resolve("processed"))
         Files.writeString(consumed.resolve("old.json"), "{}")
         Files.writeString(consumed.resolve("fresh.json"), "{}")
         Files.writeString(consumed.resolve("old.txt"), "x") // non-json ignored even when old
@@ -84,7 +84,7 @@ class CommentsPoolWatcherTest {
         Files.setLastModifiedTime(consumed.resolve("old.json"), ancient)
         Files.setLastModifiedTime(consumed.resolve("old.txt"), ancient)
 
-        watcher(comments, store(comments)).sweepConsumed()
+        watcher(comments, store(comments)).sweepProcessed()
 
         assertFalse(Files.exists(consumed.resolve("old.json"))) // aged out → reclaimed
         assertTrue(Files.exists(consumed.resolve("fresh.json"))) // recent → kept for peers/restore
@@ -92,11 +92,11 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `sweepConsumed is a no-op when there is no consumed dir`(@TempDir dir: Path) {
+    fun `sweepProcessed is a no-op when there is no consumed dir`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
 
-        watcher(comments, store(comments)).sweepConsumed() // must not throw
+        watcher(comments, store(comments)).sweepProcessed() // must not throw
 
-        assertFalse(Files.exists(comments.resolve("consumed")))
+        assertFalse(Files.exists(comments.resolve("processed")))
     }
 }

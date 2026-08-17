@@ -211,7 +211,7 @@
 <p>The directory heview-intellij owns. Comments are pooled (so whichever agent runs first consumes them); everything else is separated per coding agent.</p>
 <pre><code>~/.heview/
 ├─ comments/                                          # SHARED pool — one &lt;uuid&gt;.json per thread
-│  └─ consumed/                                       # hooks CLAIM a comment by moving it here (not
+│  └─ processed/                                       # hooks CLAIM a comment by moving it here (not
 │                                                     #   unlink) so any client can tell consumption
 │                                                     #   from a peer/user delete; the tombstone IS the
 │                                                     #   consumed comment, rewritten to status=processed
@@ -313,8 +313,8 @@ comment intuitively "sticks".</p>
   (hooks match by <code>cwd</code> prefix) across restarts until it is consumed or deleted — it does not
   self-clear the way reviewa's session purge did. Three mechanisms keep the pool honest: the user's
   explicit <b>Delete</b>; <b>single-use hook consumption</b> (now a <i>claim-by-move</i> into
-  <code>consumed/</code>); and the <b>consumption watcher</b> — <span class="pill v1">built</span> — which
-  flips a thread to <i>Seen</i> when its file is consumed and reclaims the <code>consumed/</code> tombstone.
+  <code>processed/</code>); and the <b>consumption watcher</b> — <span class="pill v1">built</span> — which
+  flips a thread to <i>Seen</i> when its file is consumed and reclaims the <code>processed/</code> tombstone.
   Still pending: <b>scoped project-close cleanup</b> (a stale <code>.json</code> can meanwhile be removed
   by hand from <code>~/.heview/comments/</code>).
 </div>
@@ -338,16 +338,16 @@ in-memory index + inlays against filesystem events:</p>
     a hook <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should
     vanish silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set).
     <b>Decided (maintainer) — and now built as a shared four-rule contract:</b> <b>(1) Consume</b> = a hook
-    atomically moves <code>comments/&lt;uuid&gt;.json</code> → <code>consumed/&lt;uuid&gt;.json</code> (the
+    atomically moves <code>comments/&lt;uuid&gt;.json</code> → <code>processed/&lt;uuid&gt;.json</code> (the
     tombstone IS the consumed comment, so a later <i>restore</i> action can revive it). <b>(2) Seen</b> = for
-    a <code>uuid</code> a client has in-index, a tombstone present in <code>consumed/</code> →
+    a <code>uuid</code> a client has in-index, a tombstone present in <code>processed/</code> →
     <code>markProcessed</code>. <b>(3) Delete</b> = the pending file vanished with <i>no</i> tombstone →
     <code>evict</code>. <b>(4) Retention</b> = <b>age-based sweep</b>, never an eager per-client delete.
     Because the move is an atomic rename, whenever a client observes the pending file disappear the tombstone
     already exists — and because every live client watches the shared <code>comments/</code> dir, each reaches
     the same verdict independently. The tombstone is <b>left in place</b> so a slower peer (e.g. heview-vscode)
     still sees it; a startup sweep reclaims tombstones older than <b>14 days</b>. Both store calls are
-    idempotent, so a self-delete the watcher later observes is a no-op — <b>the <code>consumed/</code> move
+    idempotent, so a self-delete the watcher later observes is a no-op — <b>the <code>processed/</code> move
     replaces reviewa's suppression set</b>. <span class="muted"><b>Single-use:</b> each injector
     moves-then-emits (emits only files it won the rename for), so two concurrent agents can't double-inject.
     <b>Still Later:</b> CREATE/MODIFY reconciliation for full multi-client sync (a comment created/edited in
@@ -368,7 +368,7 @@ created in one and resolved in the other stays consistent.</p>
   <li>Reads <code>cwd</code> from stdin JSON.</li>
   <li>Scans <code>~/.heview/comments/*.json</code>.</li>
   <li>Keeps a comment if its <code>intended_consumer</code> is absent or matches this agent, <b>and</b> its match-path (Claude: <code>logical_abs_path || abs_path</code>; Codex: <code>abs_path</code>) is <b>under <code>cwd</code> at a directory boundary</b> (<code>== cwd</code> or starts with <code>cwd + "/"</code>). <span class="muted"><b>Divergence from reviewa (sanctioned):</b> reviewa uses a raw <code>startsWith(cwd)</code>, so a session in <code>/a/app</code> also matches — and, since injection deletes the file, <b>steals</b> — comments left in the sibling <code>/a/app-backend</code>. heview's boundary check fixes that cross-repo data loss.</span></li>
-  <li>Sorts by <code>created_at</code>, formats each block, deletes the consumed files, emits <code>additionalContext</code>.</li>
+  <li>Sorts by <code>created_at</code>, formats each block, then <b>claims</b> each emitted comment by an atomic move into <code>~/.heview/comments/processed/</code> (rewriting its <code>status</code> to <code>processed</code>) — <b>not</b> an <code>unlink</code> — and emits <code>additionalContext</code>. <span class="muted"><b>Divergence from reviewa:</b> reviewa deletes the file; heview moves it so the watcher can distinguish consumption (→ Seen) from a peer/user delete, and the move-then-emit ordering makes it a true single-use claim (two concurrent agents can't double-inject).</span></li>
 </ol>
 <p>Injected block format (byte-for-byte identical to reviewa's <em>Claude</em> hook):</p>
 <pre><code>In `src/foo.ts` at line 42:
@@ -479,7 +479,7 @@ Your comment here</code></pre>
   <div class="card">
     <h3>Watch &amp; surfaces</h3>
     <ul>
-      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice + shared tombstone contract): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>consumed/</code> means an agent hook consumed it (→ <code>markProcessed</code>; the tombstone is left for peers + restore, age-swept after 14 days) vs a bare vanish → <code>evict</code>. Full CREATE/MODIFY multi-client sync is <span class="pill later">Later</span>.</li>
+      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice + shared tombstone contract): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>processed/</code> means an agent hook consumed it (→ <code>markProcessed</code>; the tombstone is left for peers + restore, age-swept after 14 days) vs a bare vanish → <code>evict</code>. Full CREATE/MODIFY multi-client sync is <span class="pill later">Later</span>.</li>
       <li><code>HeviewToolWindowFactory</code> + tree model.</li>
       <li><code>PendingCountWidget</code> (status bar).</li>
       <li><code>HeviewSettings</code> + <code>HeviewConfigurable</code>.</li>
@@ -495,7 +495,7 @@ Your comment here</code></pre>
     <tr><td class="num">0</td><td>Scaffold: Gradle + IntelliJ Platform Gradle Plugin 2.x, Kotlin, <code>plugin.xml</code>, min 2024.2. <b>Done when</b> <code>./gradlew runIde</code> launches a sandbox IDE with heview loaded, and <code>buildPlugin</code> + <code>verifyPlugin</code> are wired (see §11).</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">1</td><td>Core file commenting: schema + JSON store, inlay thread UI, full pending/repending/processed state machine, in-memory store + events. <b>Starts with an inlay spike</b> behind the <code>InlayCardHost</code> adapter, validated on the 2024.2 baseline before building on it.</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">2</td><td>Hook install &amp; registration for Claude + Codex (extract scripts, edit config files, CLI detection, config.toml flag).</td><td><span class="pill v1">v1</span></td></tr>
-    <tr><td class="num">3</td><td><b>Consumption watcher (mark Seen) — done</b> (<code>CommentsPoolWatcher</code>; injectors claim-by-move into <code>consumed/</code>; card relabels Pending→Seen in place; <code>consumed/</code> retention + startup sweep). Remaining: scoped project-close cleanup, comment tool window, status-bar widget, copy actions, settings page (incl. auto-collapse of Seen).</td><td><span class="pill v1">v1</span></td></tr>
+    <tr><td class="num">3</td><td><b>Consumption watcher (mark Seen) — done</b> (<code>CommentsPoolWatcher</code>; injectors claim-by-move into <code>processed/</code>; card relabels Pending→Seen in place; <code>processed/</code> retention + startup sweep). Remaining: scoped project-close cleanup, comment tool window, status-bar widget, copy actions, settings page (incl. auto-collapse of Seen).</td><td><span class="pill v1">v1</span></td></tr>
     <tr><td class="num">4</td><td>Diff-view commenting: addition/removal/context detection inside IntelliJ's diff viewer.</td><td><span class="pill later">Later</span></td></tr>
     <tr><td class="num">5</td><td>Claude plan feature: <code>PostToolUse:Write</code> plan hook, plan-metadata watcher, auto-open, plan-file commenting, Plans view.</td><td><span class="pill later">Later</span></td></tr>
     <tr><td class="num">6</td><td>Polish: GitHub identity + avatar, richer markdown rendering, Windows support investigation.</td><td><span class="pill later">Later</span></td></tr>

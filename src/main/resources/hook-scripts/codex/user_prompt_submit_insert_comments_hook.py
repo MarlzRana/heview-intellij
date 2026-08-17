@@ -4,7 +4,7 @@ import os
 import sys
 
 COMMENTS_DIR = os.path.join(os.path.expanduser("~"), ".heview", "comments")
-CONSUMED_DIR = os.path.join(COMMENTS_DIR, "consumed")
+PROCESSED_DIR = os.path.join(COMMENTS_DIR, "processed")
 
 
 def format_line_content(comment):
@@ -24,14 +24,14 @@ def is_under_cwd(p, cwd):
 
 
 def claim(comment, filepath, filename):
-    # Atomically move the file into comments/consumed/ — the single-use claim. os.replace is atomic on
+    # Atomically move the file into comments/processed/ — the single-use claim. os.replace is atomic on
     # the same filesystem, so of two concurrent agents only the one that wins the move emits the comment;
     # the loser (file already gone) raises and returns False. Moving rather than unlinking also leaves the
     # intent signal heview's watcher reads to mark the thread "Seen". Having won the claim, rewrite the
     # tombstone with status "processed" so the consumed file reads back as Seen (best-effort).
-    dest = os.path.join(CONSUMED_DIR, filename)
+    dest = os.path.join(PROCESSED_DIR, filename)
     try:
-        os.makedirs(CONSUMED_DIR, exist_ok=True)
+        os.makedirs(PROCESSED_DIR, exist_ok=True)
         os.replace(filepath, dest)
     except Exception:
         return False

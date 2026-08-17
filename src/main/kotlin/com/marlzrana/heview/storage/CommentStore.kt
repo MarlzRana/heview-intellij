@@ -153,7 +153,7 @@ class CommentStore(
 
     /**
      * Flip a comment to [CommentStatus.PROCESSED] in memory (the "Seen" state) and fire — for the
-     * consumption watcher, when an agent hook has consumed the file (moved it into `consumed/`).
+     * consumption watcher, when an agent hook has consumed the file (moved it into `processed/`).
      *
      * Deliberately does NOT persist: a processed comment is not written to the pool (plan.html §5), and
      * its file has already left `comments/`, so re-saving here would resurrect an injectable duplicate.

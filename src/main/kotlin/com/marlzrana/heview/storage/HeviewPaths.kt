@@ -23,10 +23,11 @@ object HeviewPaths {
     /**
      * Where an agent hook MOVES a comment file when it consumes it (Phase 3), instead of unlinking it —
      * the intent signal the consumption watcher reads to mark a thread *Seen* (a bare vanish from
-     * [commentsDir] is a peer/user delete instead). Nested under [commentsDir]; the pool's `*.json` glob
-     * skips this subdirectory so hydration and the injectors never treat consumed files as pending.
+     * [commentsDir] is a peer/user delete instead). Named for the resulting `processed` status the moved
+     * file carries. Nested under [commentsDir]; the pool's `*.json` glob skips this subdirectory so
+     * hydration and the injectors never treat an already-processed file as pending.
      */
-    val consumedDir: Path = commentsDir.resolve("consumed")
+    val processedDir: Path = commentsDir.resolve("processed")
 
     /** Per-agent hook script dirs heview owns and extracts into (plan.html §4). */
     val claudeCodeHooksDir: Path = root.resolve("claude-code").resolve("hooks")

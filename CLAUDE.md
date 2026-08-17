@@ -40,7 +40,7 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
 - `model/CommentJson.kt` — Gson encode/decode (`disableHtmlEscaping`; nulls omitted).
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
 - `util/HeviewTime.kt` — `nowIso()`: fixed 3-digit-millis ASCII ISO (matches JS `toISOString` so ordering matches reviewa).
-- `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`; `consumedDir` = `comments/consumed` (nested
+- `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`; `processedDir` = `comments/processed` (nested
   so the pool's `*.json` glob skips it), where a hook claims a consumed comment.
 - `storage/CommentStore.kt` — in-memory index + JSON persistence; registered as an **application** service
   (the pool is shared). EDT-confined; disk I/O offloaded to a serial background executor (`runIo`, injectable).
@@ -72,14 +72,14 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   startup once-guard can re-arm and retry. All paths/`PATH`/warn injectable → unit-tested against temp dirs.
   Bundled injector scripts (`src/main/resources/hook-scripts/{claude-code,codex}/`) match by directory
   boundary + normalize paths, are UTF-8 + null-tolerant, and consume by an atomic **CLAIM** — move-then-emit
-  into `comments/consumed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher
+  into `comments/processed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher
   reads; the moved tombstone is then rewritten to `status:"processed"` (JS/Python byte-identical) so it reads back as Seen.
 - `watch/CommentsPoolWatcher.kt` — Phase 3 application `@Service` (`Disposable`): a daemon NIO WatchService on
-  `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `consumed/` means an agent hook consumed
+  `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `processed/` means an agent hook consumed
   it → `CommentStore.markProcessed` (Seen); a bare vanish → `evict` (peer/user delete). The tombstone is the
   consumed comment itself and is **left in place** (a slower live client, e.g. heview-vscode, must observe it;
-  it's also the restore source) — reclaimed by an **age-based** startup `sweepConsumed()` (drop >14 days), never
-  an eager per-client delete. Store calls hop to the EDT. The `consumed/` move replaces reviewa's suppression
+  it's also the restore source) — reclaimed by an **age-based** startup `sweepProcessed()` (drop >14 days), never
+  an eager per-client delete. Store calls hop to the EDT. The `processed/` move replaces reviewa's suppression
   set (idempotent evict absorbs our own `delete`). Classification + FS effects are unit-tested directly (temp
   dirs, sync dispatch); the live WatchService thread is dogfood-only.
 - `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and on an
@@ -130,8 +130,8 @@ context-blind reviewer will keep raising them:
   deprecated) and heview **never edits an existing `config.toml`** (hooks default-on → create-if-absent +
   warn-on-`false` only). These three (backtick, sibling-prefix, config-wipe) are latent bugs in reviewa too.
 - **Built (Phase 3 consumption slice + shared tombstone contract):** injectors CLAIM a consumed comment by an
-  atomic move into `~/.heview/comments/consumed/` (move-then-emit ⇒ single-use) rather than `unlink`;
-  `CommentsPoolWatcher` marks a thread *Seen* on that signal vs `evict`s on a bare vanish — the `consumed/`
+  atomic move into `~/.heview/comments/processed/` (move-then-emit ⇒ single-use) rather than `unlink`;
+  `CommentsPoolWatcher` marks a thread *Seen* on that signal vs `evict`s on a bare vanish — the `processed/`
   move replaces reviewa's suppression set. `markProcessed`/`evict` never persist (a processed comment isn't
   written; its file already left the pool). **Four-rule contract (shared with heview-vscode): consume = atomic
   move; Seen = tombstone present for an in-index uuid; delete = vanished with no tombstone; retention =
@@ -153,7 +153,7 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 
 <status>
 Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment + **Phase 2 — agent
-hooks** + **Phase 3 — consumption watcher (consumed-dir slice)** are DONE. Phases 1–2 were each dogfooded
+hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE. Phases 1–2 were each dogfooded
 and taken through `/aeview-loop` to convergence; the end-to-end loop is **proven live** (a comment left in
 the IDE is injected into Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block and its
 `<uuid>.json` is consumed). Gate green: **97 tests** (JUnit5 unit + a JUnit3/4 `BasePlatformTestCase` +
@@ -164,7 +164,7 @@ The maintainer normally runs pushes — only push when asked. **The Phase-3 comm
 are LOCAL / unpushed.**
 
 Phase 3 just shipped (see `implementation_log.local.md` "Phase 3" + plan §4/§5/§8/§9): injectors CLAIM a
-consumed comment by an atomic move into `comments/consumed/` (single-use); `CommentsPoolWatcher` flips a
+consumed comment by an atomic move into `comments/processed/` (single-use); `CommentsPoolWatcher` flips a
 thread *Seen* on that signal vs `evict`s on a bare vanish; `CommentThread` shows a Pending/Seen chip and
 relabels in place. **Immediate next actions for this increment: (1) run `/aeview-loop`
 (`range:8a69734..HEAD`) — Phase 3 touches concurrency + a background thread + FS races, so expect real
