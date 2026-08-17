@@ -3,7 +3,10 @@ heview-intellij is a JetBrains-IDE plugin porting **reviewa-vscode** (being rena
 inline code-review comments on files, written to a shared on-disk pool and injected into Claude Code /
 Codex via hooks to be resolved. `plan.html` (repo root) is the authoritative design + phasing artifact
 and the primary thing the maintainer judges by — keep it current. `implementation_log.local.md`
-(gitignored) is the running build log: what shipped per increment, decisions, and the live backlog.
+(gitignored) is the running build log: what shipped per increment, decisions, and the live backlog — its
+top **RESUME HERE** banner is the fastest way back in. `changes_to_be_made_to_vscode_variant.local.md`
+(gitignored) is the hand-off list of fixes + the shared `processed/` tombstone contract to port to the VS
+Code variant — append to it when a new reviewa/heview-vscode divergence surfaces (don't edit reviewa itself).
 Reference source being ported: `~/gh/MarlzRana/reviewa-vscode`. IntelliJ SDK docs: `~/gh/JetBrains/intellij-sdk-docs`.
 </overview>
 
@@ -187,10 +190,12 @@ Phase 3's consumption watcher shipped AND went through a full **5-cycle `/aeview
 17→17→13→11→9; the real bugs each cycle shrank to edges of the prior cycle's own fixes — EDT/lifecycle,
 then the reconcile/whenHydrated wiring, then safe-evict edges). Everything the loop surfaced is either
 fixed (see the log's Phase-3 aeview section) or a recorded deferral / accepted tradeoff (see
-`<settled-decisions>`). **Next increment: pick one — remaining Phase 3 (comment tool window, status-bar
-pending-count widget, copy actions, settings page incl. Seen auto-collapse, scoped project-close cleanup)
-OR the Phase 1 reply/edit/re-pend→processed state machine (also the "restore a consumed comment" UI the
-tombstone was built for).** Full deferred backlog (durable-anchor line-number writeback, external-reload
+`<settled-decisions>`). **Next increment (maintainer chose): Phase 1 — reply / edit / re-pend → processed
+state machine** (design: plan.html §5 "State machine"; per-step spec in the log's RESUME banner). It also
+delivers the **"restore a consumed comment"** path (re-pend reads the tombstone from `comments/processed/`
+back into `comments/`). `REPENDING` is UI-only and persists as `pending` (no new on-disk enum). Remaining
+Phase 3 (tool window, status-bar widget, copy actions, settings incl. Seen auto-collapse, scoped
+project-close cleanup) is the alternative if priorities shift. Full deferred backlog (durable-anchor line-number writeback, external-reload
 listener, `CommentJson.decode` validation, multi-client CREATE/MODIFY sync, GitHub identity, …) is in
 `implementation_log.local.md`.
 </status>
