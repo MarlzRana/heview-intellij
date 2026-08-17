@@ -212,9 +212,10 @@
 <pre><code>~/.heview/
 ├─ comments/                                          # SHARED pool — one &lt;uuid&gt;.json per thread
 │  └─ consumed/                                       # hooks CLAIM a comment by moving it here (not
-│                                                     #   unlink) so the watcher can tell consumption
-│                                                     #   from a peer/user delete; the watcher deletes
-│                                                     #   the tombstone after marking Seen (retention)
+│                                                     #   unlink) so any client can tell consumption
+│                                                     #   from a peer/user delete; the tombstone IS the
+│                                                     #   consumed comment (restorable) and lingers for
+│                                                     #   peers — age-swept after 14 days, not eager
 ├─ claude-code/
 │  ├─ hooks/
 │  │  ├─ user_prompt_submit_insert_comments_hook.js   # comment injector (Node)
@@ -335,19 +336,22 @@ in-memory index + inlays against filesystem events:</p>
   <li><b>DELETE</b> is the hard one — three causes are <i>indistinguishable on a bare <code>unlink</code></i>:
     a hook <b>consumed</b> it (should mark the thread <i>Seen</i>), a <b>peer/user deleted</b> it (should
     vanish silently), or <b>this client</b> deleted it (already handled by reviewa's suppression set).
-    <b>Decided (maintainer) — and now built:</b> the hooks provide the intent signal by <b>claiming a
-    consumed file (an atomic move into <code>~/.heview/comments/consumed/</code>)</b> instead of unlinking
-    it. <code>CommentsPoolWatcher</code> reads the signal on each <code>comments/*.json</code> delete: a
-    file present in <code>consumed/</code> → consumed → <code>markProcessed</code> (mark <i>Seen</i>) then
-    delete the tombstone (retention); a file that simply <i>vanished</i> → peer/user delete → <code>evict</code>.
-    Both store calls are idempotent, so a self-delete the watcher later observes is a no-op — <b>the
-    <code>consumed/</code> move replaces reviewa's suppression set</b>. A startup sweep clears tombstones
-    left by consumption that happened while no IDE was running. <span class="muted"><b>Making the claim the
-    single-use guarantee:</b> each injector now moves-then-emits (emits only files it won the rename for),
-    so two concurrent agents can't double-inject. <b>Still Later:</b> CREATE/MODIFY reconciliation for true
-    multi-client sync; and the immediate retention delete has a multi-client race (a second live watcher
-    could miss the signal) that the renamed VS Code plugin's shared contract must address (e.g. age-based
-    sweep instead of eager delete).</span></li>
+    <b>Decided (maintainer) — and now built as a shared four-rule contract:</b> <b>(1) Consume</b> = a hook
+    atomically moves <code>comments/&lt;uuid&gt;.json</code> → <code>consumed/&lt;uuid&gt;.json</code> (the
+    tombstone IS the consumed comment, so a later <i>restore</i> action can revive it). <b>(2) Seen</b> = for
+    a <code>uuid</code> a client has in-index, a tombstone present in <code>consumed/</code> →
+    <code>markProcessed</code>. <b>(3) Delete</b> = the pending file vanished with <i>no</i> tombstone →
+    <code>evict</code>. <b>(4) Retention</b> = <b>age-based sweep</b>, never an eager per-client delete.
+    Because the move is an atomic rename, whenever a client observes the pending file disappear the tombstone
+    already exists — and because every live client watches the shared <code>comments/</code> dir, each reaches
+    the same verdict independently. The tombstone is <b>left in place</b> so a slower peer (e.g. heview-vscode)
+    still sees it; a startup sweep reclaims tombstones older than <b>14 days</b>. Both store calls are
+    idempotent, so a self-delete the watcher later observes is a no-op — <b>the <code>consumed/</code> move
+    replaces reviewa's suppression set</b>. <span class="muted"><b>Single-use:</b> each injector
+    moves-then-emits (emits only files it won the rename for), so two concurrent agents can't double-inject.
+    <b>Still Later:</b> CREATE/MODIFY reconciliation for full multi-client sync (a comment created/edited in
+    one <i>already-open</i> client still needs a restart to appear in another); the renamed VS Code plugin
+    implements the same four rules.</span></li>
 </ul>
 <p class="muted">This also matters for the VS Code side: when heview-vscode adopts the durable model, both
 plugins should share one watcher contract (same events, same tombstone/consumed convention) so a comment
@@ -474,7 +478,7 @@ Your comment here</code></pre>
   <div class="card">
     <h3>Watch &amp; surfaces</h3>
     <ul>
-      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>consumed/</code> means an agent hook consumed it (→ <code>markProcessed</code>, then delete the tombstone) vs a bare vanish → <code>evict</code>. CREATE/MODIFY + the full multi-client sync are <span class="pill later">Later</span>.</li>
+      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice + shared tombstone contract): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>consumed/</code> means an agent hook consumed it (→ <code>markProcessed</code>; the tombstone is left for peers + restore, age-swept after 14 days) vs a bare vanish → <code>evict</code>. Full CREATE/MODIFY multi-client sync is <span class="pill later">Later</span>.</li>
       <li><code>HeviewToolWindowFactory</code> + tree model.</li>
       <li><code>PendingCountWidget</code> (status bar).</li>
       <li><code>HeviewSettings</code> + <code>HeviewConfigurable</code>.</li>

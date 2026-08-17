@@ -75,10 +75,12 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   into `comments/consumed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher reads.
 - `watch/CommentsPoolWatcher.kt` — Phase 3 application `@Service` (`Disposable`): a daemon NIO WatchService on
   `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `consumed/` means an agent hook consumed
-  it → `CommentStore.markProcessed` (Seen) + delete the tombstone (retention); a bare vanish → `evict` (peer/user
-  delete). Store calls hop to the EDT. The `consumed/` move replaces reviewa's suppression set (idempotent evict
-  absorbs our own `delete`); a startup `sweepConsumed()` clears offline tombstones. Classification + FS effects
-  are unit-tested directly (temp dirs, sync dispatch); the live WatchService thread is dogfood-only.
+  it → `CommentStore.markProcessed` (Seen); a bare vanish → `evict` (peer/user delete). The tombstone is the
+  consumed comment itself and is **left in place** (a slower live client, e.g. heview-vscode, must observe it;
+  it's also the restore source) — reclaimed by an **age-based** startup `sweepConsumed()` (drop >14 days), never
+  an eager per-client delete. Store calls hop to the EDT. The `consumed/` move replaces reviewa's suppression
+  set (idempotent evict absorbs our own `delete`). Classification + FS effects are unit-tested directly (temp
+  dirs, sync dispatch); the live WatchService thread is dogfood-only.
 - `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and on an
   **application-pooled** thread (off-EDT) starts the `CommentsPoolWatcher` (idempotent) and runs
   `HookInstaller.installAll()` **once per app** — both **skipped in unit-test/headless mode** so tests never
@@ -126,12 +128,15 @@ context-blind reviewer will keep raising them:
   untouched**, not overwritten fresh; (4) Codex flag is canonical `[features] hooks = true` (`codex_hooks`
   deprecated) and heview **never edits an existing `config.toml`** (hooks default-on → create-if-absent +
   warn-on-`false` only). These three (backtick, sibling-prefix, config-wipe) are latent bugs in reviewa too.
-- **Built (Phase 3 consumption slice):** injectors CLAIM a consumed comment by an atomic move into
-  `~/.heview/comments/consumed/` (move-then-emit ⇒ single-use) rather than `unlink`; `CommentsPoolWatcher`
-  marks a thread *Seen* on that signal vs `evict`s on a bare vanish — the `consumed/` move replaces reviewa's
-  suppression set. `markProcessed`/`evict` never persist (a processed comment isn't written; its file already
-  left the pool). The eager tombstone-delete has a multi-client race (a 2nd live watcher could miss the
-  signal) → age-based sweep in the shared VS Code contract, deferred (v1 is single-watcher, so correct now).
+- **Built (Phase 3 consumption slice + shared tombstone contract):** injectors CLAIM a consumed comment by an
+  atomic move into `~/.heview/comments/consumed/` (move-then-emit ⇒ single-use) rather than `unlink`;
+  `CommentsPoolWatcher` marks a thread *Seen* on that signal vs `evict`s on a bare vanish — the `consumed/`
+  move replaces reviewa's suppression set. `markProcessed`/`evict` never persist (a processed comment isn't
+  written; its file already left the pool). **Four-rule contract (shared with heview-vscode): consume = atomic
+  move; Seen = tombstone present for an in-index uuid; delete = vanished with no tombstone; retention =
+  age-based sweep (>14 days), NEVER an eager per-client delete** (that would starve a slower peer). The
+  tombstone IS the consumed comment (kept for a future UI restore). Still Later: CREATE/MODIFY sync so a
+  comment created/edited in one already-open client appears in another without a restart.
 </settled-decisions>
 
 <review>
