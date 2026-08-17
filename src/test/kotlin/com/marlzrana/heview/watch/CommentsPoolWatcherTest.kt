@@ -26,7 +26,7 @@ class CommentsPoolWatcherTest {
     private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() })
 
     private fun watcher(comments: Path, store: CommentStore) =
-        CommentsPoolWatcher(comments, comments.resolve("processed"), store)
+        CommentsPoolWatcher(comments, store)
 
     private fun seedProcessedTombstone(comments: Path, uuid: String) {
         val consumed = Files.createDirectories(comments.resolve("processed"))
@@ -60,6 +60,26 @@ class CommentsPoolWatcherTest {
         watcher(comments, store).onCommentFileDeleted("u1")
 
         assertNull(store.get("u1")) // gone, not marked Seen
+    }
+
+    @Test
+    fun `a delete event whose pool file still exists is ignored (atomic replace, not a removal)`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1"))
+        // An atomic in-place replace fires ENTRY_DELETE while the file is present (rename recreated it).
+        Files.writeString(comments.resolve("u1.json"), "{}")
+
+        watcher(comments, store).onCommentFileDeleted("u1")
+
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // not evicted, not marked Seen
+    }
+
+    @Test
+    fun `uuidOfDeletedEntry maps json names to uuids and ignores the processed subdir entry`() {
+        assertEquals("abc", CommentsPoolWatcher.uuidOfDeletedEntry("abc.json"))
+        assertNull(CommentsPoolWatcher.uuidOfDeletedEntry("processed")) // the subdir itself, not a comment
+        assertNull(CommentsPoolWatcher.uuidOfDeletedEntry("notes.txt"))
     }
 
     @Test

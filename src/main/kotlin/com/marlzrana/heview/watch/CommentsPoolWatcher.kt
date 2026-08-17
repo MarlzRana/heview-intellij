@@ -37,35 +37,43 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   applied) → [CommentStore.evict] drops it. Both store calls are idempotent, so a self-delete the
  *   watcher later observes is a no-op — no suppression set is needed (the `processed/` move replaces it).
  *
+ * An in-place atomic replace (tmp→rename over an existing pool file) also surfaces as an `ENTRY_DELETE`;
+ * [onCommentFileDeleted] ignores the event when the pool file is still present, so a peer update can't
+ * spuriously evict a live comment.
+ *
  * Threading: a single daemon thread owns the blocking [WatchService]; every store mutation hops to the
- * EDT via [runEdt] (the store is EDT-confined). Sweep deletes run on the watch thread (already off-EDT).
- * All inputs are injectable so the classification + filesystem effects unit-test against temp dirs with
- * synchronous dispatch; the live [WatchService] glue is dogfooded in `runIde`.
+ * EDT via [runEdt] (the store is EDT-confined) and is dropped once this service is [dispose]d. Sweep
+ * deletes run on the watch thread (already off-EDT). All inputs are injectable so the classification +
+ * filesystem effects unit-test against temp dirs with synchronous dispatch; the live [WatchService]
+ * glue is dogfooded in `runIde`.
  *
  * Scope note: this is the consumption slice + the shared multi-client tombstone contract (consume =
  * atomic move; Seen = tombstone present for an in-index uuid; delete = vanished with no tombstone;
- * retention = age-based sweep). Full CREATE/MODIFY sync between live clients is a later increment —
+ * retention = age-based sweep). A consumption that races startup [CommentStore.hydrate] (or a dropped /
+ * OVERFLOW event) has no catch-up yet; full CREATE/MODIFY sync + reconcile are a later increment —
  * see plan.html §5 "Multi-client sync".
  */
 @Service(Service.Level.APP)
 internal class CommentsPoolWatcher(
     private val commentsDir: Path,
-    private val processedDir: Path,
-    private val storeProvider: () -> CommentStore,
+    private val store: CommentStore,
     private val runEdt: (Runnable) -> Unit = { ApplicationManager.getApplication().invokeLater(it) },
 ) : Disposable {
     /** Application-service constructor — binds to the shared pool + the shared [CommentStore]. */
     @Suppress("unused")
-    constructor() : this(HeviewPaths.commentsDir, HeviewPaths.processedDir, { service() })
+    constructor() : this(HeviewPaths.commentsDir, service())
 
-    /** Test constructor: a temp-dir pool, an explicit store, and synchronous EDT dispatch. */
+    /** Test constructor: a temp-dir pool + an explicit store, with synchronous EDT dispatch. */
     @TestOnly
-    constructor(commentsDir: Path, processedDir: Path, store: CommentStore) :
-        this(commentsDir, processedDir, { store }, { it.run() })
+    constructor(commentsDir: Path, store: CommentStore) : this(commentsDir, store, { it.run() })
 
-    private val store: CommentStore get() = storeProvider()
+    // Where a consumed comment is claimed to; derived so it can never be mis-paired with commentsDir.
+    private val processedDir: Path = commentsDir.resolve("processed")
 
     private val started = AtomicBoolean(false)
+
+    @Volatile
+    private var disposed = false
 
     @Volatile
     private var watchService: WatchService? = null
@@ -76,28 +84,43 @@ internal class CommentsPoolWatcher(
     /** Start watching the pool, once per application; idempotent and safe to call off-EDT. */
     fun ensureStarted() {
         if (!started.compareAndSet(false, true)) return
-        thread = Thread({ run() }, "Heview comments watcher").apply {
-            isDaemon = true
-            start()
-        }
+        // Publish the thread reference BEFORE start(), so a dispose() racing startup can interrupt it
+        // and close the service instead of leaking a daemon that outlives the plugin.
+        val t = Thread({ run() }, "Heview comments watcher").apply { isDaemon = true }
+        thread = t
+        t.start()
     }
 
     private fun run() {
+        if (disposed) return
         try {
             Files.createDirectories(commentsDir)
         } catch (e: IOException) {
             LOG.warn("heview: cannot create the comments dir to watch $commentsDir", e)
+            started.set(false) // transient — let the next project-open retry (mirrors the hook installer)
             return
         }
         // Reclaim tombstones older than the retention window so processed/ can't grow without bound,
         // while leaving recent ones for live peers + a future restore action.
         sweepProcessed()
+
         val ws = try {
-            FileSystems.getDefault().newWatchService().also {
-                commentsDir.register(it, StandardWatchEventKinds.ENTRY_DELETE)
-            }
+            FileSystems.getDefault().newWatchService()
+        } catch (e: IOException) {
+            LOG.warn("heview: cannot create a watch service for $commentsDir", e)
+            started.set(false)
+            return
+        }
+        try {
+            commentsDir.register(ws, StandardWatchEventKinds.ENTRY_DELETE)
         } catch (e: IOException) {
             LOG.warn("heview: cannot watch the comments dir $commentsDir", e)
+            ws.close() // register failed — don't leak the native watcher / file descriptors
+            started.set(false)
+            return
+        }
+        if (disposed) {
+            ws.close()
             return
         }
         watchService = ws
@@ -114,19 +137,22 @@ internal class CommentsPoolWatcher(
                 // ignore — already shutting down
             }
         }
+        // The loop exited because the watch key went invalid (the dir was removed), not a dispose:
+        // re-arm so a later ensureStarted() can rebuild the watch.
+        if (!disposed) started.set(false)
     }
 
     private fun watchLoop(ws: WatchService) {
         while (true) {
             val key = ws.take() // blocks; throws ClosedWatchServiceException when disposed
             for (event in key.pollEvents()) {
+                // OVERFLOW means events were dropped; without a reconcile pass we can't recover the
+                // lost signal here (tracked as a known gap — see the class scope note).
                 if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue
-                // For a directory watch the context is the entry's relative name (a single component),
-                // so there is no path-separator to worry about when resolving into processed/.
+                // For a directory watch the context is the entry's relative name (a single component).
                 val name = event.context() as? Path ?: continue
-                val fileName = name.toString()
-                if (!fileName.endsWith(".json")) continue // skips the processed/ subdir entry itself
-                onCommentFileDeleted(fileName.removeSuffix(".json"))
+                val uuid = uuidOfDeletedEntry(name.toString()) ?: continue
+                onCommentFileDeleted(uuid)
             }
             if (!key.reset()) break // the watched dir is gone/inaccessible — stop the loop
         }
@@ -138,16 +164,29 @@ internal class CommentsPoolWatcher(
      * (→ evict). Invoked on the watch thread; store mutations hop to the EDT. Visible for unit testing.
      */
     fun onCommentFileDeleted(uuid: String) {
+        // An atomic in-place replace (tmp→rename over an existing file) also fires ENTRY_DELETE. If the
+        // pool file is still there it wasn't really removed — ignore, so a peer update / a re-save can't
+        // spuriously evict a live comment.
+        if (Files.exists(commentsDir.resolve("$uuid.json"))) return
+
         val tombstone = processedDir.resolve("$uuid.json")
-        if (Files.exists(tombstone)) {
-            // Consumed: mark Seen, but LEAVE the tombstone — other live clients each need to observe it,
-            // and it is the consumed comment itself (a future restore reads it back). Age-swept, never
-            // eager-deleted (an eager delete would starve a slower peer of the signal).
-            runEdt { store.markProcessed(uuid) }
-        } else {
-            runEdt { store.evict(uuid) }
+        when {
+            // Confirmed consumed → Seen.
+            Files.exists(tombstone) -> markProcessed(uuid)
+            // Confirmed gone with no tombstone → a peer/user delete.
+            Files.notExists(tombstone) -> evict(uuid)
+            // Neither exists nor notExists is true → the tombstone's presence couldn't be determined
+            // (an access/I/O error). Don't destroy in-memory state on a failed check; leave it as-is.
+            else -> LOG.warn("heview: could not classify $uuid (processed/ check indeterminate)")
         }
+
+        // Bound processed/ within a long-lived session, not just at the next startup.
+        sweepProcessed()
     }
+
+    private fun markProcessed(uuid: String) = runEdt { if (!disposed) store.markProcessed(uuid) }
+
+    private fun evict(uuid: String) = runEdt { if (!disposed) store.evict(uuid) }
 
     /**
      * Reclaim consumed tombstones older than [TOMBSTONE_RETENTION]; recent ones are kept so every live
@@ -182,6 +221,7 @@ internal class CommentsPoolWatcher(
     }
 
     override fun dispose() {
+        disposed = true // queued EDT hops become no-ops
         thread?.interrupt()
         try {
             watchService?.close()
@@ -196,5 +236,12 @@ internal class CommentsPoolWatcher(
         // A consumed tombstone lingers this long so every live client (and a future "restore" action)
         // can read it; the startup sweep reclaims older ones. Not eager-deleted (that starves peers).
         private val TOMBSTONE_RETENTION: Duration = Duration.ofDays(14)
+
+        /**
+         * The uuid a `comments/` `ENTRY_DELETE` refers to, or null to ignore the entry — a non-`.json`
+         * name (notably the `processed/` subdirectory itself). Pure so the watch-loop parsing is testable.
+         */
+        fun uuidOfDeletedEntry(fileName: String): String? =
+            if (fileName.endsWith(".json")) fileName.removeSuffix(".json") else null
     }
 }
