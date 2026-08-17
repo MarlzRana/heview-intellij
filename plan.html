@@ -241,48 +241,56 @@
 
 <!-- ============================================================ -->
 <h2 id="schema">5 · Comment schema &amp; lifecycle</h2>
-<p>The JSON schema is preserved verbatim from reviewa (so the same hook scripts work unchanged). One file per thread:</p>
+<p>The top-level fields are preserved verbatim from reviewa (so the same hook scripts work unchanged). One file per thread; <code>replies[]</code> is a heview superset field (see below):</p>
 <pre><code>{
   "uuid":             "…",             // filename is &lt;uuid&gt;.json
-  "status":           "pending" | "processed",
-  "created_at":       "&lt;ISO-8601&gt;",     // bumped on reply / edit / re-pend
+  "status":           "pending" | "processed",  // DERIVED: pending iff any reply is actionable
+  "created_at":       "&lt;ISO-8601&gt;",     // DERIVED: bumped on any reply add / edit / re-pend
   "workspace":        "/abs/project/root",
   "abs_path":         "/abs/path/to/file",
   "logical_abs_path": "/abs/path/to/file",  // remapped for plan files (Later)
   "line_number":      42,
   "line_content":     "const x = 1",
   "side":             "file" | "addition" | "removal",  // v1 always "file"
-  "content":          "the review comment text",
-  "intended_consumer": "claude_code"    // optional; absent = any agent
+  "content":          "the review comment text",  // DERIVED: the PENDING replies, joined by "\n\n" (hooks read THIS)
+  "intended_consumer": "claude_code",   // optional; absent = any agent
+  "replies": [                          // heview superset (a foreign/legacy file omits it → 1 reply from content)
+    { "content": "…", "status": "pending" | "processed", "author": "…", "created_at": "&lt;ISO&gt;" }
+  ]
 }</code></pre>
+<p class="muted"><b>Why <code>replies[]</code> (heview divergence).</b> A thread is a list of replies, each with
+its own status and its own edit / delete / re-pend actions — reviewa's per-comment UI, which reviewa keeps
+only <i>in memory</i> (it is session-scoped). heview is durable (it reloads the pool on restart), so the
+per-reply structure is <b>persisted</b>. The hook-facing <code>content</code>/<code>status</code> stay
+<b>derived</b> from <code>replies</code> — <code>content</code> is the PENDING replies joined by a blank line
+(Seen replies are excluded from injection) — so the injectors are <b>unchanged</b> (they read
+<code>content</code> and move the whole file on consume). heview-vscode adopts the same field (or ignores it,
+degrading to one reply).</p>
 
 <p class="muted"><b>v1 field simplifications (sanctioned):</b> <code>side</code> is always <code>"file"</code> (diff-side detection deferred); <code>logical_abs_path == abs_path</code> (plan remap deferred); <code>workspace</code> is the IntelliJ project base path, a v1 approximation of reviewa's git-repo root (hooks match by <code>abs_path</code> prefix, so injection is unaffected). Persistence is <b>async/off-EDT</b> (the platform forbids blocking I/O on the EDT) and atomic; <code>line_content</code> is read from the editor buffer at submit.</p>
 
-<h3>State machine (UI-side, preserved) — <span class="pill v1">built</span></h3>
-<pre><code>          create                     hook / copy consumes file
- (none) ─────────▶ PENDING ───────────────────────────────▶ PROCESSED ("Seen")
-                     ▲  │ edit / re-pend                          │
-                     │  └──────────────────────────────────┐     │ re-pend
-                     └──────────── REPENDING ◀──────────────┴─────┘
-   • PENDING & REPENDING are "actionable" — written to disk, injected to agents.
-   • PROCESSED is not written to disk; only re-pending revives it.
-   • A thread is "Pending comments" if any comment is actionable, else "All comments seen".
-   • Deleting the last actionable comment removes the file from disk.
-   • created_at bumps on reply, edit, and re-pend (drives injection ordering).</code></pre>
-<p><b>Built (reply / edit / re-pend).</b> <code>CommentStore.reply/edit/repend</code> each revive the
-comment to <code>PENDING</code>, bump <code>created_at</code>, and re-persist it into <code>comments/</code>.
-heview's single-comment-per-card model maps reviewa's per-thread <code>content = actionableTexts.join("\n\n")</code>
-onto one string: <b>reply</b> appends after a blank line, <b>edit</b> replaces, <b>re-pend</b> leaves the
-text and just revives. <code>REPENDING</code> stays UI-only — it persists as <code>pending</code> (no new
-on-disk enum). Because editing/replying a Seen comment auto-revives it (reviewa parity), any revive first
-<b>removes the <code>processed/</code> tombstone</b>: a tombstone present for an in-index uuid is the
-consumption watcher's "Seen" signal, so leaving it would let the next catch-up reconcile flip the comment
-straight back. This revive path is also the <b>"restore a consumed comment"</b> mechanism (the tombstone is
-the full comment, so re-pend writes it back to the actionable pool). The card matches reviewa's UI — a
-header action row of icon buttons (delete / edit, and a re-pend "clock" only on a Seen card) plus a
-persistent "Leave a comment" reply box. <i>Still Later: multi-comment threads with independent per-reply
-status (heview keeps one status per card in v1); the thread-aggregate label and delete-last-actionable
-file removal follow once threads hold more than one comment.</i></p>
+<h3>Per-reply state machine — <span class="pill v1">built</span></h3>
+<pre><code>Each REPLY within a thread is independently:
+                add reply / edit / re-pend
+   (new) ──▶ PENDING ◀───────────────────────── PROCESSED ("Seen")
+              │  actions: edit, delete           │  actions: edit, delete, re-pend (↺)
+              └──────────── hook consumes the whole thread ──▶ all replies PROCESSED
+   • PENDING replies are actionable — their text is joined into the thread's `content` and injected.
+   • Editing a Seen reply revives it to PENDING; re-pend (↺, Seen-only) revives it unchanged.
+   • Deleting the last reply removes the thread+file; deleting the last PENDING reply of a mixed
+     thread keeps the Seen replies visible but drops the file from the injectable pool.
+   • created_at (top-level + the touched reply) bumps on add / edit / re-pend (drives ordering).</code></pre>
+<p><b>Built (multi-reply threads).</b> A thread renders as a stack of reply rows, each with its author, a
+Pending/Seen chip, and icon actions — <b>edit</b> (pencil) + <b>delete</b> (trash) always, <b>re-pend</b>
+(clock <code>AllIcons.Vcs.History</code>) only on a Seen reply — plus a persistent "Leave a comment" box that
+adds a new PENDING reply. <code>CommentStore.addReply / editReply / rependReply / deleteReply</code> mutate
+the reply list, <code>recompute</code> the derived <code>content</code>/<code>status</code>/<code>created_at</code>,
+and re-persist; a revive first <b>removes the <code>processed/</code> tombstone</b> (a tombstone for an
+in-index uuid is the watcher's "Seen" signal — leaving it would let the next reconcile flip the thread back).
+Consuming the thread (hook) flips <b>all</b> replies to Seen at once. <b>Two-state per reply</b> (no separate
+"re-pending"): PENDING or PROCESSED, matching the <code>replies[].status</code> enum. <i>Deferred: restoring a
+fully-consumed thread across a restart from its <code>processed/</code> tombstone (in-session it stays visible
+and re-pendable); a dedicated thread-level "delete whole thread" button; multiple authors per reply.</i></p>
 
 <h3>Session lifetime — a deliberate divergence: heview comments are durable</h3>
 <div class="callout warn">

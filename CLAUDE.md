@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 134 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 142 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -39,13 +39,15 @@ Kotlin 1.9.25 + IntelliJ Platform Gradle Plugin 2.1.0. Target IC 2024.2.1; `sinc
 <architecture>
 Source of truth for a comment = its file in the shared pool `~/.heview/comments/<uuid>.json`; the JSON
 schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code map (`src/main/kotlin/com/marlzrana/heview/`):
-- `model/HeviewComment.kt` — schema data class (`@SerializedName` snake_case) + `CommentSide` / `CommentStatus` / `IntendedConsumer` enums.
+- `model/HeviewComment.kt` — thread schema data class (`@SerializedName` snake_case) + `CommentSide` /
+  `CommentStatus` / `IntendedConsumer` enums, plus `HeviewReply(content,status,author,createdAt)`. A thread
+  holds `replies: List<HeviewReply>?` (heview superset; a foreign/legacy file omits it → one reply). Top-level
+  `content` (PENDING replies joined by a blank line — the only field hooks read) and `status` are DERIVED.
 - `model/CommentJson.kt` — Gson encode/decode (`disableHtmlEscaping`; nulls omitted).
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
-- `model/CommentEdits.kt` — pure state-machine transitions on `HeviewComment`: `withReply` (append after a
-  blank line — reviewa's `content.join("\n\n")`), `withContent` (replace), `revived` (bump only). All land
-  in PENDING + bump `created_at` (reviewa auto-revives a Seen comment on edit/reply; PENDING is the only
-  status ever written to `comments/`).
+- `model/CommentEdits.kt` — pure helpers for the reply model: `recomputed(now)` re-derives the thread's
+  `content`/`status`/`created_at` from its replies (PENDING join; PROCESSED iff none actionable);
+  `normalizedReplies(fallbackAuthor)` reconstructs a single reply from `content` for a foreign/legacy file.
 - `util/HeviewTime.kt` — `nowIso()`: fixed 3-digit-millis ASCII ISO (matches JS `toISOString` so ordering matches reviewa).
 - `storage/HeviewPaths.kt` — resolves `~/.heview` via `user.home`; `processedDir` = `comments/processed` (nested
   so the pool's `*.json` glob skips it), where a hook claims a consumed comment.
@@ -53,32 +55,36 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   (the pool is shared). EDT-confined; disk I/O offloaded to a serial background executor (`runIo`, injectable).
   `hydrate()` loads the pool from disk once (read on `runIo`, apply on `runEdt` — both injectable → sync in
   tests); `forAbsPath(path)` returns a file's comments (normalized-path match); `addChangeListener` returns a
-  `Disposable` to unregister. `markProcessed(uuid)` (→ Seen) / `evict(uuid)` (peer/user delete) mutate the
-  index **in memory only, no disk write** — for the watcher; both idempotent. `reply`/`edit`/`repend` (state
-  machine, plan §5) revive a comment to PENDING, bump `created_at`, and re-persist via a private `revive()`
-  that **first removes the `processed/` tombstone** (a tombstone for an in-index uuid is the watcher's Seen
-  signal — leaving it would let the next reconcile flip the comment straight back); `repend` guards
-  `status==PROCESSED`, blank reply/edit + unknown uuids are no-ops. `whenHydrated(cb)` runs `cb`
+  `Disposable` to unregister. `markProcessed(uuid)` (→ flips every reply Seen) / `evict(uuid)` (peer/user delete) mutate the
+  index **in memory only, no disk write** — for the watcher; both idempotent. Per-reply state
+  machine (plan §5): `addReply`/`editReply`/`rependReply`/`deleteReply` mutate the reply list, `recompute`
+  the derived fields, and re-persist via a private `revive()` that **first removes the `processed/`
+  tombstone** (a tombstone for an in-index uuid is the watcher's Seen signal — leaving it would let the next
+  reconcile flip the thread straight back); deleting the last reply drops the thread, deleting the last
+  PENDING reply of a mixed thread keeps the Seen replies but unlinks the pool file. `hydrate`/`decodeIfValid`
+  **normalize replies** (drop malformed, synthesize one from `content` if none) via a `defaultAuthor`
+  provider so every indexed thread has ≥1 well-formed reply. `whenHydrated(cb)` runs `cb`
   once after hydrate applies (a one-shot for the watcher's post-hydrate reconcile — not an every-change
   listener). `isPersisted(uuid)` (a `persisted` set: write-succeeded or hydrated, cleared on evict/delete/
   markProcessed) lets the watcher evict only a comment that was on disk, never one whose create-save failed.
 - `ui/InlayCardHost.kt` — THE seam isolating the experimental inlay API (the ONE swap point).
 - `ui/ComponentInlayCardHost.kt` — backs it via `Editor.addComponentInlay(offset, InlayProperties().relatesToPrecedingText(true), card, FIT_VIEWPORT_WIDTH)`, wrapped in `EditorScrollingPositionKeeper`. Verified present on 2024.2.
-- `ui/CommentThread.kt` — the inlay card. Two entry points: `startCompose()` (an `EditorTextField`, so it owns
-  editor keys) for the create flow, and `startDisplay(comment)` for an already-persisted comment. A display
-  card shows a status chip (orange **Pending** / green **Seen**), a header row of **icon buttons** (`AllIcons`
-  delete / edit, and a re-pend "clock" only on a Seen card — reviewa's trash/pencil/clock UI) and a persistent
-  "Leave a comment" reply box; an inline **edit** sub-mode swaps the body for an editable field (an `editing`
-  flag suppresses `refreshDisplay` so an in-progress edit survives an unrelated reconcile). Reply/edit/re-pend
-  route to `onReply`/`onEdit`/`onRepend`; `refreshDisplay(comment)` relabels a shown card in place (no-op while
+- `ui/CommentThread.kt` — the inlay card, rendering a **thread as a `VerticalLayout` stack of reply rows** +
+  a "Leave a comment" box. `startCompose()` (an `EditorTextField`, owns editor keys) creates a new thread's
+  first reply; `startDisplay(comment)` renders an existing thread. Each reply row shows author + a Pending/Seen
+  chip and **icon buttons** (`AllIcons.Actions` GC delete / Edit pencil always; `AllIcons.Vcs.History` clock
+  re-pend only on a Seen reply — reviewa's trash/pencil/clock UI); an inline per-row **edit** sub-mode swaps
+  that row for an editable field (an `editingIndex` suppresses `refreshDisplay` so an in-progress edit
+  survives an unrelated reconcile). Actions route to `onReply`/`onEditReply`/`onDeleteReply`/`onRependReply`
+  (index-based, valid within one render); `refreshDisplay(comment)` rebuilds the stack in place (no-op while
   composing/editing/unchanged). EDT-only; `onDispose` parented to the inlay; `dispose()` is idempotent.
 - `ui/CommentInlayManager.kt` — **project** light `@Service`; the single controller that owns every
   `CommentThread`. Renders/disposes display cards per `Editor` on open/split/reopen/close (`EditorFactoryListener`),
   and reconciles all open editors on any `CommentStore` change so a comment appears/disappears in every split.
   Owns the create flow too (`compose(editor)`) — tracks the thread under its uuid *before* `store.save` fires, so
-  reconcile never double-renders the composing editor. A shared `newThread()` wires every card's
-  delete/reply/edit/re-pend callbacks to the store (`created_at` via `HeviewTime.nowIso()`). `init()` is
-  EDT-only; boot it via the startup activity.
+  reconcile never double-renders the composing editor. A shared `newThread()` wires every card's per-reply
+  callbacks (`onReply`/`onEditReply`/`onDeleteReply`/`onRependReply`) to the store (`created_at` via
+  `HeviewTime.nowIso()`, new replies authored by the OS user). `init()` is EDT-only; boot it via the startup activity.
 - `actions/AddCommentAction.kt` — "heview: Add Comment" (editor context menu / Ctrl+Alt+Shift+H); local files only;
   thin trigger that delegates to `CommentInlayManager.compose(editor)`.
 - `hooks/HookInstaller.kt` — Phase 2: **atomically** extracts the bundled agent hook scripts into
@@ -175,17 +181,21 @@ context-blind reviewer will keep raising them:
   the read-to-claim "stale snapshot" race is a **non-issue in v1** (no edit path → content is immutable
   after create). Reviewer coverage note: some cycles had ~6/18 reviewers fail (harness/token infra), not
   findings.
-- **Built (Phase 1 reply / edit / re-pend state machine — plan §5):** `CommentStore.reply/edit/repend`
-  revive a comment to PENDING, bump `created_at`, and re-persist. **v1 is single-comment-per-card**, so
-  reviewa's per-thread `content = actionableTexts.join("\n\n")` maps onto one string: reply appends after a
-  blank line, edit replaces, re-pend bumps only. `REPENDING` stays UI-only (persists as `pending` — no new
-  on-disk enum). **A revive first removes the `processed/` tombstone** (a tombstone for an in-index uuid is
-  the watcher's Seen signal — leaving it would let the next reconcile flip the comment back), and this same
-  path IS the **"restore a consumed comment"** mechanism. Editing/replying a Seen comment **auto-revives** it
-  (reviewa parity). Card matches reviewa: header **icon buttons** (delete/edit, re-pend "clock" only on Seen)
-  + a persistent "Leave a comment" reply box. Deferred (don't build without a decision): **multi-comment
-  threads** with independent per-reply status + the thread-aggregate label + delete-last-actionable file
-  removal (heview keeps one status per card in v1).
+- **Built (Phase 1 multi-reply threads + per-reply state machine — plan §5):** a thread (one uuid/file)
+  holds an ordered `replies[]` (a heview **superset** field: `{content,status,author,created_at}`), each
+  reply with its own status and its own edit/delete/re-pend actions — reviewa's per-comment UI, which reviewa
+  keeps only in memory (it is session-scoped). heview **persists** it (durable). Top-level `content`
+  (PENDING replies joined by `\n\n`) + `status` stay **DERIVED** (`recomputed`), so the injectors are
+  **unchanged** (they read `content` + move the whole file on consume). **Two-state per reply** (maintainer
+  decision): PENDING / PROCESSED — edit + delete always, re-pend only on Seen, editing a Seen reply revives
+  it, consuming the thread flips **all** replies. `addReply`/`editReply`/`rependReply`/`deleteReply` recompute
+  + re-persist; a revive **first clears the `processed/` tombstone** (else the next reconcile re-marks Seen);
+  deleting the last reply drops the thread, the last PENDING reply of a mixed thread keeps the Seen replies
+  but unlinks the pool file (reviewa parity). Hydrate **normalizes** a foreign/legacy single-`content` file
+  into one reply. **Deferred (don't build without a decision):** restoring a fully-consumed thread from its
+  `processed/` tombstone across a restart (in-session it stays visible + re-pendable); a thread-level delete
+  button; per-reply multi-author; the injectors flipping `replies[]` statuses in the tombstone (only needed
+  once restore-from-tombstone exists — harmless now).
 </settled-decisions>
 
 <review>
@@ -204,24 +214,25 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **134 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **142 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
 The maintainer normally runs pushes — only push when asked. Everything through the Phase-3 loop is pushed
-(`main` == `origin/main` == `287adfb`); **the new Phase-1 reply/edit/re-pend commits (`2c2e4f3`..HEAD) are
-LOCAL / unpushed.**
+(`origin/main` == `287adfb`); **the new Phase-1 multi-reply commits (`2c2e4f3`..HEAD) are LOCAL / unpushed.**
 
-**Just shipped — Phase 1 reply / edit / re-pend state machine (plan §5).** `CommentStore.reply/edit/repend`
-revive a comment to PENDING, bump `created_at`, re-persist, and remove the `processed/` tombstone; the
-display card gained reviewa's icon actions (delete/edit, re-pend "clock" on a Seen card) + a persistent
-"Leave a comment" reply box + an inline edit mode. This also delivers the **"restore a consumed comment"**
-path. See `<settled-decisions>` ("Built (Phase 1 …)") and the log's RESUME banner.
-**Next: (1) maintainer dogfood in `runIde`** (the create/edit/reply/re-pend action path + real inlay
-rendering is dogfood-only, like earlier UI increments); **(2) `/aeview-loop`** on this increment's diff
-(`range:287adfb..HEAD`). Then the remaining Phase 3 (tool window, status-bar widget, copy actions, settings
-incl. Seen auto-collapse, scoped project-close cleanup) or multi-comment threads (deferred; needs a
-decision). Full deferred backlog (durable-anchor line-number writeback, external-reload listener,
-`CommentJson.decode` validation, multi-client CREATE/MODIFY sync, GitHub identity, …) is in
-`implementation_log.local.md`.
+**Just shipped — Phase 1 multi-reply comment threads + per-reply state machine (plan §5).** A thread now
+holds an ordered `replies[]` (heview superset field), each reply with its own Pending/Seen status and its
+own edit / delete / re-pend actions (reviewa's per-comment UI, persisted because heview is durable). The
+top-level `content`/`status` stay derived so the injectors are unchanged. Two-state per reply; the card
+renders a stack of reply rows (trash/pencil always, clock re-pend on Seen) + a "Leave a comment" box. This
+superseded the earlier single-content reply/edit/re-pend. See `<settled-decisions>` ("Built (Phase 1 …)").
+**Next: (1) maintainer dogfood in `runIde`** — create a comment, add a 2nd reply (two rows), edit/delete a
+reply, consume via a hook (all rows → Seen + clock), re-pend one reply, restart and confirm a mixed thread
+reloads intact. The action path + real inlay rendering is dogfood-only. **(2) `/aeview-loop`** on this
+increment's diff (`range:287adfb..HEAD`). Then remaining Phase 3 (tool window, status-bar widget, copy
+actions, settings incl. Seen auto-collapse, scoped project-close cleanup), or the deferred restore-from-
+tombstone / thread-level-delete items. Full deferred backlog (durable-anchor line-number writeback,
+external-reload listener, `CommentJson.decode` validation, multi-client CREATE/MODIFY sync, GitHub
+identity, …) is in `implementation_log.local.md`.
 </status>
