@@ -43,12 +43,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [onCommentFileDeleted] ignores the event when the pool file is still present, so a peer update can't
  * spuriously evict a live comment.
  *
- * A [reconcile] pass — run once startup [CommentStore.hydrate] applies (via [CommentStore.whenHydrated],
- * a one-shot, so we don't re-scan on every store change), after each watch (re)registration, and on
- * OVERFLOW — catches an in-index PENDING comment whose watch event was missed: it marks *Seen* one whose
- * file is now in `processed/`, and evicts one that was **persisted** and then vanished with no tombstone
- * (a lost bare delete). It never touches a comment that was never persisted (a failed / in-flight save),
- * so it can't race an async create-save.
+ * A [reconcile] pass catches an in-index PENDING comment whose watch event was missed. It marks *Seen*
+ * one whose file is now in `processed/`; and — only when told to (OVERFLOW, where the dir is intact) —
+ * evicts one that was **persisted** and then vanished with no tombstone (a lost bare delete). It runs
+ * markProcessed-only once startup [CommentStore.hydrate] applies (via [CommentStore.whenHydrated]) and
+ * after each watch (re)registration; the register path never evicts, so a rebuild that recreates the
+ * pool dir empty can't mass-evict. It never touches a comment that was never persisted (a failed /
+ * in-flight save), so it can't race an async create-save.
  *
  * Threading: a single daemon thread owns the blocking [WatchService] and rebuilds it if the watched dir
  * is removed at runtime; every store mutation hops to the EDT via [runEdt] and is dropped once this
@@ -112,16 +113,25 @@ internal class CommentsPoolWatcher(
         // listener to leak across the watch-rebuild loop below.
         runEdt { if (!disposed) store.whenHydrated { reconcile() } }
 
+        var consecutiveFailures = 0
         while (!disposed) {
             val ws = openWatch()
             if (ws == null) {
+                // A permanently unwatchable pool (e.g. an exotic FS with no WatchService support) must not
+                // spin a fixed-interval retry forever — give up after a bounded run of consecutive failures.
+                if (++consecutiveFailures >= MAX_WATCH_ATTEMPTS) {
+                    LOG.warn("heview: giving up watching $commentsDir after $consecutiveFailures failed attempts")
+                    return
+                }
                 if (!sleepBeforeRetry()) return // interrupted → disposed
                 continue
             }
+            consecutiveFailures = 0
             watchService = ws
-            // Catch up any consume that landed BEFORE this (re)registration: the whenHydrated pass can
-            // run before register(), and a runtime watch-rebuild would otherwise miss consumes during the
-            // outage. markProcessed-only, so it's safe to repeat on every (re)register.
+            // Catch up consumes that landed BEFORE this (re)registration — markProcessed ONLY. Not the
+            // evict branch: a runtime watch-rebuild recreates commentsDir empty, so a bulk evict here would
+            // wrongly drop every still-valid comment. Lost bare deletes are handled on OVERFLOW (where the
+            // dir is intact), not on a rebuild where the whole dir may have vanished.
             reconcile()
             try {
                 watchLoop(ws)
@@ -177,10 +187,10 @@ internal class CommentsPoolWatcher(
         while (true) {
             val key = ws.take() // blocks; throws ClosedWatchServiceException when disposed
             for (event in key.pollEvents()) {
-                // OVERFLOW means events were dropped — reconcile to re-derive Seen for any comment that
-                // was consumed while we weren't looking.
+                // OVERFLOW means events were dropped while the watch was live (the dir is intact) — a full
+                // reconcile re-derives Seen AND safely evicts lost bare-deletes.
                 if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
-                    reconcile()
+                    reconcile(evictLostDeletes = true)
                     continue
                 }
                 // For a directory watch the context is the entry's relative name (a single component).
@@ -232,23 +242,29 @@ internal class CommentsPoolWatcher(
      * "keep the record on persist failure". Idempotent + convergent. Snapshot on the EDT, stat off the
      * EDT, apply on the EDT. Visible for direct unit testing.
      */
-    fun reconcile() {
+    fun reconcile(evictLostDeletes: Boolean = false) {
         runEdt {
             if (disposed) return@runEdt
-            val pending = store.all().filter { it.status == CommentStatus.PENDING }.map { it.uuid }
+            // Snapshot uuid + persisted-at-snapshot on the EDT. Capturing persisted here (not after the FS
+            // stats) means a save that completes mid-scan — flipping persisted and writing the file — can't
+            // be mistaken for a lost bare-delete and evicted.
+            val pending = store.all()
+                .filter { it.status == CommentStatus.PENDING }
+                .map { it.uuid to store.isPersisted(it.uuid) }
             if (pending.isEmpty()) return@runEdt
             runIo {
                 if (disposed) return@runIo
                 val seen = ArrayList<String>()
                 val gone = ArrayList<String>()
-                for (uuid in pending) {
+                for ((uuid, wasPersisted) in pending) {
                     if (Files.exists(commentsDir.resolve("$uuid.json"))) continue // still pending on disk
                     when {
                         Files.exists(processedDir.resolve("$uuid.json")) -> seen += uuid
-                        // Vanished, no tombstone. Evict only if it was persisted (its file existed and was
-                        // removed) — never a never-persisted / mid-write comment.
-                        Files.notExists(processedDir.resolve("$uuid.json")) && store.isPersisted(uuid) -> gone += uuid
-                        // else: indeterminate processed/ check, or not-yet-persisted → leave it.
+                        // Vanished, no tombstone → a lost bare delete. Evict only when asked (OVERFLOW,
+                        // dir intact) AND the comment was persisted at snapshot — never a never-persisted
+                        // / mid-write comment, and never on a rebuild that recreated the dir empty.
+                        evictLostDeletes && wasPersisted && Files.notExists(processedDir.resolve("$uuid.json")) -> gone += uuid
+                        // else: indeterminate / not-yet-persisted / evict-not-requested → leave it.
                     }
                 }
                 if (seen.isEmpty() && gone.isEmpty()) return@runIo
@@ -287,7 +303,10 @@ internal class CommentsPoolWatcher(
                     if (mtime.isBefore(cutoff)) deleteQuietly(path)
                 }
             }
-        } catch (e: IOException) {
+        } catch (e: Exception) {
+            // Broad: DirectoryStream iteration can throw DirectoryIteratorException, and a permission
+            // check a SecurityException. sweepProcessed() runs on the watch thread outside openWatch's
+            // retry guard, so a throw here would otherwise kill the daemon for the session.
             LOG.warn("heview: failed to sweep $glob in $processedDir", e)
         }
     }
@@ -332,6 +351,10 @@ internal class CommentsPoolWatcher(
 
         // Backoff before rebuilding the watch after the watched dir was removed/replaced at runtime.
         private const val RETRY_DELAY_MS = 5_000L
+
+        // Give up (rather than spin the retry forever) after this many consecutive openWatch() failures —
+        // e.g. a pool dir on a filesystem that has no WatchService support.
+        private const val MAX_WATCH_ATTEMPTS = 10
 
         /**
          * The uuid a `comments/` `ENTRY_DELETE` refers to, or null to ignore the entry — a non-`.json`

@@ -122,26 +122,41 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `reconcile evicts a persisted comment whose file vanished with no tombstone`(@TempDir dir: Path) {
+    fun `reconcile with evict requested evicts a persisted comment that vanished with no tombstone`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val store = store(comments)
         store.save(sampleComment(uuid = "u1")) // sync write succeeds → persisted
-        Files.deleteIfExists(comments.resolve("u1.json")) // a lost bare delete (event dropped/OVERFLOW)
+        Files.deleteIfExists(comments.resolve("u1.json")) // a lost bare delete (an OVERFLOW-dropped event)
 
+        watcher(comments, store).reconcile(evictLostDeletes = true)
+
+        assertNull(store.get("u1")) // persisted then vanished with no tombstone → evicted
+    }
+
+    @Test
+    fun `reconcile without evict requested never evicts, even a persisted vanished comment`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1")) // persisted
+        Files.deleteIfExists(comments.resolve("u1.json")) // vanished, no tombstone
+
+        // The default (whenHydrated + post-(re)register) path must NOT evict: a rebuild recreates the pool
+        // dir empty, so a bulk evict here would wrongly drop every still-valid comment.
         watcher(comments, store).reconcile()
 
-        assertNull(store.get("u1")) // it was persisted then vanished with no tombstone → evicted
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
+        assertNotNull(store.get("u1"))
     }
 
     @Test
     fun `reconcile does not evict a comment whose write never completed`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         // runIo drops the write, so save indexes the record but it is never persisted (mimics a create
-        // whose async write hasn't landed, or one that failed). reconcile must retain it, not evict.
+        // whose async write hasn't landed, or one that failed). Even with evict requested, retain it.
         val store = CommentStore(comments, runIo = {}, runEdt = { it.run() })
         store.save(sampleComment(uuid = "u1")) // PENDING, no file on disk, not persisted
 
-        watcher(comments, store).reconcile()
+        watcher(comments, store).reconcile(evictLostDeletes = true)
 
         assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
         assertNotNull(store.get("u1"))
