@@ -280,4 +280,8 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     /** Live anchor count — lets a test assert no RangeMarker leaks on the unplaceable path. */
     @TestOnly
     internal fun anchorCountForTest(): Int = anchors.size
+
+    /** The display card shown for [uuid] in [editor], if any — lets a test observe its render count. */
+    @TestOnly
+    internal fun cardForTest(editor: Editor, uuid: String): CommentThread? = rendered[editor]?.get(uuid)
 }

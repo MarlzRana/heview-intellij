@@ -255,6 +255,24 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertFalse(host.labelTexts().contains("Pending"))
     }
 
+    fun testRefreshDisplaySkipsUnrelatedChangesAndRebuildsOnStatusFlip() {
+        val (e1, path) = openLocalEditor("N.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "look")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        val baseline = card.displayRenderCount // rendered once on display
+
+        // An unrelated change (a comment on a different file) fires a GLOBAL reconcile; the guard in
+        // refreshDisplay must skip rebuilding this unchanged card (no flicker / re-disabled Delete).
+        store.save(commentAt("/elsewhere/Other.txt", line0Based = 0, content = "other"))
+        assertEquals(baseline, card.displayRenderCount)
+
+        // A relevant change (status flip to Seen) must rebuild it in place.
+        store.markProcessed(comment.uuid)
+        assertEquals(baseline + 1, card.displayRenderCount)
+    }
+
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0
 
     private fun commentAt(absPath: String, line0Based: Int, content: String) =

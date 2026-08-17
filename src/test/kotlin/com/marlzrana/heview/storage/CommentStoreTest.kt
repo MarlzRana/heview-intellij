@@ -401,4 +401,19 @@ class CommentStoreTest {
 
         assertEquals(0, fires)
     }
+
+    @Test
+    fun `hydrate ignores comments nested under the processed subdirectory`(@TempDir dir: Path) {
+        val store = store(dir)
+        seed(dir, sampleComment(uuid = "root1")) // a real pending comment in the pool root
+        // A pending-status file under comments/processed/ (a best-effort tombstone rewrite that stayed
+        // pending): the pool's *.json listing is non-recursive, so it must NOT hydrate as pending — else
+        // a later save() would resurrect an injectable comments/<uuid>.json.
+        val processed = Files.createDirectories(dir.resolve("processed"))
+        Files.writeString(processed.resolve("tomb1.json"), CommentJson.encode(sampleComment(uuid = "tomb1")))
+
+        store.hydrate()
+
+        assertEquals(listOf("root1"), store.all().map { it.uuid })
+    }
 }

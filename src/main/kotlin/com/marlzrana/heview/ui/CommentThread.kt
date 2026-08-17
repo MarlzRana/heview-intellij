@@ -60,6 +60,12 @@ internal class CommentThread(
     // skip a no-op re-render and lets the compose→submit path own the first display render itself.
     private var displayed: HeviewComment? = null
 
+    // Bumped every time the display card is (re)built, so a test can prove refreshDisplay's
+    // no-op-when-unchanged guard actually skips a rebuild on unrelated store changes.
+    @get:TestOnly
+    internal var displayRenderCount = 0
+        private set
+
     /** Place the compose card below the target line. Returns false if the host could not place it. */
     fun startCompose(onSubmit: (text: String) -> HeviewComment): Boolean {
         composeSubmit = onSubmit
@@ -146,6 +152,7 @@ internal class CommentThread(
     internal fun submitForTest(text: String) = submit(text)
 
     private fun renderDisplay(current: HeviewComment) {
+        displayRenderCount++
         displayed = current
         val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
             add(JBLabel(author))
