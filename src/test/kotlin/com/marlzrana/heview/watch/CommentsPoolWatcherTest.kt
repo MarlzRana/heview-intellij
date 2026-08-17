@@ -5,6 +5,7 @@ import com.marlzrana.heview.sampleComment
 import com.marlzrana.heview.storage.CommentStore
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -91,6 +92,47 @@ class CommentsPoolWatcherTest {
         watcher(comments, store).onCommentFileDeleted("gone")
 
         assertNull(store.get("gone")) // no crash, no resurrection
+    }
+
+    @Test
+    fun `reconcile marks Seen a pending comment whose file was consumed without an event`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1")) // PENDING, writes comments/u1.json
+        // Simulate a consume whose ENTRY_DELETE the watcher missed (raced hydrate / dropped): the file
+        // has already moved to processed/, but the store still thinks it's pending.
+        val processed = Files.createDirectories(comments.resolve("processed"))
+        Files.move(comments.resolve("u1.json"), processed.resolve("u1.json"))
+
+        watcher(comments, store).reconcile()
+
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
+    }
+
+    @Test
+    fun `reconcile leaves a normally-pending comment untouched`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1")) // comments/u1.json present, no tombstone
+
+        watcher(comments, store).reconcile()
+
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
+    }
+
+    @Test
+    fun `reconcile never evicts a pending comment that has no tombstone`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1"))
+        // File gone with NO tombstone: e.g. a comment saved this instant whose async write hasn't landed
+        // (or a peer/user delete). reconcile must NOT touch it — that's the watch event's job, not ours.
+        Files.deleteIfExists(comments.resolve("u1.json"))
+
+        watcher(comments, store).reconcile()
+
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // still pending, not evicted
+        assertNotNull(store.get("u1"))
     }
 
     @Test

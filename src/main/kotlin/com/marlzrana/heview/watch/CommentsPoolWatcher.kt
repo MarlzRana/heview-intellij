@@ -5,6 +5,9 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.logger
+import com.intellij.openapi.util.Disposer
+import com.intellij.util.concurrency.AppExecutorUtil
+import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.storage.CommentStore
 import com.marlzrana.heview.storage.HeviewPaths
 import org.jetbrains.annotations.TestOnly
@@ -47,10 +50,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * filesystem effects unit-test against temp dirs with synchronous dispatch; the live [WatchService]
  * glue is dogfooded in `runIde`.
  *
+ * A [reconcile] pass (run once startup [CommentStore.hydrate] applies, and again on OVERFLOW) marks
+ * *Seen* any in-index PENDING comment whose file is already in `processed/`, covering a consume that
+ * raced hydrate or a dropped watch event. It only ever marks Seen, never evicts.
+ *
  * Scope note: this is the consumption slice + the shared multi-client tombstone contract (consume =
  * atomic move; Seen = tombstone present for an in-index uuid; delete = vanished with no tombstone;
- * retention = age-based sweep). A consumption that races startup [CommentStore.hydrate] (or a dropped /
- * OVERFLOW event) has no catch-up yet; full CREATE/MODIFY sync + reconcile are a later increment —
+ * retention = age-based sweep). Full CREATE/MODIFY sync between live clients is a later increment —
  * see plan.html §5 "Multi-client sync".
  */
 @Service(Service.Level.APP)
@@ -58,14 +64,15 @@ internal class CommentsPoolWatcher(
     private val commentsDir: Path,
     private val store: CommentStore,
     private val runEdt: (Runnable) -> Unit = { ApplicationManager.getApplication().invokeLater(it) },
+    private val runIo: (Runnable) -> Unit = { AppExecutorUtil.getAppExecutorService().execute(it) },
 ) : Disposable {
     /** Application-service constructor — binds to the shared pool + the shared [CommentStore]. */
     @Suppress("unused")
     constructor() : this(HeviewPaths.commentsDir, service())
 
-    /** Test constructor: a temp-dir pool + an explicit store, with synchronous EDT dispatch. */
+    /** Test constructor: a temp-dir pool + an explicit store, with synchronous EDT/IO dispatch. */
     @TestOnly
-    constructor(commentsDir: Path, store: CommentStore) : this(commentsDir, store, { it.run() })
+    constructor(commentsDir: Path, store: CommentStore) : this(commentsDir, store, { it.run() }, { it.run() })
 
     // Where a consumed comment is claimed to; derived so it can never be mis-paired with commentsDir.
     private val processedDir: Path = commentsDir.resolve("processed")
@@ -124,6 +131,14 @@ internal class CommentsPoolWatcher(
             return
         }
         watchService = ws
+        // Catch-up for the event-only design: reconcile now, and again on every store change (so it runs
+        // once startup hydrate applies). The store subscription is parented to this service → removed on
+        // dispose. See reconcile().
+        runEdt {
+            if (disposed) return@runEdt
+            Disposer.register(this, store.addChangeListener { reconcile() })
+            reconcile()
+        }
         try {
             watchLoop(ws)
         } catch (e: ClosedWatchServiceException) {
@@ -146,9 +161,12 @@ internal class CommentsPoolWatcher(
         while (true) {
             val key = ws.take() // blocks; throws ClosedWatchServiceException when disposed
             for (event in key.pollEvents()) {
-                // OVERFLOW means events were dropped; without a reconcile pass we can't recover the
-                // lost signal here (tracked as a known gap — see the class scope note).
-                if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue
+                // OVERFLOW means events were dropped — reconcile to re-derive Seen for any comment that
+                // was consumed while we weren't looking.
+                if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                    reconcile()
+                    continue
+                }
                 // For a directory watch the context is the entry's relative name (a single component).
                 val name = event.context() as? Path ?: continue
                 val uuid = uuidOfDeletedEntry(name.toString()) ?: continue
@@ -187,6 +205,33 @@ internal class CommentsPoolWatcher(
     private fun markProcessed(uuid: String) = runEdt { if (!disposed) store.markProcessed(uuid) }
 
     private fun evict(uuid: String) = runEdt { if (!disposed) store.evict(uuid) }
+
+    /**
+     * Catch-up for the event-only design: an agent consume that raced startup [CommentStore.hydrate]
+     * (its `ENTRY_DELETE` fired before the record was in the index), or a dropped/OVERFLOW watch event,
+     * leaves an in-index PENDING comment whose file is already in `processed/`. Mark those *Seen*.
+     *
+     * Only ever marks Seen — never evicts — so it can't race the async write of a freshly-saved comment:
+     * a just-created comment has no `processed/` tombstone yet, so it is left untouched. Idempotent and
+     * convergent (a marked comment is no longer PENDING, so a re-entrant pass skips it). Snapshot on the
+     * EDT, stat off the EDT, apply on the EDT. Visible for direct unit testing.
+     */
+    fun reconcile() {
+        runEdt {
+            if (disposed) return@runEdt
+            val pending = store.all().filter { it.status == CommentStatus.PENDING }.map { it.uuid }
+            if (pending.isEmpty()) return@runEdt
+            runIo {
+                if (disposed) return@runIo
+                val consumed = pending.filter { uuid ->
+                    Files.notExists(commentsDir.resolve("$uuid.json")) &&
+                        Files.exists(processedDir.resolve("$uuid.json"))
+                }
+                if (consumed.isEmpty()) return@runIo
+                runEdt { if (!disposed) consumed.forEach { store.markProcessed(it) } }
+            }
+        }
+    }
 
     /**
      * Reclaim consumed tombstones older than [TOMBSTONE_RETENTION]; recent ones are kept so every live
