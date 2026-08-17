@@ -2,6 +2,7 @@ package com.marlzrana.heview.watch
 
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.sampleComment
+import com.marlzrana.heview.sampleReply
 import com.marlzrana.heview.storage.CommentStore
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -62,6 +63,27 @@ class CommentsPoolWatcherTest {
         watcher(comments, store).onCommentFileDeleted("u1")
 
         assertNull(store.get("u1")) // gone, not marked Seen
+    }
+
+    @Test
+    fun `a thread taken off the pool by deleting its last pending reply is not evicted`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        val todo = sampleReply(content = "todo", status = CommentStatus.PENDING)
+        store.save(
+            sampleComment(uuid = "u1", replies = listOf(todo, sampleReply(content = "seen", status = CommentStatus.PROCESSED))),
+        )
+        // Deleting the only actionable reply → retainSeenOffPool: keeps the Seen reply in the index,
+        // unlinks the pool file (no tombstone), and clears `persisted`. The live watcher then sees the
+        // unlink; it must NOT evict (that would drop the still-visible Seen thread).
+        store.deleteReply("u1", todo)
+        assertFalse(Files.exists(comments.resolve("u1.json")))
+        assertFalse(Files.exists(comments.resolve("processed/u1.json"))) // no tombstone written
+
+        watcher(comments, store).onCommentFileDeleted("u1")
+
+        assertNotNull(store.get("u1")) // retained — the isPersisted gate leaves our own retain alone
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
     }
 
     @Test

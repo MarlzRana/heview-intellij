@@ -345,6 +345,39 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(1, liveCards(e1)) // still one card (now two rows)
     }
 
+    fun testInlineEditSuppressesRefreshOnAnUnrelatedReconcile() {
+        val (e1, path) = openLocalEditor("T.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "original")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        card.startEditForTest(0) // open the inline edit without submitting
+        val baseline = card.displayRenderCount
+
+        // A GLOBAL reconcile from an unrelated change must NOT rebuild this card — that would clobber the
+        // in-progress edit (the editingIndex guard in refreshDisplay).
+        store.save(commentAt("/elsewhere/Other.txt", line0Based = 0, content = "unrelated"))
+
+        assertEquals(baseline, card.displayRenderCount)
+    }
+
+    fun testDeleteReplyThroughTheManagerRemovesItThenTheThread() {
+        val (e1, path) = openLocalEditor("U.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "first")
+        store.save(comment)
+        manager.init()
+        manager.cardForTest(e1, comment.uuid)!!.replyForTest("second") // two replies
+        assertEquals(2, store.get(comment.uuid)?.replies?.size)
+
+        manager.cardForTest(e1, comment.uuid)!!.deleteReplyForTest(0) // delete "first"
+        assertEquals(listOf("second"), store.get(comment.uuid)?.replies?.map { it.content })
+        assertEquals(1, liveCards(e1)) // card stays (one reply remains)
+
+        manager.cardForTest(e1, comment.uuid)!!.deleteReplyForTest(0) // delete the last reply
+        assertNull(store.get(comment.uuid)) // thread gone
+        assertEquals(0, liveCards(e1)) // …and its card removed
+    }
+
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0
 
     private fun commentAt(absPath: String, line0Based: Int, content: String) =

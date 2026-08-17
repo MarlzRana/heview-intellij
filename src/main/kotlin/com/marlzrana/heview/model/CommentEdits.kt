@@ -16,8 +16,7 @@ package com.marlzrana.heview.model
  * Call after any reply mutation so the persisted thread stays consistent for the hooks.
  */
 fun HeviewComment.recomputed(now: String): HeviewComment {
-    val reps = replies ?: emptyList()
-    val actionable = reps.filter { it.status == CommentStatus.PENDING }
+    val actionable = replies.orEmpty().filter { it.status == CommentStatus.PENDING }
     return copy(
         content = actionable.joinToString("\n\n") { it.content },
         status = if (actionable.isEmpty()) CommentStatus.PROCESSED else CommentStatus.PENDING,

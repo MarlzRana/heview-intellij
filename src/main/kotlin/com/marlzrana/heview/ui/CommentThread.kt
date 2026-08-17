@@ -53,9 +53,9 @@ internal class CommentThread(
     private val lineEndOffset: Int,
     private val author: String,
     private val onReply: (comment: HeviewComment, replyText: String) -> Unit = { _, _ -> },
-    private val onEditReply: (comment: HeviewComment, replyIndex: Int, newText: String) -> Unit = { _, _, _ -> },
-    private val onDeleteReply: (comment: HeviewComment, replyIndex: Int) -> Unit = { _, _ -> },
-    private val onRependReply: (comment: HeviewComment, replyIndex: Int) -> Unit = { _, _ -> },
+    private val onEditReply: (comment: HeviewComment, reply: HeviewReply, newText: String) -> Unit = { _, _, _ -> },
+    private val onDeleteReply: (comment: HeviewComment, reply: HeviewReply) -> Unit = { _, _ -> },
+    private val onRependReply: (comment: HeviewComment, reply: HeviewReply) -> Unit = { _, _ -> },
     private val onDispose: (thread: CommentThread) -> Unit = {},
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
@@ -162,15 +162,9 @@ internal class CommentThread(
 
     /** One reply row: author + status chip and the edit/delete/(re-pend) icons, over its content. */
     private fun replyRow(index: Int, reply: HeviewReply): JPanel {
-        if (index == editingIndex) return editRow(index, reply)
+        if (index == editingIndex) return editRow(reply)
         val header = JPanel(BorderLayout()).apply {
-            add(
-                JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
-                    add(JBLabel(reply.author))
-                    add(statusLabel(reply.status))
-                },
-                BorderLayout.WEST,
-            )
+            add(replyMetadata(reply), BorderLayout.WEST)
             add(rowActions(index, reply), BorderLayout.EAST)
         }
         val body = JBTextArea(reply.content).apply {
@@ -188,27 +182,32 @@ internal class CommentThread(
         }
     }
 
-    private fun rowActions(index: Int, reply: HeviewReply): JPanel =
-        JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
-            add(iconButton(AllIcons.Actions.GC, "Delete") { deleteReply(index) })
-            add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit(index) })
-            if (reply.status == CommentStatus.PROCESSED) {
-                add(iconButton(AllIcons.Vcs.History, "Re-pend") { rependReply(index) })
-            }
-        }
-
-    /** The [index] row swapped into inline edit mode (editable field + Save/Cancel). */
-    private fun editRow(index: Int, reply: HeviewReply): JPanel {
-        val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
+    /** The author + status chip shown at the left of a reply row (and its edit mode). */
+    private fun replyMetadata(reply: HeviewReply): JPanel =
+        JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
             add(JBLabel(reply.author))
             add(statusLabel(reply.status))
         }
+
+    // Edit opens by row index (which row shows the field, within this render); delete/re-pend act on the
+    // reply VALUE so a concurrent list change can't misroute them to the wrong reply.
+    private fun rowActions(index: Int, reply: HeviewReply): JPanel =
+        JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            add(iconButton(AllIcons.Actions.GC, "Delete") { deleteReply(reply) })
+            add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit(index) })
+            if (reply.status == CommentStatus.PROCESSED) {
+                add(iconButton(AllIcons.Vcs.History, "Re-pend") { rependReply(reply) })
+            }
+        }
+
+    /** The editing row swapped into inline edit mode (editable field + Save/Cancel). */
+    private fun editRow(reply: HeviewReply): JPanel {
         val input = commentInput(text = reply.content, placeholder = "Edit comment…")
-        val save = JButton("Save").apply { addActionListener { submitEdit(index, input.text) } }
+        val save = JButton("Save").apply { addActionListener { submitEdit(reply, input.text) } }
         val cancel = JButton("Cancel").apply { addActionListener { cancelEdit() } }
         focusLater(input)
         return JPanel(BorderLayout()).apply {
-            add(header, BorderLayout.NORTH)
+            add(replyMetadata(reply), BorderLayout.NORTH)
             add(input, BorderLayout.CENTER)
             add(buttonRow(cancel, save), BorderLayout.SOUTH)
         }
@@ -239,13 +238,13 @@ internal class CommentThread(
         renderThread(current)
     }
 
-    private fun submitEdit(index: Int, text: String) {
+    private fun submitEdit(reply: HeviewReply, text: String) {
         if (text.isBlank()) return
         val current = displayed ?: return
         // Clear the edit flag BEFORE firing: its synchronous reconcile calls refreshDisplay, which must
         // be allowed through to rebuild the stack back into display mode with the new content.
         editingIndex = null
-        onEditReply(current, index, text)
+        onEditReply(current, reply, text)
     }
 
     private fun cancelEdit() {
@@ -254,14 +253,14 @@ internal class CommentThread(
         renderThread(current)
     }
 
-    private fun deleteReply(index: Int) {
+    private fun deleteReply(reply: HeviewReply) {
         val current = displayed ?: return
-        onDeleteReply(current, index)
+        onDeleteReply(current, reply)
     }
 
-    private fun rependReply(index: Int) {
+    private fun rependReply(reply: HeviewReply) {
         val current = displayed ?: return
-        onRependReply(current, index)
+        onRependReply(current, reply)
     }
 
     // ---- test seams: drive the reply actions without real clicks / EditorTextFields ----
@@ -272,14 +271,20 @@ internal class CommentThread(
     @TestOnly
     internal fun editReplyForTest(index: Int, text: String) {
         startEdit(index)
-        submitEdit(index, text)
+        submitEdit(replyAt(index) ?: return, text)
     }
 
     @TestOnly
-    internal fun deleteReplyForTest(index: Int) = deleteReply(index)
+    internal fun deleteReplyForTest(index: Int) = replyAt(index)?.let { deleteReply(it) }
 
     @TestOnly
-    internal fun rependReplyForTest(index: Int) = rependReply(index)
+    internal fun rependReplyForTest(index: Int) = replyAt(index)?.let { rependReply(it) }
+
+    /** Open the inline edit on a row without submitting — for the refresh-suppression test. */
+    @TestOnly
+    internal fun startEditForTest(index: Int) = startEdit(index)
+
+    private fun replyAt(index: Int): HeviewReply? = displayed?.normalizedReplies(author)?.getOrNull(index)
 
     /** The status of each shown reply, in order — lets a test assert per-reply Pending/Seen state. */
     @TestOnly

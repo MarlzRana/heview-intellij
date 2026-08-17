@@ -227,7 +227,11 @@ internal class CommentsPoolWatcher(
 
     private fun markProcessed(uuid: String) = runEdt { if (!disposed) store.markProcessed(uuid) }
 
-    private fun evict(uuid: String) = runEdt { if (!disposed) store.evict(uuid) }
+    // Gate on isPersisted (checked on the EDT), mirroring the reconcile path: evict only a comment that
+    // was confirmed on disk and then vanished with no tombstone (a genuine peer/user delete). A thread
+    // the store intentionally took off the pool while keeping it visible (retainSeenOffPool, which clears
+    // `persisted` before unlinking) is NOT evicted — otherwise its now-Seen replies would vanish.
+    private fun evict(uuid: String) = runEdt { if (!disposed && store.isPersisted(uuid)) store.evict(uuid) }
 
     /**
      * Catch-up for the event-only design, for an in-index PENDING comment whose watch event was missed

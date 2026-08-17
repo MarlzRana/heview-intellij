@@ -229,9 +229,9 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         lineEndOffset = lineEndOffset,
         author = author,
         onReply = { comment, text -> store.addReply(comment.uuid, text, author, HeviewTime.nowIso()) },
-        onEditReply = { comment, index, text -> store.editReply(comment.uuid, index, text, HeviewTime.nowIso()) },
-        onDeleteReply = { comment, index -> store.deleteReply(comment.uuid, index, HeviewTime.nowIso()) },
-        onRependReply = { comment, index -> store.rependReply(comment.uuid, index, HeviewTime.nowIso()) },
+        onEditReply = { comment, reply, text -> store.editReply(comment.uuid, reply, text, HeviewTime.nowIso()) },
+        onDeleteReply = { comment, reply -> store.deleteReply(comment.uuid, reply) },
+        onRependReply = { comment, reply -> store.rependReply(comment.uuid, reply, HeviewTime.nowIso()) },
         onDispose = onDispose,
     )
 
