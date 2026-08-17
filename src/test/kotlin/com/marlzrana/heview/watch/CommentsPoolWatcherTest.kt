@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
@@ -133,6 +134,53 @@ class CommentsPoolWatcherTest {
 
         assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // still pending, not evicted
         assertNotNull(store.get("u1"))
+    }
+
+    @Test
+    fun `reconcile leaves a pending comment alone when its pool file is still present`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1")) // comments/u1.json present
+        seedProcessedTombstone(comments, "u1") // a stale tombstone from a prior life is also present
+
+        watcher(comments, store).reconcile()
+
+        // The absent-pool guard: a lingering tombstone must not suppress a still-actionable comment.
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
+    }
+
+    @Test
+    fun `sweepProcessed also reclaims aged orphaned json-tmp files`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val processed = Files.createDirectories(comments.resolve("processed"))
+        Files.writeString(processed.resolve("orphan.json.tmp"), "{}") // a crashed atomic rewrite's leftover
+        Files.writeString(processed.resolve("fresh.json.tmp"), "{}")
+        Files.setLastModifiedTime(processed.resolve("orphan.json.tmp"), FileTime.from(Instant.now().minus(Duration.ofDays(20))))
+
+        watcher(comments, store(comments)).sweepProcessed()
+
+        assertFalse(Files.exists(processed.resolve("orphan.json.tmp"))) // aged out
+        assertTrue(Files.exists(processed.resolve("fresh.json.tmp"))) // recent → kept
+    }
+
+    @Test
+    fun `sweepProcessed refuses to follow a symlinked processed dir`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val outside = Files.createDirectories(dir.resolve("outside"))
+        val victim = outside.resolve("keep.json")
+        Files.writeString(victim, "{}")
+        Files.setLastModifiedTime(victim, FileTime.from(Instant.now().minus(Duration.ofDays(20)))) // "expired"
+        val supported = try {
+            Files.createSymbolicLink(comments.resolve("processed"), outside) // processed/ -> outside
+            true
+        } catch (e: Exception) {
+            false
+        }
+        assumeTrue(supported, "symbolic links not supported on this filesystem")
+
+        watcher(comments, store(comments)).sweepProcessed()
+
+        assertTrue(Files.exists(victim)) // never deleted through the symlink
     }
 
     @Test
