@@ -439,4 +439,40 @@ class CommentStoreTest {
 
         assertEquals(1, ran)
     }
+
+    @Test
+    fun `isPersisted tracks a successful save and clears on evict and delete`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        assertTrue(store.isPersisted("u1")) // write succeeded → on disk
+
+        store.evict("u1")
+        assertFalse(store.isPersisted("u1"))
+
+        store.save(sampleComment(uuid = "u2"))
+        store.delete("u2")
+        assertFalse(store.isPersisted("u2"))
+    }
+
+    @Test
+    fun `isPersisted is false when the save write fails`(@TempDir dir: Path) {
+        val ro = Files.createDirectories(dir.resolve("ro"))
+        makeReadOnlyOrSkip(ro)
+        try {
+            val store = store(ro)
+            store.save(sampleComment(uuid = "u1"))
+            assertNotNull(store.get("u1")) // retained in memory…
+            assertFalse(store.isPersisted("u1")) // …but never persisted (the write failed)
+        } finally {
+            ro.toFile().setWritable(true)
+        }
+    }
+
+    @Test
+    fun `hydrate marks loaded comments persisted`(@TempDir dir: Path) {
+        seed(dir, sampleComment(uuid = "u1"))
+        val store = store(dir)
+        store.hydrate()
+        assertTrue(store.isPersisted("u1")) // it was read from disk
+    }
 }

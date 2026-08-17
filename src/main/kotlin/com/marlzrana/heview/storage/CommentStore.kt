@@ -12,6 +12,7 @@ import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -43,6 +44,13 @@ class CommentStore(
     private var hydrationApplied = false
     private val onHydrated = mutableListOf<() -> Unit>()
 
+    // UUIDs confirmed present on disk in comments/ — a save's write succeeded, or the file was hydrated
+    // from disk. The watcher's reconcile uses this to evict only a comment that was persisted and then
+    // vanished (a lost bare-delete); a comment whose create-save failed or is still in flight was never
+    // persisted, so it is retained (matches the "keep the record on persist failure" decision).
+    // Thread-safe: added off-EDT (save's write completion) + on-EDT (hydrate), read off-EDT (reconcile).
+    private val persisted = ConcurrentHashMap.newKeySet<String>()
+
     /** Register a change listener; dispose the returned handle to unregister (e.g. on project close). */
     fun addChangeListener(listener: () -> Unit): Disposable {
         listeners += listener
@@ -71,8 +79,11 @@ class CommentStore(
         fireChanged()
         val uuid = comment.uuid
         val json = CommentJson.encode(comment)
-        runIo { writeAtomically(uuid, json) }
+        runIo { if (writeAtomically(uuid, json)) persisted.add(uuid) }
     }
+
+    /** True once [uuid] has been confirmed on disk (write succeeded or hydrated) and not since removed. */
+    fun isPersisted(uuid: String): Boolean = persisted.contains(uuid)
 
     /**
      * Load existing threads from the shared pool into the index — once per application. Runs at most
@@ -88,6 +99,7 @@ class CommentStore(
                 var changed = false
                 for (comment in loaded) {
                     if (index.putIfAbsent(comment.uuid, comment) == null) changed = true
+                    persisted.add(comment.uuid) // it was just read from disk, so its file exists
                 }
                 if (changed) fireChanged()
                 hydrationApplied = true
@@ -180,6 +192,7 @@ class CommentStore(
         val current = index[uuid] ?: return
         if (current.status == CommentStatus.PROCESSED) return
         index[uuid] = current.copy(status = CommentStatus.PROCESSED)
+        persisted.remove(uuid) // the file has left comments/ (moved to processed/)
         fireChanged()
     }
 
@@ -190,12 +203,14 @@ class CommentStore(
      */
     fun evict(uuid: String) {
         if (index.remove(uuid) == null) return
+        persisted.remove(uuid)
         fireChanged()
     }
 
     /** Drop the record and fire immediately; unlink the file best-effort in the background. */
     fun delete(uuid: String) {
         if (index.remove(uuid) == null) return
+        persisted.remove(uuid)
         fireChanged()
         runIo {
             try {
@@ -206,9 +221,13 @@ class CommentStore(
         }
     }
 
-    /** Write to a temp file in the same directory, then atomically move it over the target. */
-    private fun writeAtomically(uuid: String, json: String) {
-        try {
+    /**
+     * Write to a temp file in the same directory, then atomically move it over the target. Returns true
+     * if the comment is now on disk — the caller records it as persisted only then, so a failed write
+     * keeps the in-memory record without the watcher later treating the missing file as a delete.
+     */
+    private fun writeAtomically(uuid: String, json: String): Boolean {
+        return try {
             Files.createDirectories(commentsDir)
             val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
             try {
@@ -221,12 +240,14 @@ class CommentStore(
                     // replaces, so this fallback is only reached off-platform.
                     Files.move(tmp, fileFor(uuid), StandardCopyOption.REPLACE_EXISTING)
                 }
+                true
             } catch (e: IOException) {
                 Files.deleteIfExists(tmp) // don't leak a stray .json.tmp into the shared pool
                 throw e
             }
         } catch (e: IOException) {
             LOG.warn("heview: failed to persist comment $uuid", e)
+            false
         }
     }
 
