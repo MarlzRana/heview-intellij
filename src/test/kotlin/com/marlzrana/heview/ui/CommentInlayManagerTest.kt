@@ -73,6 +73,19 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
             if (c is javax.swing.JButton) c.toolTipText?.let { add(it) }
             if (c is java.awt.Container) c.components.forEach { addAll(collectButtonTooltips(it)) }
         }
+
+        /** Click the first icon button with [tooltip] — exercises the real Swing listener wiring. */
+        fun clickButton(tooltip: String): Boolean {
+            val button = card?.let { findButton(it, tooltip) } ?: return false
+            button.doClick()
+            return true
+        }
+
+        private fun findButton(c: java.awt.Component, tooltip: String): javax.swing.JButton? {
+            if (c is javax.swing.JButton && c.toolTipText == tooltip) return c
+            if (c is java.awt.Container) for (child in c.components) findButton(child, tooltip)?.let { return it }
+            return null
+        }
     }
 
     /** A host that always declines placement (addComponentInlay returning null). */
@@ -420,6 +433,35 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         manager.cardForTest(e1, comment.uuid)!!.deleteReplyForTest(0) // delete the last reply
         assertNull(store.get(comment.uuid)) // thread gone
         assertEquals(0, liveCards(e1)) // …and its card removed
+    }
+
+    fun testClickingTheDeleteIconWiresThroughToTheStore() {
+        val (e1, path) = openLocalEditor("X.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "first")
+        store.save(comment)
+        manager.init()
+        manager.cardForTest(e1, comment.uuid)!!.replyForTest("second") // two replies
+        assertEquals(2, store.get(comment.uuid)?.replies?.size)
+
+        assertTrue(hosts.getValue(e1).clickButton("Delete")) // a real click on the first row's Delete icon
+        assertEquals(1, store.get(comment.uuid)?.replies?.size) // listener wired through → a reply removed
+    }
+
+    fun testCancellingAnInlineEditReturnsToDisplayShowingTheLatest() {
+        val (e1, path) = openLocalEditor("Y.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "original")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        card.startEditForTest(0)
+        assertTrue(card.isEditingForTest())
+
+        store.markProcessed(comment.uuid) // a consume lands mid-edit (displayed advances, rebuild deferred)
+        card.cancelEditForTest()
+
+        assertFalse(card.isEditingForTest()) // back in display mode
+        assertEquals("original", store.get(comment.uuid)?.replies?.get(0)?.content) // cancel discarded input
+        assertTrue(hosts.getValue(e1).labelTexts().contains("Seen")) // rendered the advanced (Seen) thread
     }
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0

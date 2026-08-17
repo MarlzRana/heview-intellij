@@ -40,9 +40,11 @@ Kotlin 1.9.25 + IntelliJ Platform Gradle Plugin 2.1.0. Target IC 2024.2.1; `sinc
 Source of truth for a comment = its file in the shared pool `~/.heview/comments/<uuid>.json`; the JSON
 schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code map (`src/main/kotlin/com/marlzrana/heview/`):
 - `model/HeviewComment.kt` — thread schema data class (`@SerializedName` snake_case) + `CommentSide` /
-  `CommentStatus` / `IntendedConsumer` enums, plus `HeviewReply(content,status,author,createdAt)`. A thread
-  holds `replies: List<HeviewReply>?` (heview superset; a foreign/legacy file omits it → one reply). Top-level
-  `content` (PENDING replies joined by a blank line — the only field hooks read) and `status` are DERIVED.
+  `CommentStatus` / `IntendedConsumer` enums, plus `HeviewReply(content,status,author,createdAt,id)`. A thread
+  holds `replies: List<HeviewReply>?` (heview superset; a foreign/legacy file omits it → one reply). Each reply
+  has a stable `id` (edit/delete/re-pend match on it, surviving a concurrent status/content change; an id-less
+  foreign reply is backfilled distinctly). Top-level `content` (PENDING replies joined by a blank line — the
+  only field hooks read) and `status` are DERIVED.
 - `model/CommentJson.kt` — Gson encode/decode (`disableHtmlEscaping`; nulls omitted).
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
 - `model/CommentEdits.kt` — pure helpers for the reply model: `recomputed(now)` re-derives the thread's
@@ -182,7 +184,8 @@ context-blind reviewer will keep raising them:
   after create). Reviewer coverage note: some cycles had ~6/18 reviewers fail (harness/token infra), not
   findings.
 - **Built (Phase 1 multi-reply threads + per-reply state machine — plan §5):** a thread (one uuid/file)
-  holds an ordered `replies[]` (a heview **superset** field: `{content,status,author,created_at}`), each
+  holds an ordered `replies[]` (a heview **superset** field: `{content,status,author,created_at,id}` — the
+  `id` is a stable per-reply identity so edit/delete/re-pend match the right reply through a concurrent change), each
   reply with its own status and its own edit/delete/re-pend actions — reviewa's per-comment UI, which reviewa
   keeps only in memory (it is session-scoped). heview **persists** it (durable). Top-level `content`
   (PENDING replies joined by `\n\n`) + `status` stay **DERIVED** (`recomputed`), so the injectors are

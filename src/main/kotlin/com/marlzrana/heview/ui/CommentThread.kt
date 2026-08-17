@@ -68,6 +68,9 @@ internal class CommentThread(
     // Which reply row is in inline-edit mode (null = none). While set, refreshDisplay is suppressed so
     // an in-progress edit isn't clobbered by an unrelated reconcile.
     private var editingIndex: Int? = null
+    // The current "Leave a comment" reply input, so a rebuild (a reply/delete elsewhere, a status flip)
+    // can carry over an in-progress draft instead of discarding it.
+    private var replyInput: EditorTextField? = null
 
     // Bumped every time the reply stack is (re)built, so a test can prove refreshDisplay's
     // no-op-when-unchanged guard actually skips a rebuild on unrelated store changes.
@@ -158,12 +161,13 @@ internal class CommentThread(
 
     private fun renderThread(comment: HeviewComment) {
         displayRenderCount++
+        val draft = replyInput?.text.orEmpty() // carry any in-progress reply draft across the rebuild
         displayed = comment
         val replies = comment.normalizedReplies(author)
         val stack = JPanel(VerticalLayout(JBUI.scale(8)))
         replies.forEachIndexed { index, reply -> stack.add(replyRow(index, reply)) }
-        stack.add(replyBox())
-        setBody(stack)
+        stack.add(replyBox(draft))
+        setContent(stack)
     }
 
     /** One reply row: author + status chip and the edit/delete/(re-pend) icons, over its content. */
@@ -220,8 +224,9 @@ internal class CommentThread(
     }
 
     /** The thread-level "Leave a comment" reply input; a reply adds a new Pending reply. */
-    private fun replyBox(): JPanel {
-        val input = commentInput(text = "", placeholder = "Leave a comment…", heightPx = 40)
+    private fun replyBox(draft: String): JPanel {
+        val input = commentInput(text = draft, placeholder = "Leave a comment…", heightPx = 40)
+        replyInput = input
         val reply = JButton("Reply").apply { addActionListener { submitReply(input.text) } }
         return JPanel(BorderLayout()).apply {
             border = JBUI.Borders.emptyTop(6)
@@ -235,6 +240,7 @@ internal class CommentThread(
     private fun submitReply(text: String) {
         if (text.isBlank()) return
         val current = displayed ?: return
+        replyInput?.text = "" // consumed — clear before firing so the rebuild doesn't re-seed the draft
         onReply(current, text)
     }
 
@@ -251,6 +257,9 @@ internal class CommentThread(
         // be allowed through to rebuild the stack back into display mode with the new content.
         editingIndex = null
         onEditReply(current, reply, text)
+        // Ensure we leave edit mode even if the op was a no-op (the target reply was deleted/changed away
+        // and matched nothing): render the latest thread. A harmless refresh if onEditReply already did.
+        displayed?.let { renderThread(it) }
     }
 
     private fun cancelEdit() {
@@ -289,6 +298,10 @@ internal class CommentThread(
     /** Open the inline edit on a row without submitting — for the refresh-suppression test. */
     @TestOnly
     internal fun startEditForTest(index: Int) = startEdit(index)
+
+    /** Cancel an open inline edit — for the cancel-path test. */
+    @TestOnly
+    internal fun cancelEditForTest() = cancelEdit()
 
     /** Whether an inline edit is currently open — lets a test assert the card returned to display mode. */
     @TestOnly
@@ -350,19 +363,11 @@ internal class CommentThread(
     private fun buttonRow(vararg buttons: JButton): JPanel =
         JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { buttons.forEach { add(it) } }
 
-    /** Compose layout: a single input over a button row. */
-    private fun setContent(center: Component, south: Component) {
+    /** Swap the card's content: [center] fills it, optional [south] holds a button row (compose mode). */
+    private fun setContent(center: Component, south: Component? = null) {
         panel.removeAll()
         panel.add(center, BorderLayout.CENTER)
-        panel.add(south, BorderLayout.SOUTH)
-        panel.revalidate()
-        panel.repaint()
-    }
-
-    /** Display layout: the whole reply stack as the card body. */
-    private fun setBody(component: Component) {
-        panel.removeAll()
-        panel.add(component, BorderLayout.CENTER)
+        if (south != null) panel.add(south, BorderLayout.SOUTH)
         panel.revalidate()
         panel.repaint()
     }

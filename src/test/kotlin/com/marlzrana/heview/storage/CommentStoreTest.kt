@@ -853,6 +853,49 @@ class CommentStoreTest {
         assertEquals("keep me", Files.readString(outside.resolve("u1.json")))
     }
 
+    @Test
+    fun `a failed revive keeps the tombstone and creates no pool file`(@TempDir dir: Path) {
+        val store = store(dir)
+        val r0 = sampleReply(content = "x", status = CommentStatus.PROCESSED)
+        store.save(sampleComment(uuid = "u1", replies = listOf(r0)))
+        val tomb = tombstone(dir, "u1")
+        Files.deleteIfExists(dir.resolve("u1.json")) // a genuinely consumed thread: only the tombstone remains
+        makeReadOnlyOrSkip(dir) // the revive's write will now fail
+        try {
+            store.rependReply("u1", r0, laterTs)
+            assertTrue(Files.exists(tomb)) // write failed → the only durable copy is retained
+            assertFalse(Files.exists(dir.resolve("u1.json"))) // and no half-revived pool file was created
+        } finally {
+            dir.toFile().setWritable(true)
+        }
+    }
+
+    @Test
+    fun `hydrate backfills distinct ids for id-less replies and routes edits by id`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("f.json"),
+            """
+            {"uuid":"f","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+             "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":42,
+             "line_content":"x","side":"file","content":"a\n\nb",
+             "replies":[{"content":"a","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z"},
+                        {"content":"b","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z"}]}
+            """.trimIndent(),
+        )
+        val store = store(dir)
+        store.hydrate()
+
+        val replies = store.get("f")!!.replies!!
+        assertEquals(2, replies.size)
+        assertTrue(replies[0].id.isNotBlank() && replies[1].id.isNotBlank())
+        assertTrue(replies[0].id != replies[1].id) // distinct backfilled ids — not both null/index-0
+
+        // Edit the SECOND row (as the card would, holding replies[1]); only it changes.
+        store.editReply("f", replies[1], "b-edited", laterTs)
+        assertEquals(listOf("a", "b-edited"), store.get("f")?.replies?.map { it.content })
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))

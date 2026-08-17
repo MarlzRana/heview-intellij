@@ -155,7 +155,9 @@ class CommentStore(
     fun deleteReply(uuid: String, target: HeviewReply) {
         val current = index[uuid] ?: return
         val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
-        if (!replies.removeAll { it.id == target.id }) return
+        val at = replies.indexOfFirst { it.id == target.id }
+        if (at < 0) return
+        replies.removeAt(at) // remove exactly the matched reply, not every reply sharing the id
         if (replies.isEmpty()) {
             delete(uuid) // the last reply is gone → drop the whole thread + its pool file
             return
@@ -297,12 +299,17 @@ class CommentStore(
 
     private fun sanitizedReplies(c: HeviewComment): List<HeviewReply> {
         // Gson (via Unsafe) can leave a null element in a non-null-typed List (null-check each), and
-        // bypasses the constructor so an absent/null `id` in a foreign file stays null (backfill a fresh
-        // one so every indexed reply has a distinct, matchable identity).
+        // bypasses the constructor so an absent/null `id` in a foreign file stays null. Backfill a fresh
+        // id for any reply whose id is null OR a duplicate of an earlier one, so every indexed reply has a
+        // distinct, matchable identity (else `indexOfFirst { it.id == target.id }` would collapse rows).
+        val seenIds = HashSet<String>()
         @Suppress("SENSELESS_COMPARISON")
         val valid = c.replies
             ?.filter { it != null && isWellFormedReply(it) }
-            ?.map { if (it.id == null) it.copy(id = java.util.UUID.randomUUID().toString()) else it }
+            ?.map { r ->
+                if (r.id != null && seenIds.add(r.id)) r
+                else r.copy(id = java.util.UUID.randomUUID().toString()).also { seenIds.add(it.id) }
+            }
             .orEmpty()
         if (valid.isNotEmpty()) return valid
         return listOf(HeviewReply(content = c.content, status = c.status, author = defaultAuthor(), createdAt = c.createdAt, id = c.uuid))
@@ -372,7 +379,7 @@ class CommentStore(
         fireChanged()
     }
 
-    /** Drop the record and fire immediately; unlink the file best-effort in the background. */
+    /** Drop the record and fire immediately; unlink the pool file (and any tombstone) in the background. */
     fun delete(uuid: String) {
         if (index.remove(uuid) == null) return
         persisted.remove(uuid)
@@ -383,6 +390,9 @@ class CommentStore(
             } catch (e: IOException) {
                 LOG.warn("heview: failed to delete comment file $uuid", e)
             }
+            // Also drop a consumption tombstone if the thread had been consumed — an explicit delete
+            // leaves no restorable copy (symmetric with revive's care; deleteTombstone refuses a symlink).
+            deleteTombstone(uuid)
         }
     }
 

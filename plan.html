@@ -255,7 +255,8 @@
   "content":          "the review comment text",  // DERIVED: the PENDING replies, joined by "\n\n" (hooks read THIS)
   "intended_consumer": "claude_code",   // optional; absent = any agent
   "replies": [                          // heview superset (a foreign/legacy file omits it → 1 reply from content)
-    { "content": "…", "status": "pending" | "processed", "author": "…", "created_at": "&lt;ISO&gt;" }
+    { "content": "…", "status": "pending" | "processed", "author": "…", "created_at": "&lt;ISO&gt;",
+      "id": "…" }                        // stable per-reply identity (heview-internal; edit/delete/re-pend match on it)
   ]
 }</code></pre>
 <p class="muted"><b>Why <code>replies[]</code> (heview divergence).</b> A thread is a list of replies, each with
@@ -288,7 +289,9 @@ the reply list, <code>recompute</code> the derived <code>content</code>/<code>st
 and re-persist; a revive first <b>removes the <code>processed/</code> tombstone</b> (a tombstone for an
 in-index uuid is the watcher's "Seen" signal — leaving it would let the next reconcile flip the thread back).
 Consuming the thread (hook) flips <b>all</b> replies to Seen at once. <b>Two-state per reply</b> (no separate
-"re-pending"): PENDING or PROCESSED, matching the <code>replies[].status</code> enum. <i>Deferred: restoring a
+"re-pending"): PENDING or PROCESSED, matching the <code>replies[].status</code> enum. Each reply carries a
+stable <code>id</code> so edit / delete / re-pend target the right one even after a concurrent change flips
+its status or edits its text (all its other fields are mutable); an id-less foreign reply is backfilled. <i>Deferred: restoring a
 fully-consumed thread across a restart from its <code>processed/</code> tombstone (in-session it stays visible
 and re-pendable); a dedicated thread-level "delete whole thread" button; multiple authors per reply.</i></p>
 

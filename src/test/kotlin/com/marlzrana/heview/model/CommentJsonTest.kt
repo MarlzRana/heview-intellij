@@ -60,6 +60,45 @@ class CommentJsonTest {
     }
 
     @Test
+    fun `encodes the nested replies array with each snake_case key`() {
+        val json = CommentJson.encode(
+            sampleComment(
+                replies = listOf(
+                    HeviewReply("first", CommentStatus.PENDING, "marlzrana", "2026-08-15T00:00:00.000Z", id = "r1"),
+                    HeviewReply("second", CommentStatus.PROCESSED, "marlzrana", "2026-08-16T00:00:00.000Z", id = "r2"),
+                ),
+            ),
+        )
+        assertTrue(json.contains("\"replies\""), json)
+        for (key in listOf("\"content\"", "\"status\"", "\"author\"", "\"created_at\"", "\"id\"")) {
+            assertTrue(json.contains(key), "missing nested reply key $key in: $json")
+        }
+    }
+
+    @Test
+    fun `decodes an external payload preserving every reply field`() {
+        val payload = """
+            {
+              "uuid": "t", "status": "pending", "created_at": "2026-08-15T00:00:00.000Z",
+              "workspace": "/repo", "abs_path": "/repo/src/Foo.kt", "logical_abs_path": "/repo/src/Foo.kt",
+              "line_number": 7, "line_content": "x", "side": "file", "content": "first",
+              "replies": [
+                {"content":"first","status":"pending","author":"a","created_at":"2026-08-15T00:00:00.000Z","id":"r1"},
+                {"content":"second","status":"processed","author":"b","created_at":"2026-08-16T00:00:00.000Z","id":"r2"}
+              ]
+            }
+        """.trimIndent()
+        val replies = CommentJson.decode(payload).replies ?: error("replies did not decode")
+        assertEquals(
+            listOf(
+                HeviewReply("first", CommentStatus.PENDING, "a", "2026-08-15T00:00:00.000Z", id = "r1"),
+                HeviewReply("second", CommentStatus.PROCESSED, "b", "2026-08-16T00:00:00.000Z", id = "r2"),
+            ),
+            replies,
+        )
+    }
+
+    @Test
     fun `decodes a reviewa-style payload written by a shared hook`() {
         val payload = """
             {
