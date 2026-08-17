@@ -177,7 +177,7 @@ internal class CommentThread(
             add(iconButton(AllIcons.Actions.GC, "Delete") { onDelete(current); dispose() })
             add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit() })
             if (current.status == CommentStatus.PROCESSED) {
-                add(iconButton(AllIcons.Actions.Rollback, "Re-pend") { repend() })
+                add(iconButton(AllIcons.Vcs.History, "Re-pend") { repend() })
             }
         }
 
