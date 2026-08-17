@@ -44,9 +44,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * spuriously evict a live comment.
  *
  * A [reconcile] pass — run once startup [CommentStore.hydrate] applies (via [CommentStore.whenHydrated],
- * a one-shot, so we don't re-scan on every store change) and again on OVERFLOW — marks *Seen* any
- * in-index PENDING comment whose file is already in `processed/`, covering a consume that raced hydrate
- * or a dropped watch event. It only ever marks Seen, never evicts.
+ * a one-shot, so we don't re-scan on every store change), after each watch (re)registration, and on
+ * OVERFLOW — catches an in-index PENDING comment whose watch event was missed: it marks *Seen* one whose
+ * file is now in `processed/`, and evicts one that was **persisted** and then vanished with no tombstone
+ * (a lost bare delete). It never touches a comment that was never persisted (a failed / in-flight save),
+ * so it can't race an async create-save.
  *
  * Threading: a single daemon thread owns the blocking [WatchService] and rebuilds it if the watched dir
  * is removed at runtime; every store mutation hops to the EDT via [runEdt] and is dropped once this
@@ -218,14 +220,17 @@ internal class CommentsPoolWatcher(
     private fun evict(uuid: String) = runEdt { if (!disposed) store.evict(uuid) }
 
     /**
-     * Catch-up for the event-only design: an agent consume that raced startup [CommentStore.hydrate]
-     * (its `ENTRY_DELETE` fired before the record was in the index), or a dropped/OVERFLOW watch event,
-     * leaves an in-index PENDING comment whose file is already in `processed/`. Mark those *Seen*.
+     * Catch-up for the event-only design, for an in-index PENDING comment whose watch event was missed
+     * (a consume that raced startup [CommentStore.hydrate] before the record was indexed, or a
+     * dropped/OVERFLOW event, or a delete during a watch-rebuild outage). For each such comment whose
+     * pool file is gone:
+     * - a `processed/` tombstone exists → an agent consumed it → mark *Seen*;
+     * - no tombstone, but the comment was **persisted** (its file existed) → a lost bare delete → evict.
      *
-     * Only ever marks Seen — never evicts — so it can't race the async write of a freshly-saved comment:
-     * a just-created comment has no `processed/` tombstone yet, so it is left untouched. Idempotent and
-     * convergent (a marked comment is no longer PENDING, so a re-entrant pass skips it). Snapshot on the
-     * EDT, stat off the EDT, apply on the EDT. Visible for direct unit testing.
+     * A comment that was never persisted (a create-save that failed, or one still mid-write) is left
+     * untouched — that is how this avoids racing the async save of a freshly-created comment and honors
+     * "keep the record on persist failure". Idempotent + convergent. Snapshot on the EDT, stat off the
+     * EDT, apply on the EDT. Visible for direct unit testing.
      */
     fun reconcile() {
         runEdt {
@@ -234,12 +239,24 @@ internal class CommentsPoolWatcher(
             if (pending.isEmpty()) return@runEdt
             runIo {
                 if (disposed) return@runIo
-                val consumed = pending.filter { uuid ->
-                    Files.notExists(commentsDir.resolve("$uuid.json")) &&
-                        Files.exists(processedDir.resolve("$uuid.json"))
+                val seen = ArrayList<String>()
+                val gone = ArrayList<String>()
+                for (uuid in pending) {
+                    if (Files.exists(commentsDir.resolve("$uuid.json"))) continue // still pending on disk
+                    when {
+                        Files.exists(processedDir.resolve("$uuid.json")) -> seen += uuid
+                        // Vanished, no tombstone. Evict only if it was persisted (its file existed and was
+                        // removed) — never a never-persisted / mid-write comment.
+                        Files.notExists(processedDir.resolve("$uuid.json")) && store.isPersisted(uuid) -> gone += uuid
+                        // else: indeterminate processed/ check, or not-yet-persisted → leave it.
+                    }
                 }
-                if (consumed.isEmpty()) return@runIo
-                runEdt { if (!disposed) consumed.forEach { store.markProcessed(it) } }
+                if (seen.isEmpty() && gone.isEmpty()) return@runIo
+                runEdt {
+                    if (disposed) return@runEdt
+                    seen.forEach { store.markProcessed(it) }
+                    gone.forEach { store.evict(it) }
+                }
             }
         }
     }

@@ -122,17 +122,28 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `reconcile never evicts a pending comment that has no tombstone`(@TempDir dir: Path) {
+    fun `reconcile evicts a persisted comment whose file vanished with no tombstone`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val store = store(comments)
-        store.save(sampleComment(uuid = "u1"))
-        // File gone with NO tombstone: e.g. a comment saved this instant whose async write hasn't landed
-        // (or a peer/user delete). reconcile must NOT touch it — that's the watch event's job, not ours.
-        Files.deleteIfExists(comments.resolve("u1.json"))
+        store.save(sampleComment(uuid = "u1")) // sync write succeeds → persisted
+        Files.deleteIfExists(comments.resolve("u1.json")) // a lost bare delete (event dropped/OVERFLOW)
 
         watcher(comments, store).reconcile()
 
-        assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // still pending, not evicted
+        assertNull(store.get("u1")) // it was persisted then vanished with no tombstone → evicted
+    }
+
+    @Test
+    fun `reconcile does not evict a comment whose write never completed`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        // runIo drops the write, so save indexes the record but it is never persisted (mimics a create
+        // whose async write hasn't landed, or one that failed). reconcile must retain it, not evict.
+        val store = CommentStore(comments, runIo = {}, runEdt = { it.run() })
+        store.save(sampleComment(uuid = "u1")) // PENDING, no file on disk, not persisted
+
+        watcher(comments, store).reconcile()
+
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
         assertNotNull(store.get("u1"))
     }
 
