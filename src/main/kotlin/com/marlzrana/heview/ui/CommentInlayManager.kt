@@ -113,12 +113,9 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         val anchor = document.createRangeMarker(document.getLineStartOffset(line), lineEndOffset)
         var promoted = false
 
-        val thread = CommentThread(
-            project = project,
-            host = hostFactory(editor),
+        val thread = newThread(
+            editor = editor,
             lineEndOffset = lineEndOffset,
-            author = author,
-            onDelete = { store.delete(it.uuid) },
             onDispose = { disposed ->
                 // If the anchor was promoted into the registry it belongs to the comment now; the
                 // registry disposes it (store-removal / manager dispose), not this card's teardown.
@@ -200,12 +197,9 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     }
 
     private fun displayThread(editor: Editor, comment: HeviewComment): CommentThread? {
-        val thread = CommentThread(
-            project = project,
-            host = hostFactory(editor),
+        val thread = newThread(
+            editor = editor,
             lineEndOffset = currentLineEndOffset(editor.document, comment),
-            author = author,
-            onDelete = { store.delete(it.uuid) },
             onDispose = { disposed ->
                 // If the platform disposes the inlay (e.g. its text range was deleted), drop the stale
                 // entry so a later reconcile recreates the card instead of skipping it forever.
@@ -217,6 +211,28 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         retireAnchorIfUnused(comment.uuid) // placement declined — don't leak the anchor just created
         return null
     }
+
+    /**
+     * A [CommentThread] wired to the store: delete, and the state-machine actions (reply / edit /
+     * re-pend) that revive a comment to PENDING and re-persist it (bumping `created_at` via
+     * [HeviewTime.nowIso]). Shared by the compose and display paths so both cards offer the same
+     * actions; only [lineEndOffset] and [onDispose] differ between them.
+     */
+    private fun newThread(
+        editor: Editor,
+        lineEndOffset: Int,
+        onDispose: (CommentThread) -> Unit,
+    ): CommentThread = CommentThread(
+        project = project,
+        host = hostFactory(editor),
+        lineEndOffset = lineEndOffset,
+        author = author,
+        onDelete = { store.delete(it.uuid) },
+        onReply = { comment, text -> store.reply(comment.uuid, text, HeviewTime.nowIso()) },
+        onEdit = { comment, text -> store.edit(comment.uuid, text, HeviewTime.nowIso()) },
+        onRepend = { store.repend(it.uuid, HeviewTime.nowIso()) },
+        onDispose = onDispose,
+    )
 
     /**
      * The line-end offset where [comment]'s card should sit *now*. All editors of a file share one

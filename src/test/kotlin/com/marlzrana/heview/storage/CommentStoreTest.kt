@@ -475,4 +475,111 @@ class CommentStoreTest {
         store.hydrate()
         assertTrue(store.isPersisted("u1")) // it was read from disk
     }
+
+    // ---- reply / edit / re-pend state machine (plan.html §5) ----
+
+    private val laterTs = "2026-08-16T09:30:00.000Z"
+
+    @Test
+    fun `reply appends after a blank line, bumps created_at, and re-persists`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1").copy(content = "make this a const"))
+
+        store.reply("u1", "also rename x", laterTs)
+
+        val updated = store.get("u1")!!
+        assertEquals("make this a const\n\nalso rename x", updated.content)
+        assertEquals(CommentStatus.PENDING, updated.status)
+        assertEquals(laterTs, updated.createdAt)
+        // The revived comment is written straight back into the pool.
+        assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json"))))
+        assertTrue(store.isPersisted("u1"))
+    }
+
+    @Test
+    fun `edit replaces the content, bumps created_at, and re-persists`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+
+        store.edit("u1", "totally different", laterTs)
+
+        val updated = store.get("u1")!!
+        assertEquals("totally different", updated.content)
+        assertEquals(laterTs, updated.createdAt)
+        assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json"))))
+    }
+
+    @Test
+    fun `editing or replying to a Seen comment revives it to pending`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        store.markProcessed("u1")
+        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
+
+        store.edit("u1", "revived by edit", laterTs)
+
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // reviewa auto-repends on edit
+    }
+
+    @Test
+    fun `repend revives a Seen comment, bumps created_at, and writes it back to the pool`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1").copy(content = "please fix"))
+        store.markProcessed("u1") // now Seen, in-index
+
+        store.repend("u1", laterTs)
+
+        val updated = store.get("u1")!!
+        assertEquals(CommentStatus.PENDING, updated.status)
+        assertEquals("please fix", updated.content) // untouched by re-pend
+        assertEquals(laterTs, updated.createdAt)
+        assertEquals(CommentStatus.PENDING, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).status)
+        assertTrue(store.isPersisted("u1"))
+    }
+
+    @Test
+    fun `repend is a no-op on an already-pending comment`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.repend("u1", laterTs) // still PENDING → nothing to revive
+
+        assertEquals(0, fires)
+        assertEquals("2026-08-15T00:00:00.000Z", store.get("u1")?.createdAt) // not bumped
+    }
+
+    @Test
+    fun `reviving removes the consumption tombstone so a reconcile cannot re-mark it Seen`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        store.markProcessed("u1")
+        // The hook left a tombstone under comments/processed/ when it consumed the comment.
+        val processed = Files.createDirectories(dir.resolve("processed"))
+        val tombstone = processed.resolve("u1.json")
+        Files.writeString(tombstone, CommentJson.encode(sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)))
+
+        store.repend("u1", laterTs)
+
+        assertFalse(Files.exists(tombstone)) // gone → the four-rule "Seen" signal no longer fires
+        assertTrue(Files.exists(dir.resolve("u1.json"))) // back in the actionable pool
+    }
+
+    @Test
+    fun `reply and edit drop a blank input and unknown uuids without firing`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1").copy(content = "keep me"))
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.reply("u1", "   ", laterTs)   // blank
+        store.edit("u1", "\n\t ", laterTs)  // blank
+        store.reply("ghost", "hi", laterTs) // unknown
+        store.edit("ghost", "hi", laterTs)  // unknown
+        store.repend("ghost", laterTs)      // unknown
+
+        assertEquals(0, fires)
+        assertEquals("keep me", store.get("u1")?.content)
+    }
 }

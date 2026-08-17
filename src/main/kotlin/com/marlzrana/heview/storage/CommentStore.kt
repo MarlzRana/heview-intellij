@@ -7,6 +7,9 @@ import com.intellij.util.concurrency.AppExecutorUtil
 import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
+import com.marlzrana.heview.model.revived
+import com.marlzrana.heview.model.withContent
+import com.marlzrana.heview.model.withReply
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
@@ -34,6 +37,11 @@ class CommentStore(
     /** Application-service constructor — binds to the shared `~/.heview/comments` pool. */
     @Suppress("unused")
     constructor() : this(HeviewPaths.commentsDir)
+
+    // Where a hook claims a consumed comment (an atomic move out of the pool); a lingering tombstone
+    // here means "Seen". Resolved the same way as HeviewPaths.processedDir so re-pend/edit/reply can
+    // remove the tombstone when they revive a comment back into comments/.
+    private val processedDir = commentsDir.resolve("processed")
 
     private val index = LinkedHashMap<String, HeviewComment>()
     private val listeners = mutableListOf<() -> Unit>()
@@ -84,6 +92,55 @@ class CommentStore(
 
     /** True once [uuid] has been confirmed on disk (write succeeded or hydrated) and not since removed. */
     fun isPersisted(uuid: String): Boolean = persisted.contains(uuid)
+
+    /**
+     * Reply / edit / re-pend — the actionable transitions of the state machine (plan.html §5). Each
+     * revives the comment to PENDING, bumps `created_at`, and writes it back to `comments/`. No-op on
+     * an unknown uuid; reply/edit also drop a blank input (parity with the create flow).
+     *
+     * - [reply] appends [replyText] to the thread (reviewa joins texts with a blank line).
+     * - [edit] replaces the content with [newContent].
+     * - [repend] revives a Seen (PROCESSED) comment unchanged; a no-op on an already-actionable one.
+     */
+    fun reply(uuid: String, replyText: String, createdAt: String) {
+        if (replyText.isBlank()) return
+        val current = index[uuid] ?: return
+        revive(current.withReply(replyText, createdAt))
+    }
+
+    fun edit(uuid: String, newContent: String, createdAt: String) {
+        if (newContent.isBlank()) return
+        val current = index[uuid] ?: return
+        revive(current.withContent(newContent, createdAt))
+    }
+
+    fun repend(uuid: String, createdAt: String) {
+        val current = index[uuid] ?: return
+        if (current.status != CommentStatus.PROCESSED) return
+        revive(current.revived(createdAt))
+    }
+
+    /**
+     * Persist a revived (PENDING) comment back into the pool. The consumption tombstone is removed
+     * first: a tombstone present in `processed/` for an in-index uuid is exactly the watcher's "Seen"
+     * signal, so leaving it would let the next catch-up reconcile flip this comment straight back to
+     * PROCESSED. The delete is enqueued on the serial IO executor before [save]'s write, so they run
+     * in order; a no-op when there was no tombstone (reply/edit on an already-actionable comment).
+     */
+    private fun revive(updated: HeviewComment) {
+        clearTombstone(updated.uuid)
+        save(updated)
+    }
+
+    private fun clearTombstone(uuid: String) {
+        runIo {
+            try {
+                Files.deleteIfExists(processedDir.resolve("$uuid.json"))
+            } catch (e: IOException) {
+                LOG.warn("heview: failed to remove the consumption tombstone for $uuid", e)
+            }
+        }
+    }
 
     /**
      * Load existing threads from the shared pool into the index — once per application. Runs at most
