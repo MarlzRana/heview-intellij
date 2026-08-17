@@ -173,6 +173,44 @@ class HookScriptTest {
     }
 
     @Test
+    fun `every matched comment is claimed and none re-inject on a second run`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("multi-$name"))
+            seed(home, "a", "/tmp/proj/a.kt", 1, "x", "first", createdAt = "2026-01-01T00:00:00.000Z")
+            seed(home, "b", "/tmp/proj/b.kt", 2, "y", "second", createdAt = "2026-02-01T00:00:00.000Z")
+
+            val out = additionalContext(run(cmd(home), home, "/tmp/proj"))!!
+            assertTrue(out.contains("first") && out.contains("second")) // both injected
+            for (uuid in listOf("a", "b")) {
+                assertFalse(pending(home, uuid)) // each claimed out of the pending pool…
+                assertTrue(inProcessed(home, uuid)) // …into processed/
+            }
+            assertNull(additionalContext(run(cmd(home), home, "/tmp/proj"))) // nothing re-injects
+        }
+    }
+
+    @Test
+    fun `a failed tombstone rewrite still injects once and leaves an intact original`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("rw-$name"))
+            seed(home, "u1", "/tmp/proj/f.kt", 1, "x", "note")
+            // Force the status-rewrite's write-to-temp to fail by pre-creating the temp path AS A DIR.
+            // The best-effort catch must leave the moved original (a valid pending comment) intact.
+            Files.createDirectories(home.resolve(".heview/comments/processed/u1.json.tmp"))
+
+            val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
+            assertEquals("In `f.kt` at line 1:\n```\nx\n```\nnote", out) // still injected once
+            assertFalse(pending(home, "u1")) // claimed out of the pending pool
+            assertTrue(inProcessed(home, "u1")) // tombstone present…
+            assertEquals("pending", processedStatus(home, "u1")) // …the intact original (rewrite didn't run)
+        }
+    }
+
+    @Test
     fun `non-ASCII content stays byte-identical between the Node and Python injectors`(@TempDir dir: Path) {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val content = "café ★ λ 日本語" // exercises ensure_ascii=False vs JSON.stringify (both keep raw UTF-8)

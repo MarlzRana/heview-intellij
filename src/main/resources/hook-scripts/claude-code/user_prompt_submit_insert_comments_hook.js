@@ -32,6 +32,9 @@ function claim(comment, filePath, filename) {
 	const dest = path.join(PROCESSED_DIR, filename);
 	try {
 		fs.mkdirSync(PROCESSED_DIR, { recursive: true });
+		// Never move into a symlinked processed/ — a planted `processed -> ~/.codex` (or similar) could
+		// otherwise clobber a file outside heview. Require a real directory.
+		if (fs.lstatSync(PROCESSED_DIR).isSymbolicLink()) return false;
 		fs.renameSync(filePath, dest);
 	} catch {
 		return false;

@@ -32,6 +32,10 @@ def claim(comment, filepath, filename):
     dest = os.path.join(PROCESSED_DIR, filename)
     try:
         os.makedirs(PROCESSED_DIR, exist_ok=True)
+        # Never move into a symlinked processed/ — a planted `processed -> ~/.codex` (or similar) could
+        # otherwise clobber a file outside heview. Require a real directory.
+        if os.path.islink(PROCESSED_DIR):
+            return False
         os.replace(filepath, dest)
     except Exception:
         return False
