@@ -117,6 +117,10 @@ internal class CommentsPoolWatcher(
                 continue
             }
             watchService = ws
+            // Catch up any consume that landed BEFORE this (re)registration: the whenHydrated pass can
+            // run before register(), and a runtime watch-rebuild would otherwise miss consumes during the
+            // outage. markProcessed-only, so it's safe to repeat on every (re)register.
+            reconcile()
             try {
                 watchLoop(ws)
             } catch (e: ClosedWatchServiceException) {

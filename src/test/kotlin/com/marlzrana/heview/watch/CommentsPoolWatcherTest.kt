@@ -150,6 +150,24 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
+    fun `a disposed watcher drops store mutations`(@TempDir dir: Path) {
+        val comments = Files.createDirectories(dir.resolve("comments"))
+        val store = store(comments)
+        store.save(sampleComment(uuid = "u1"))
+        seedProcessedTombstone(comments, "u1")
+        Files.deleteIfExists(comments.resolve("u1.json")) // looks consumed
+        val w = watcher(comments, store)
+        w.dispose()
+
+        w.onCommentFileDeleted("u1")
+        w.reconcile()
+
+        // The disposed guards held: a queued hop must not mutate the store after teardown.
+        assertEquals(CommentStatus.PENDING, store.get("u1")?.status)
+        assertNotNull(store.get("u1"))
+    }
+
+    @Test
     fun `sweepProcessed also reclaims aged orphaned json-tmp files`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val processed = Files.createDirectories(comments.resolve("processed"))
