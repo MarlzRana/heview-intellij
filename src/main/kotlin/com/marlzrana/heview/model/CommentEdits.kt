@@ -1,29 +1,37 @@
 package com.marlzrana.heview.model
 
 /**
- * The reply / edit / re-pend transitions of the comment state machine (plan.html §5), as pure
- * functions on [HeviewComment] — IDE-free so the on-disk result is unit-testable, mirroring
- * [newFileComment].
- *
- * All three land the comment in [CommentStatus.PENDING] ("actionable"): reviewa auto-revives a Seen
- * (processed) comment the moment it is edited, replied to, or re-pended, and PENDING is the only
- * status ever written to `comments/` (PROCESSED lives only in `processed/` as a tombstone). Each also
- * bumps `created_at` — the field that drives injection ordering — so a revived comment sorts as the
- * newest actionable note. Persistence + tombstone cleanup are the caller's job (see [com.marlzrana.heview.storage.CommentStore]).
+ * Pure helpers for the multi-reply thread model (plan.html §5) — IDE-free so the on-disk payload is
+ * unit-testable, mirroring [newFileComment]. A thread's [HeviewComment.replies] is the source of truth;
+ * the hook-facing `content`/`status`/`created_at` are derived from it.
  */
 
 /**
- * Append [replyText] to the thread and revive it. reviewa persists a thread's `content` as its
- * actionable comment texts joined by a blank line; a reply is one more text, so it appends `"\n\n" +
- * replyText`. Byte-compatible with reviewa's on-disk `content` for a single-author thread.
+ * Recompute the thread's DERIVED top-level fields from its [HeviewComment.replies]:
+ * - `content` = the PENDING (actionable) replies' text joined by a blank line (reviewa's join; the only
+ *   thing the coding-agent hooks read — so Seen replies are excluded from injection).
+ * - `status`  = PENDING if any reply is actionable, else PROCESSED.
+ * - `created_at` = [now] (bumped on every change; drives cross-thread injection ordering).
+ *
+ * Call after any reply mutation so the persisted thread stays consistent for the hooks.
  */
-fun HeviewComment.withReply(replyText: String, createdAt: String): HeviewComment =
-    copy(content = "$content\n\n$replyText", createdAt = createdAt, status = CommentStatus.PENDING)
+fun HeviewComment.recomputed(now: String): HeviewComment {
+    val reps = replies ?: emptyList()
+    val actionable = reps.filter { it.status == CommentStatus.PENDING }
+    return copy(
+        content = actionable.joinToString("\n\n") { it.content },
+        status = if (actionable.isEmpty()) CommentStatus.PROCESSED else CommentStatus.PENDING,
+        createdAt = now,
+    )
+}
 
-/** Replace the thread's `content` and revive it (reviewa's edit-a-processed-comment auto-repends). */
-fun HeviewComment.withContent(newContent: String, createdAt: String): HeviewComment =
-    copy(content = newContent, createdAt = createdAt, status = CommentStatus.PENDING)
-
-/** Re-pend: revive a Seen comment to actionable, bumping `created_at`; the content is untouched. */
-fun HeviewComment.revived(createdAt: String): HeviewComment =
-    copy(createdAt = createdAt, status = CommentStatus.PENDING)
+/**
+ * The thread's replies, always non-empty: a foreign / legacy / pre-`replies` file (or one whose replies
+ * were all malformed) is reconstructed as a single reply from the top-level `content`/`status`/`created_at`,
+ * authored by [fallbackAuthor]. Lets the rest of the code treat every thread as a list of replies.
+ */
+fun HeviewComment.normalizedReplies(fallbackAuthor: String): List<HeviewReply> {
+    val reps = replies
+    if (!reps.isNullOrEmpty()) return reps
+    return listOf(HeviewReply(content = content, status = status, author = fallbackAuthor, createdAt = createdAt))
+}

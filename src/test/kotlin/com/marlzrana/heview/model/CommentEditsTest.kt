@@ -1,53 +1,76 @@
 package com.marlzrana.heview.model
 
 import com.marlzrana.heview.sampleComment
+import com.marlzrana.heview.sampleReply
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
 class CommentEditsTest {
-    private val laterTs = "2026-08-16T09:30:00.000Z"
+    private val now = "2026-08-16T09:30:00.000Z"
 
     @Test
-    fun `withReply appends the reply after a blank line and revives to pending`() {
-        val seen = sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)
-            .copy(content = "make this a const")
+    fun `recomputed derives content from the PENDING replies joined by a blank line`() {
+        val thread = sampleComment(uuid = "u1").copy(
+            replies = listOf(
+                sampleReply(content = "first", status = CommentStatus.PENDING),
+                sampleReply(content = "second", status = CommentStatus.PENDING),
+            ),
+        )
 
-        val replied = seen.withReply("also rename x", laterTs)
+        val out = thread.recomputed(now)
 
-        // reviewa persists a thread's content as its texts joined by a blank line.
-        assertEquals("make this a const\n\nalso rename x", replied.content)
-        assertEquals(CommentStatus.PENDING, replied.status)
-        assertEquals(laterTs, replied.createdAt) // bumped — drives injection ordering
+        assertEquals("first\n\nsecond", out.content) // reviewa's actionable-texts join
+        assertEquals(CommentStatus.PENDING, out.status)
+        assertEquals(now, out.createdAt) // bumped
     }
 
     @Test
-    fun `withContent replaces the content and revives to pending`() {
-        val seen = sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)
+    fun `recomputed excludes SEEN replies from content and stays pending if any remain`() {
+        val thread = sampleComment(uuid = "u1").copy(
+            replies = listOf(
+                sampleReply(content = "seen one", status = CommentStatus.PROCESSED),
+                sampleReply(content = "still actionable", status = CommentStatus.PENDING),
+            ),
+        )
 
-        val edited = seen.withContent("completely new text", laterTs)
+        val out = thread.recomputed(now)
 
-        assertEquals("completely new text", edited.content)
-        assertEquals(CommentStatus.PENDING, edited.status)
-        assertEquals(laterTs, edited.createdAt)
+        assertEquals("still actionable", out.content) // the Seen reply is not injected
+        assertEquals(CommentStatus.PENDING, out.status)
     }
 
     @Test
-    fun `revived flips status to pending and bumps created_at without touching content`() {
-        val seen = sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)
-            .copy(content = "please fix")
+    fun `recomputed marks the thread PROCESSED with empty content when no reply is actionable`() {
+        val thread = sampleComment(uuid = "u1").copy(
+            replies = listOf(
+                sampleReply(content = "a", status = CommentStatus.PROCESSED),
+                sampleReply(content = "b", status = CommentStatus.PROCESSED),
+            ),
+        )
 
-        val repended = seen.revived(laterTs)
+        val out = thread.recomputed(now)
 
-        assertEquals("please fix", repended.content) // unchanged
-        assertEquals(CommentStatus.PENDING, repended.status)
-        assertEquals(laterTs, repended.createdAt)
+        assertEquals("", out.content)
+        assertEquals(CommentStatus.PROCESSED, out.status)
     }
 
     @Test
-    fun `the transitions preserve every other shared-contract field`() {
-        val original = sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)
-        val repended = original.revived(laterTs)
-        // Only status + created_at move; uuid/path/line/side/etc. must survive verbatim.
-        assertEquals(original.copy(status = CommentStatus.PENDING, createdAt = laterTs), repended)
+    fun `normalizedReplies passes through an existing replies list`() {
+        val replies = listOf(sampleReply(content = "x"), sampleReply(content = "y"))
+        val thread = sampleComment(uuid = "u1").copy(replies = replies)
+        assertEquals(replies, thread.normalizedReplies("fallback"))
+    }
+
+    @Test
+    fun `normalizedReplies reconstructs one reply from content for a legacy file`() {
+        val legacy = sampleComment(uuid = "u1", status = CommentStatus.PENDING)
+            .copy(content = "solo note", replies = null)
+
+        val out = legacy.normalizedReplies("marlzrana")
+
+        assertEquals(
+            listOf(HeviewReply("solo note", CommentStatus.PENDING, "marlzrana", legacy.createdAt)),
+            out,
+        )
     }
 }

@@ -7,9 +7,9 @@ import com.intellij.util.concurrency.AppExecutorUtil
 import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
-import com.marlzrana.heview.model.revived
-import com.marlzrana.heview.model.withContent
-import com.marlzrana.heview.model.withReply
+import com.marlzrana.heview.model.HeviewReply
+import com.marlzrana.heview.model.normalizedReplies
+import com.marlzrana.heview.model.recomputed
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
@@ -33,6 +33,9 @@ class CommentStore(
     private val commentsDir: Path,
     private val runIo: (Runnable) -> Unit = { IO_POOL.execute(it) },
     private val runEdt: (Runnable) -> Unit = { ApplicationManager.getApplication().invokeLater(it) },
+    // Only used to reconstruct a single reply for a foreign/legacy file that has no `replies` array;
+    // heview v1 is single-author, so the OS user is the right default. Injectable for tests.
+    private val defaultAuthor: () -> String = { System.getProperty("user.name") ?: "You" },
 ) {
     /** Application-service constructor — binds to the shared `~/.heview/comments` pool. */
     @Suppress("unused")
@@ -94,42 +97,89 @@ class CommentStore(
     fun isPersisted(uuid: String): Boolean = persisted.contains(uuid)
 
     /**
-     * Reply / edit / re-pend — the actionable transitions of the state machine (plan.html §5). Each
-     * revives the comment to PENDING, bumps `created_at`, and writes it back to `comments/`. No-op on
-     * an unknown uuid; reply/edit also drop a blank input (parity with the create flow).
+     * The per-reply state machine (plan.html §5). Each mutates one thread's [HeviewComment.replies],
+     * recomputes the thread's derived `content`/`status`/`created_at` ([recomputed]) and re-persists.
+     * All are no-ops on an unknown uuid or out-of-range reply index; [addReply]/[editReply] also drop a
+     * blank text. The replies are normalized first, so a foreign/legacy single-`content` file behaves
+     * as a one-reply thread.
      *
-     * - [reply] appends [replyText] to the thread (reviewa joins texts with a blank line).
-     * - [edit] replaces the content with [newContent].
-     * - [repend] revives a Seen (PROCESSED) comment unchanged; a no-op on an already-actionable one.
+     * - [addReply] appends a new PENDING reply (the thread's "Leave a comment" box).
+     * - [editReply] replaces reply [replyIndex]'s text and revives it to PENDING (editing a Seen reply
+     *   makes it actionable again — reviewa parity).
+     * - [rependReply] revives a Seen (PROCESSED) reply to PENDING; a no-op if it is already actionable.
+     * - [deleteReply] removes reply [replyIndex]: the last reply drops the whole thread; if only Seen
+     *   replies remain the thread leaves the injectable pool but stays visible (reviewa parity).
      */
-    fun reply(uuid: String, replyText: String, createdAt: String) {
-        if (replyText.isBlank()) return
+    fun addReply(uuid: String, text: String, author: String, now: String) {
+        if (text.isBlank()) return
         val current = index[uuid] ?: return
-        revive(current.withReply(replyText, createdAt))
+        val replies = current.normalizedReplies(author) + HeviewReply(text, CommentStatus.PENDING, author, now)
+        revive(current.copy(replies = replies).recomputed(now))
     }
 
-    fun edit(uuid: String, newContent: String, createdAt: String) {
-        if (newContent.isBlank()) return
+    fun editReply(uuid: String, replyIndex: Int, newText: String, now: String) {
+        if (newText.isBlank()) return
         val current = index[uuid] ?: return
-        revive(current.withContent(newContent, createdAt))
+        val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
+        val reply = replies.getOrNull(replyIndex) ?: return
+        replies[replyIndex] = reply.copy(content = newText, status = CommentStatus.PENDING, createdAt = now)
+        revive(current.copy(replies = replies).recomputed(now))
     }
 
-    fun repend(uuid: String, createdAt: String) {
+    fun rependReply(uuid: String, replyIndex: Int, now: String) {
         val current = index[uuid] ?: return
-        if (current.status != CommentStatus.PROCESSED) return
-        revive(current.revived(createdAt))
+        val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
+        val reply = replies.getOrNull(replyIndex) ?: return
+        if (reply.status != CommentStatus.PROCESSED) return
+        replies[replyIndex] = reply.copy(status = CommentStatus.PENDING, createdAt = now)
+        revive(current.copy(replies = replies).recomputed(now))
+    }
+
+    fun deleteReply(uuid: String, replyIndex: Int, now: String) {
+        val current = index[uuid] ?: return
+        val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
+        if (replyIndex !in replies.indices) return
+        replies.removeAt(replyIndex)
+        if (replies.isEmpty()) {
+            delete(uuid) // the last reply is gone → drop the whole thread + its pool file
+            return
+        }
+        val updated = current.copy(replies = replies).recomputed(now)
+        if (updated.status == CommentStatus.PENDING) {
+            revive(updated) // still actionable → keep it in the injectable pool
+        } else {
+            retainSeenOffPool(updated) // only Seen replies remain (reviewa's deleteComment-no-actionable)
+        }
     }
 
     /**
-     * Persist a revived (PENDING) comment back into the pool. The consumption tombstone is removed
-     * first: a tombstone present in `processed/` for an in-index uuid is exactly the watcher's "Seen"
-     * signal, so leaving it would let the next catch-up reconcile flip this comment straight back to
-     * PROCESSED. The delete is enqueued on the serial IO executor before [save]'s write, so they run
-     * in order; a no-op when there was no tombstone (reply/edit on an already-actionable comment).
+     * Persist a revived (PENDING) thread into the pool. The consumption tombstone is removed first: a
+     * tombstone in `processed/` for an in-index uuid is exactly the watcher's "Seen" signal, so leaving
+     * it would let the next catch-up reconcile flip this thread straight back to PROCESSED. The delete
+     * is enqueued on the serial IO executor before [save]'s write, so they run in order; a no-op when
+     * there was no tombstone (a mutation on an already-actionable thread).
      */
     private fun revive(updated: HeviewComment) {
         clearTombstone(updated.uuid)
         save(updated)
+    }
+
+    /**
+     * A thread whose last actionable reply was deleted: keep its (all-Seen) replies visible in the UI
+     * but drop it from the injectable pool — reviewa's `deleteComment`-with-no-actionable behaviour. No
+     * tombstone is written (unlike a hook consume), so it is not restored after a restart.
+     */
+    private fun retainSeenOffPool(updated: HeviewComment) {
+        index[updated.uuid] = updated
+        persisted.remove(updated.uuid)
+        fireChanged()
+        runIo {
+            try {
+                Files.deleteIfExists(fileFor(updated.uuid))
+            } catch (e: IOException) {
+                LOG.warn("heview: failed to unlink the now-Seen comment file ${updated.uuid}", e)
+            }
+        }
     }
 
     private fun clearTombstone(uuid: String) {
@@ -205,8 +255,21 @@ class CommentStore(
             // plan.html §5: processed comments are not persisted/actionable — never hydrate one as pending.
             return null
         }
-        return comment
+        // Normalize the reply list so every indexed thread has a well-formed, non-empty `replies`: drop
+        // individually malformed replies (foreign writer), and reconstruct a single reply from `content`
+        // when there are none (a reviewa/legacy/pre-`replies` file).
+        return comment.copy(replies = sanitizedReplies(comment))
     }
+
+    private fun sanitizedReplies(c: HeviewComment): List<HeviewReply> {
+        val valid = c.replies?.filter { isWellFormedReply(it) }.orEmpty()
+        if (valid.isNotEmpty()) return valid
+        return listOf(HeviewReply(c.content, c.status, defaultAuthor(), c.createdAt))
+    }
+
+    @Suppress("SENSELESS_COMPARISON")
+    private fun isWellFormedReply(r: HeviewReply): Boolean =
+        r.content != null && r.status != null && r.author != null && r.createdAt != null
 
     // Gson (via Unsafe) can leave a non-null Kotlin field null when its JSON key is absent, and returns
     // null for an unknown enum value — so every required field is null-checked despite its declared type.
@@ -238,17 +301,19 @@ class CommentStore(
     fun processedCount(): Int = index.values.count { it.status == CommentStatus.PROCESSED }
 
     /**
-     * Flip a comment to [CommentStatus.PROCESSED] in memory (the "Seen" state) and fire — for the
-     * consumption watcher, when an agent hook has consumed the file (moved it into `processed/`).
+     * Flip a whole thread to "Seen" in memory — for the consumption watcher, when an agent hook has
+     * consumed the file (moved it into `processed/`). Every reply becomes PROCESSED and the thread's
+     * derived `content` empties, so all rows relabel to Seen at once (each then offering re-pend).
      *
-     * Deliberately does NOT persist: a processed comment is not written to the pool (plan.html §5), and
+     * Deliberately does NOT persist: a processed thread is not written to the pool (plan.html §5), and
      * its file has already left `comments/`, so re-saving here would resurrect an injectable duplicate.
-     * No-op if the uuid is unknown or already processed.
+     * No-op if the uuid is unknown or already fully processed.
      */
     fun markProcessed(uuid: String) {
         val current = index[uuid] ?: return
         if (current.status == CommentStatus.PROCESSED) return
-        index[uuid] = current.copy(status = CommentStatus.PROCESSED)
+        val seen = current.normalizedReplies(defaultAuthor()).map { it.copy(status = CommentStatus.PROCESSED) }
+        index[uuid] = current.copy(replies = seen, status = CommentStatus.PROCESSED, content = "")
         persisted.remove(uuid) // the file has left comments/ (moved to processed/)
         fireChanged()
     }

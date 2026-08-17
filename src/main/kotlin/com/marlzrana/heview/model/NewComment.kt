@@ -3,8 +3,10 @@ package com.marlzrana.heview.model
 import java.util.UUID
 
 /**
- * Builds a v1 file comment: `side = FILE` (no diff-side detection yet), `logical_abs_path == abs_path`
- * (no plan remap yet), `status = PENDING`, and a 1-based `line_number` from a 0-based editor line.
+ * Builds a v1 file comment thread: `side = FILE` (no diff-side detection yet), `logical_abs_path ==
+ * abs_path` (no plan remap yet), `status = PENDING`, and a 1-based `line_number` from a 0-based editor
+ * line. The thread starts with a single PENDING reply ([content], authored by [author]); the top-level
+ * `content` mirrors it (the derived hook-facing text).
  *
  * Pure and IDE-free so the persisted payload — the shared-contract fields the coding-agent hooks
  * match on (`abs_path`/`logical_abs_path` by `cwd` prefix) and render (`line_number`, `line_content`)
@@ -16,6 +18,7 @@ fun newFileComment(
     line0Based: Int,
     lineContent: String,
     content: String,
+    author: String,
     createdAt: String,
     uuid: String = UUID.randomUUID().toString(),
 ): HeviewComment = HeviewComment(
@@ -29,4 +32,5 @@ fun newFileComment(
     lineContent = lineContent,
     side = CommentSide.FILE,
     content = content,
+    replies = listOf(HeviewReply(content = content, status = CommentStatus.PENDING, author = author, createdAt = createdAt)),
 )

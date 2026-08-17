@@ -12,6 +12,7 @@ import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
+import com.marlzrana.heview.model.HeviewReply
 import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
 import java.nio.file.Files
@@ -277,53 +278,71 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(baseline + 1, card.displayRenderCount)
     }
 
-    fun testSeenCardOffersRependAndRependingRestoresPendingInPlace() {
+    fun testTwoReplyThreadRendersBothRowsInOneCard() {
         val (e1, path) = openLocalEditor("P.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "a").copy(
+            replies = listOf(
+                HeviewReply("a", CommentStatus.PENDING, "tester", "2026-01-01T00:00:00.000Z"),
+                HeviewReply("b", CommentStatus.PROCESSED, "tester", "2026-01-01T00:00:00.000Z"),
+            ),
+        )
+        store.save(comment)
+        manager.init()
+
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        assertEquals(1, liveCards(e1)) // one card…
+        assertEquals(listOf(CommentStatus.PENDING, CommentStatus.PROCESSED), card.replyStatusesForTest()) // …two rows
+        val labels = hosts.getValue(e1).labelTexts()
+        assertTrue(labels.contains("Pending"))
+        assertTrue(labels.contains("Seen"))
+    }
+
+    fun testConsumedThreadOffersPerReplyRependAndRependingRestoresPendingInPlace() {
+        val (e1, path) = openLocalEditor("Q.txt", "a\nb\n")
         val comment = commentAt(path, line0Based = 0, content = "please fix")
         store.save(comment)
         manager.init()
         val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
-        assertFalse(card.offersRependForTest()) // a Pending card shows no re-pend action
+        assertEquals(listOf(CommentStatus.PENDING), card.replyStatusesForTest())
 
-        store.markProcessed(comment.uuid) // the consumption watcher flips it to Seen
-        assertTrue(card.offersRependForTest()) // a Seen card offers re-pend (the clock-back icon)
+        store.markProcessed(comment.uuid) // the consumption watcher flips the whole thread to Seen
+        assertEquals(listOf(CommentStatus.PROCESSED), card.replyStatusesForTest())
         assertTrue(hosts.getValue(e1).labelTexts().contains("Seen"))
 
-        card.rependForTest() // click re-pend
-        assertEquals(CommentStatus.PENDING, store.get(comment.uuid)?.status)
+        card.rependReplyForTest(0) // click the reply's re-pend clock
+        assertEquals(CommentStatus.PENDING, store.get(comment.uuid)?.replies?.get(0)?.status)
         assertEquals(1, liveCards(e1)) // relabeled in place — no duplicate, no removal
-        assertFalse(card.offersRependForTest())
+        assertEquals(listOf(CommentStatus.PENDING), card.replyStatusesForTest())
         assertTrue(hosts.getValue(e1).labelTexts().contains("Pending"))
     }
 
-    fun testEditUpdatesContentAndRefreshesTheCardInPlace() {
-        val (e1, path) = openLocalEditor("Q.txt", "a\nb\n")
+    fun testEditReplyUpdatesContentAndRefreshesTheCardInPlace() {
+        val (e1, path) = openLocalEditor("R.txt", "a\nb\n")
         val comment = commentAt(path, line0Based = 0, content = "old text")
         store.save(comment)
         manager.init()
         val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
         val before = card.displayRenderCount
 
-        card.editForTest("new text")
+        card.editReplyForTest(0, "new text")
 
-        assertEquals("new text", store.get(comment.uuid)?.content)
+        assertEquals("new text", store.get(comment.uuid)?.replies?.get(0)?.content)
         assertEquals(1, liveCards(e1)) // same card, no duplicate
-        assertTrue(card.displayRenderCount > before) // rebuilt into display with the new content
+        assertTrue(card.displayRenderCount > before) // rebuilt in place with the new content
     }
 
-    fun testReplyAppendsToContentAndRefreshesTheCardInPlace() {
-        val (e1, path) = openLocalEditor("R.txt", "a\nb\n")
+    fun testReplyAddsARowAndRefreshesTheCardInPlace() {
+        val (e1, path) = openLocalEditor("S.txt", "a\nb\n")
         val comment = commentAt(path, line0Based = 0, content = "first")
         store.save(comment)
         manager.init()
         val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
-        val before = card.displayRenderCount
 
         card.replyForTest("second")
 
-        assertEquals("first\n\nsecond", store.get(comment.uuid)?.content) // blank-line join
-        assertEquals(1, liveCards(e1))
-        assertTrue(card.displayRenderCount > before)
+        assertEquals(listOf("first", "second"), store.get(comment.uuid)?.replies?.map { it.content })
+        assertEquals("first\n\nsecond", store.get(comment.uuid)?.content) // derived content, blank-line join
+        assertEquals(1, liveCards(e1)) // still one card (now two rows)
     }
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0
@@ -335,6 +354,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
             line0Based = line0Based,
             lineContent = "",
             content = content,
+            author = "tester",
             createdAt = "2026-01-01T00:00:00.000Z",
         )
 

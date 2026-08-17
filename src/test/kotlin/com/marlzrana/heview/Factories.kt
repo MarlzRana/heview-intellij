@@ -3,6 +3,7 @@ package com.marlzrana.heview
 import com.marlzrana.heview.model.CommentSide
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
+import com.marlzrana.heview.model.HeviewReply
 import com.marlzrana.heview.model.IntendedConsumer
 
 internal fun sampleComment(
@@ -10,6 +11,7 @@ internal fun sampleComment(
     status: CommentStatus = CommentStatus.PENDING,
     side: CommentSide = CommentSide.FILE,
     intendedConsumer: IntendedConsumer? = null,
+    replies: List<HeviewReply>? = null,
 ): HeviewComment = HeviewComment(
     uuid = uuid,
     status = status,
@@ -22,4 +24,12 @@ internal fun sampleComment(
     side = side,
     content = "make this a const",
     intendedConsumer = intendedConsumer,
+    replies = replies,
 )
+
+internal fun sampleReply(
+    content: String = "make this a const",
+    status: CommentStatus = CommentStatus.PENDING,
+    author: String = "tester",
+    createdAt: String = "2026-08-15T00:00:00.000Z",
+): HeviewReply = HeviewReply(content = content, status = status, author = author, createdAt = createdAt)

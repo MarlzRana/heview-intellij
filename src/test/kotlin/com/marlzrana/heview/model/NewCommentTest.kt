@@ -13,6 +13,7 @@ class NewCommentTest {
             line0Based = 0,
             lineContent = "val x = 1",
             content = "make this a const",
+            author = "marlzrana",
             createdAt = "2026-08-16T00:00:00.000Z",
             uuid = "u1",
         )
@@ -29,9 +30,18 @@ class NewCommentTest {
     }
 
     @Test
+    fun `seeds a single pending reply mirroring the content`() {
+        val c = newFileComment("/w", "/w/a.kt", 0, "", "the note", "marlzrana", "2026-08-16T00:00:00.000Z")
+        assertEquals(
+            listOf(HeviewReply("the note", CommentStatus.PENDING, "marlzrana", "2026-08-16T00:00:00.000Z")),
+            c.replies,
+        )
+    }
+
+    @Test
     fun `line_number is the 0-based editor line plus one`() {
-        assertEquals(1, newFileComment("/w", "/w/a.kt", 0, "", "c", "t").lineNumber)
-        assertEquals(6, newFileComment("/w", "/w/a.kt", 5, "", "c", "t").lineNumber)
-        assertEquals(100, newFileComment("/w", "/w/a.kt", 99, "", "c", "t").lineNumber)
+        assertEquals(1, newFileComment("/w", "/w/a.kt", 0, "", "c", "me", "t").lineNumber)
+        assertEquals(6, newFileComment("/w", "/w/a.kt", 5, "", "c", "me", "t").lineNumber)
+        assertEquals(100, newFileComment("/w", "/w/a.kt", 99, "", "c", "me", "t").lineNumber)
     }
 }

@@ -11,9 +11,12 @@ import com.intellij.ui.EditorTextField
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextArea
+import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.JBUI
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
+import com.marlzrana.heview.model.HeviewReply
+import com.marlzrana.heview.model.normalizedReplies
 import org.jetbrains.annotations.TestOnly
 import java.awt.BorderLayout
 import java.awt.Component
@@ -24,27 +27,23 @@ import javax.swing.JButton
 import javax.swing.JPanel
 
 /**
- * A single comment thread rendered as an editor inlay card via [InlayCardHost].
+ * A comment thread rendered as an editor inlay card via [InlayCardHost].
+ *
+ * A thread is a stack of **replies**, each with its own author, status (Pending / Seen) and actions
+ * (plan.html §5) — mirroring reviewa's per-comment UI:
+ * - **edit** (pencil) and **delete** (trash) on every reply,
+ * - **re-pend** (clock) only on a Seen reply,
+ * - a persistent "Leave a comment" box that adds a new Pending reply to the thread.
  *
  * Two entry points, mutually exclusive per instance:
- * - [startCompose] opens an empty compose card; its `onSubmit` argument persists and returns the
- *   stored record, then the card flips to display; Cancel discards. Used for the create flow.
- *   `onSubmit` lives on the method (not the constructor) so display cards can't be handed a compose
- *   callback they must never use.
- * - [startDisplay] renders an already-persisted comment straight in display mode (no compose step).
- *   Used by the [com.marlzrana.heview.ui.CommentInlayManager] when hydrating existing comments into
- *   newly opened editors.
+ * - [startCompose] opens an empty compose card for a *new* thread; `onSubmit` persists the first reply
+ *   and returns the stored thread, then the card flips to the reply stack; Cancel discards. `onSubmit`
+ *   lives on the method (not the constructor) so display cards can't be handed a compose callback.
+ * - [startDisplay] renders an already-persisted thread straight as the reply stack.
  *
- * A display card shows the comment's author + status chip (Pending / Seen), a row of icon actions
- * (delete, edit, and — only on a Seen comment — re-pend), and a persistent "Leave a comment" reply
- * box (plan.html §5 state machine; parity with reviewa's thread UI). Reply / edit / re-pend all route
- * to the caller-supplied callbacks, which revive the comment to PENDING and re-persist it; the store
- * change then flows back as a [refreshDisplay] so the card (and every other split) relabels in place.
- *
- * [onDispose] is registered on the inlay, so it runs on *any* teardown — Cancel/Delete or the
- * platform disposing the inlay when the editor closes — letting the caller release resources it owns
- * (e.g. the line anchor) and drop its bookkeeping. It receives this thread so the owner can identify
- * which card was torn down.
+ * Reply / edit / delete / re-pend route to the caller-supplied callbacks (which mutate the store); the
+ * resulting store change flows back as a [refreshDisplay], rebuilding the stack in place (and in every
+ * split). [onDispose] is registered on the inlay so it runs on any teardown.
  *
  * EDT-only — all methods run on the event dispatch thread that owns the editor.
  */
@@ -53,24 +52,24 @@ internal class CommentThread(
     private val host: InlayCardHost,
     private val lineEndOffset: Int,
     private val author: String,
-    private val onDelete: (comment: HeviewComment) -> Unit,
     private val onReply: (comment: HeviewComment, replyText: String) -> Unit = { _, _ -> },
-    private val onEdit: (comment: HeviewComment, newContent: String) -> Unit = { _, _ -> },
-    private val onRepend: (comment: HeviewComment) -> Unit = {},
+    private val onEditReply: (comment: HeviewComment, replyIndex: Int, newText: String) -> Unit = { _, _, _ -> },
+    private val onDeleteReply: (comment: HeviewComment, replyIndex: Int) -> Unit = { _, _ -> },
+    private val onRependReply: (comment: HeviewComment, replyIndex: Int) -> Unit = { _, _ -> },
     private val onDispose: (thread: CommentThread) -> Unit = {},
 ) {
     private val panel = JPanel(BorderLayout()).apply { border = JBUI.Borders.empty(6, 10) }
     private var inlay: Disposable? = null
     private var disposed = false
     private var composeSubmit: ((text: String) -> HeviewComment)? = null
-    // The comment this card currently shows in display mode; null while composing. Lets refreshDisplay
-    // skip a no-op re-render and lets the compose→submit path own the first display render itself.
+    // The thread this card currently shows; null while composing. Lets refreshDisplay skip a no-op
+    // re-render and lets the compose→submit path own the first render itself.
     private var displayed: HeviewComment? = null
-    // True while the inline edit field is open. Its in-progress text must survive an unrelated store
-    // reconcile, so refreshDisplay is suppressed until the edit is saved or cancelled.
-    private var editing = false
+    // Which reply row is in inline-edit mode (null = none). While set, refreshDisplay is suppressed so
+    // an in-progress edit isn't clobbered by an unrelated reconcile.
+    private var editingIndex: Int? = null
 
-    // Bumped every time the display card is (re)built, so a test can prove refreshDisplay's
+    // Bumped every time the reply stack is (re)built, so a test can prove refreshDisplay's
     // no-op-when-unchanged guard actually skips a rebuild on unrelated store changes.
     @get:TestOnly
     internal var displayRenderCount = 0
@@ -85,24 +84,22 @@ internal class CommentThread(
         return true
     }
 
-    /** Place an already-persisted comment straight in display mode. Returns false if unplaceable. */
+    /** Place an already-persisted thread straight as the reply stack. Returns false if unplaceable. */
     fun startDisplay(comment: HeviewComment): Boolean {
-        renderDisplay(comment)
+        renderThread(comment)
         return place()
     }
 
     /**
-     * Re-render this card if [comment] differs from what it currently shows — e.g. the consumption
-     * watcher flipping PENDING→PROCESSED ("Seen"), or a reply/edit/re-pend reviving it to PENDING.
-     * No-op while still composing (nothing displayed yet, so the submit path owns the first render),
-     * while an inline edit is open (its text must not be clobbered), or when the comment is unchanged,
-     * so steady-state reconciles and the compose→submit sequence never needlessly rebuild the card.
+     * Rebuild the reply stack if [comment] differs from what it currently shows — e.g. the consumption
+     * watcher flipping the thread to Seen, or a reply/edit/re-pend mutating it. No-op while composing
+     * (nothing displayed yet), while an inline edit is open (its text must survive), or when unchanged.
      */
     fun refreshDisplay(comment: HeviewComment) {
-        if (disposed || editing) return
+        if (disposed || editingIndex != null) return
         val shown = displayed ?: return
         if (shown == comment) return
-        renderDisplay(comment)
+        renderThread(comment)
     }
 
     /** Insert the card below the target line and wire teardown. Returns false if the host declines. */
@@ -129,6 +126,8 @@ internal class CommentThread(
         inlay = null
     }
 
+    // ---- compose (create the first reply of a new thread) ----
+
     private fun renderCompose(): EditorTextField {
         val input = commentInput(text = "", placeholder = "Leave a comment…")
         val submit = JButton("Submit").apply { addActionListener { submit(input.text) } }
@@ -137,29 +136,44 @@ internal class CommentThread(
         return input
     }
 
-    /** Persist [text] via the compose callback and flip to display; blank/whitespace is dropped. */
+    /** Persist [text] via the compose callback and flip to the reply stack; blank/whitespace is dropped. */
     private fun submit(text: String) {
         // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
         if (text.isBlank()) return
         val persist = checkNotNull(composeSubmit) { "submit() is only valid after startCompose" }
-        renderDisplay(persist(text))
+        renderThread(persist(text))
     }
 
-    private fun renderDisplay(current: HeviewComment) {
+    /** Drive the submit path without a real button click / EditorTextField (UI-lifecycle test). */
+    @TestOnly
+    internal fun submitForTest(text: String) = submit(text)
+
+    // ---- display (the reply stack) ----
+
+    private fun renderThread(comment: HeviewComment) {
         displayRenderCount++
-        displayed = current
-        editing = false
+        displayed = comment
+        val replies = comment.normalizedReplies(author)
+        val stack = JPanel(VerticalLayout(JBUI.scale(8)))
+        replies.forEachIndexed { index, reply -> stack.add(replyRow(index, reply)) }
+        stack.add(replyBox())
+        setBody(stack)
+    }
+
+    /** One reply row: author + status chip and the edit/delete/(re-pend) icons, over its content. */
+    private fun replyRow(index: Int, reply: HeviewReply): JPanel {
+        if (index == editingIndex) return editRow(index, reply)
         val header = JPanel(BorderLayout()).apply {
             add(
                 JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
-                    add(JBLabel(author))
-                    add(statusLabel(current.status))
+                    add(JBLabel(reply.author))
+                    add(statusLabel(reply.status))
                 },
                 BorderLayout.WEST,
             )
-            add(actionRow(current), BorderLayout.EAST)
+            add(rowActions(index, reply), BorderLayout.EAST)
         }
-        val body = JBTextArea(current.content).apply {
+        val body = JBTextArea(reply.content).apply {
             isEditable = false
             // Non-focusable so clicks don't route Backspace/Enter/arrows to the host code editor.
             isFocusable = false
@@ -168,20 +182,39 @@ internal class CommentThread(
             wrapStyleWord = true
             border = null
         }
-        setContent(center = body, south = replyBox(), north = header)
+        return JPanel(BorderLayout()).apply {
+            add(header, BorderLayout.NORTH)
+            add(body, BorderLayout.CENTER)
+        }
     }
 
-    /** The delete / edit / re-pend icon actions; re-pend appears only on a Seen (PROCESSED) comment. */
-    private fun actionRow(current: HeviewComment): JPanel =
+    private fun rowActions(index: Int, reply: HeviewReply): JPanel =
         JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
-            add(iconButton(AllIcons.Actions.GC, "Delete") { onDelete(current); dispose() })
-            add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit() })
-            if (current.status == CommentStatus.PROCESSED) {
-                add(iconButton(AllIcons.Vcs.History, "Re-pend") { repend() })
+            add(iconButton(AllIcons.Actions.GC, "Delete") { deleteReply(index) })
+            add(iconButton(AllIcons.Actions.Edit, "Edit") { startEdit(index) })
+            if (reply.status == CommentStatus.PROCESSED) {
+                add(iconButton(AllIcons.Vcs.History, "Re-pend") { rependReply(index) })
             }
         }
 
-    /** The persistent "Leave a comment" reply input; a reply revives the thread to Pending. */
+    /** The [index] row swapped into inline edit mode (editable field + Save/Cancel). */
+    private fun editRow(index: Int, reply: HeviewReply): JPanel {
+        val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
+            add(JBLabel(reply.author))
+            add(statusLabel(reply.status))
+        }
+        val input = commentInput(text = reply.content, placeholder = "Edit comment…")
+        val save = JButton("Save").apply { addActionListener { submitEdit(index, input.text) } }
+        val cancel = JButton("Cancel").apply { addActionListener { cancelEdit() } }
+        focusLater(input)
+        return JPanel(BorderLayout()).apply {
+            add(header, BorderLayout.NORTH)
+            add(input, BorderLayout.CENTER)
+            add(buttonRow(cancel, save), BorderLayout.SOUTH)
+        }
+    }
+
+    /** The thread-level "Leave a comment" reply input; a reply adds a new Pending reply. */
     private fun replyBox(): JPanel {
         val input = commentInput(text = "", placeholder = "Leave a comment…", heightPx = 40)
         val reply = JButton("Reply").apply { addActionListener { submitReply(input.text) } }
@@ -192,67 +225,68 @@ internal class CommentThread(
         }
     }
 
-    /** Swap the body for an editable field; Save revives + re-persists, Cancel restores the display. */
-    private fun startEdit() {
-        val current = displayed ?: return
-        editing = true
-        val header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
-            add(JBLabel(author))
-            add(statusLabel(current.status))
-        }
-        val input = commentInput(text = current.content, placeholder = "Edit comment…")
-        val save = JButton("Save").apply { addActionListener { submitEdit(input.text) } }
-        val cancel = JButton("Cancel").apply { addActionListener { cancelEdit() } }
-        setContent(center = input, south = buttonRow(cancel, save), north = header)
-        focusLater(input)
-    }
+    // ---- reply actions (each reads the shown thread; the store change re-renders the stack) ----
 
     private fun submitReply(text: String) {
         if (text.isBlank()) return
         val current = displayed ?: return
-        onReply(current, text) // store change → reconcile → refreshDisplay rebuilds (reply box reset)
+        onReply(current, text)
     }
 
-    private fun submitEdit(text: String) {
+    private fun startEdit(index: Int) {
+        val current = displayed ?: return
+        editingIndex = index
+        renderThread(current)
+    }
+
+    private fun submitEdit(index: Int, text: String) {
         if (text.isBlank()) return
         val current = displayed ?: return
-        // Clear `editing` BEFORE firing onEdit: its synchronous reconcile calls refreshDisplay, which
-        // must be allowed through to rebuild the card back into display mode with the new content.
-        editing = false
-        onEdit(current, text)
+        // Clear the edit flag BEFORE firing: its synchronous reconcile calls refreshDisplay, which must
+        // be allowed through to rebuild the stack back into display mode with the new content.
+        editingIndex = null
+        onEditReply(current, index, text)
     }
 
     private fun cancelEdit() {
         val current = displayed ?: return
-        editing = false
-        renderDisplay(current)
+        editingIndex = null
+        renderThread(current)
     }
 
-    private fun repend() {
+    private fun deleteReply(index: Int) {
         val current = displayed ?: return
-        onRepend(current) // store change → reconcile → refreshDisplay relabels Seen → Pending
+        onDeleteReply(current, index)
     }
 
-    /** Drive the submit path without a real button click / EditorTextField (UI-lifecycle test). */
-    @TestOnly
-    internal fun submitForTest(text: String) = submit(text)
+    private fun rependReply(index: Int) {
+        val current = displayed ?: return
+        onRependReply(current, index)
+    }
 
-    /** Drive reply / edit / re-pend without real clicks — for the UI-lifecycle test. */
+    // ---- test seams: drive the reply actions without real clicks / EditorTextFields ----
+
     @TestOnly
     internal fun replyForTest(text: String) = submitReply(text)
 
     @TestOnly
-    internal fun editForTest(newText: String) {
-        startEdit()
-        submitEdit(newText)
+    internal fun editReplyForTest(index: Int, text: String) {
+        startEdit(index)
+        submitEdit(index, text)
     }
 
     @TestOnly
-    internal fun rependForTest() = repend()
+    internal fun deleteReplyForTest(index: Int) = deleteReply(index)
 
-    /** Whether this card currently offers the re-pend action (i.e. it is showing a Seen comment). */
     @TestOnly
-    internal fun offersRependForTest(): Boolean = displayed?.status == CommentStatus.PROCESSED
+    internal fun rependReplyForTest(index: Int) = rependReply(index)
+
+    /** The status of each shown reply, in order — lets a test assert per-reply Pending/Seen state. */
+    @TestOnly
+    internal fun replyStatusesForTest(): List<CommentStatus> =
+        displayed?.normalizedReplies(author)?.map { it.status } ?: emptyList()
+
+    // ---- shared bits ----
 
     /** A real embedded editor (owns Backspace/Enter/arrows/undo so they don't leak to the code editor). */
     private fun commentInput(text: String, placeholder: String, heightPx: Int = 64): EditorTextField =
@@ -285,7 +319,7 @@ internal class CommentThread(
         )
     }
 
-    /** The status chip in the card header — orange "Pending" (actionable) vs green "Seen" (consumed). */
+    /** The status chip in a reply header — orange "Pending" (actionable) vs green "Seen" (consumed). */
     private fun statusLabel(status: CommentStatus): JBLabel = when (status) {
         CommentStatus.PENDING -> JBLabel("Pending").apply { foreground = JBColor.ORANGE }
         CommentStatus.PROCESSED -> JBLabel("Seen").apply { foreground = JBColor.GREEN }
@@ -294,11 +328,19 @@ internal class CommentThread(
     private fun buttonRow(vararg buttons: JButton): JPanel =
         JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply { buttons.forEach { add(it) } }
 
-    private fun setContent(center: Component, south: Component, north: Component? = null) {
+    /** Compose layout: a single input over a button row. */
+    private fun setContent(center: Component, south: Component) {
         panel.removeAll()
-        if (north != null) panel.add(north, BorderLayout.NORTH)
         panel.add(center, BorderLayout.CENTER)
         panel.add(south, BorderLayout.SOUTH)
+        panel.revalidate()
+        panel.repaint()
+    }
+
+    /** Display layout: the whole reply stack as the card body. */
+    private fun setBody(component: Component) {
+        panel.removeAll()
+        panel.add(component, BorderLayout.CENTER)
         panel.revalidate()
         panel.repaint()
     }

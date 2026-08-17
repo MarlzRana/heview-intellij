@@ -3,6 +3,7 @@ package com.marlzrana.heview.storage
 import com.marlzrana.heview.model.CommentJson
 import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.sampleComment
+import com.marlzrana.heview.sampleReply
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -16,8 +17,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class CommentStoreTest {
-    // Synchronous executors so the async disk + EDT-hop paths run inline and deterministically.
-    private fun store(dir: Path) = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() })
+    // Synchronous executors so the async disk + EDT-hop paths run inline and deterministically; a fixed
+    // default author so a legacy-file (no `replies`) reconstruction is deterministic.
+    private fun store(dir: Path, author: String = "tester") =
+        CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() }, defaultAuthor = { author })
 
     private fun seed(dir: Path, comment: com.marlzrana.heview.model.HeviewComment) {
         Files.createDirectories(dir)
@@ -476,110 +479,197 @@ class CommentStoreTest {
         assertTrue(store.isPersisted("u1")) // it was read from disk
     }
 
-    // ---- reply / edit / re-pend state machine (plan.html §5) ----
+    // ---- per-reply state machine (plan.html §5) ----
 
     private val laterTs = "2026-08-16T09:30:00.000Z"
 
     @Test
-    fun `reply appends after a blank line, bumps created_at, and re-persists`(@TempDir dir: Path) {
+    fun `addReply appends a pending reply, recomputes the content, and re-persists`(@TempDir dir: Path) {
         val store = store(dir)
-        store.save(sampleComment(uuid = "u1").copy(content = "make this a const"))
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "first"))))
 
-        store.reply("u1", "also rename x", laterTs)
+        store.addReply("u1", "second", "marlzrana", laterTs)
 
         val updated = store.get("u1")!!
-        assertEquals("make this a const\n\nalso rename x", updated.content)
+        assertEquals(2, updated.replies?.size)
+        assertEquals("first\n\nsecond", updated.content) // derived: both pending, blank-line joined
         assertEquals(CommentStatus.PENDING, updated.status)
         assertEquals(laterTs, updated.createdAt)
-        // The revived comment is written straight back into the pool.
-        assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json"))))
+        assertEquals(com.marlzrana.heview.model.HeviewReply("second", CommentStatus.PENDING, "marlzrana", laterTs), updated.replies?.last())
+        assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json")))) // written back
         assertTrue(store.isPersisted("u1"))
     }
 
     @Test
-    fun `edit replaces the content, bumps created_at, and re-persists`(@TempDir dir: Path) {
+    fun `editReply replaces a reply's text and revives it to pending`(@TempDir dir: Path) {
         val store = store(dir)
-        store.save(sampleComment(uuid = "u1"))
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "old", status = CommentStatus.PROCESSED))))
 
-        store.edit("u1", "totally different", laterTs)
+        store.editReply("u1", 0, "edited", laterTs)
 
         val updated = store.get("u1")!!
-        assertEquals("totally different", updated.content)
-        assertEquals(laterTs, updated.createdAt)
+        assertEquals("edited", updated.replies?.get(0)?.content)
+        assertEquals(CommentStatus.PENDING, updated.replies?.get(0)?.status) // editing a Seen reply revives it
+        assertEquals("edited", updated.content)
         assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json"))))
     }
 
     @Test
-    fun `editing or replying to a Seen comment revives it to pending`(@TempDir dir: Path) {
+    fun `rependReply revives a Seen reply and clears the tombstone`(@TempDir dir: Path) {
         val store = store(dir)
-        store.save(sampleComment(uuid = "u1"))
-        store.markProcessed("u1")
-        assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status)
-
-        store.edit("u1", "revived by edit", laterTs)
-
-        assertEquals(CommentStatus.PENDING, store.get("u1")?.status) // reviewa auto-repends on edit
-    }
-
-    @Test
-    fun `repend revives a Seen comment, bumps created_at, and writes it back to the pool`(@TempDir dir: Path) {
-        val store = store(dir)
-        store.save(sampleComment(uuid = "u1").copy(content = "please fix"))
-        store.markProcessed("u1") // now Seen, in-index
-
-        store.repend("u1", laterTs)
-
-        val updated = store.get("u1")!!
-        assertEquals(CommentStatus.PENDING, updated.status)
-        assertEquals("please fix", updated.content) // untouched by re-pend
-        assertEquals(laterTs, updated.createdAt)
-        assertEquals(CommentStatus.PENDING, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).status)
-        assertTrue(store.isPersisted("u1"))
-    }
-
-    @Test
-    fun `repend is a no-op on an already-pending comment`(@TempDir dir: Path) {
-        val store = store(dir)
-        store.save(sampleComment(uuid = "u1"))
-        var fires = 0
-        store.addChangeListener { fires++ }
-
-        store.repend("u1", laterTs) // still PENDING → nothing to revive
-
-        assertEquals(0, fires)
-        assertEquals("2026-08-15T00:00:00.000Z", store.get("u1")?.createdAt) // not bumped
-    }
-
-    @Test
-    fun `reviving removes the consumption tombstone so a reconcile cannot re-mark it Seen`(@TempDir dir: Path) {
-        val store = store(dir)
-        store.save(sampleComment(uuid = "u1"))
-        store.markProcessed("u1")
-        // The hook left a tombstone under comments/processed/ when it consumed the comment.
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "please fix", status = CommentStatus.PROCESSED))))
         val processed = Files.createDirectories(dir.resolve("processed"))
         val tombstone = processed.resolve("u1.json")
         Files.writeString(tombstone, CommentJson.encode(sampleComment(uuid = "u1", status = CommentStatus.PROCESSED)))
 
-        store.repend("u1", laterTs)
+        store.rependReply("u1", 0, laterTs)
 
-        assertFalse(Files.exists(tombstone)) // gone → the four-rule "Seen" signal no longer fires
-        assertTrue(Files.exists(dir.resolve("u1.json"))) // back in the actionable pool
+        val updated = store.get("u1")!!
+        assertEquals(CommentStatus.PENDING, updated.replies?.get(0)?.status)
+        assertEquals("please fix", updated.replies?.get(0)?.content) // untouched by re-pend
+        assertEquals("please fix", updated.content)
+        assertFalse(Files.exists(tombstone)) // the "Seen" signal is gone so a reconcile can't re-mark it
+        assertTrue(Files.exists(dir.resolve("u1.json")))
     }
 
     @Test
-    fun `reply and edit drop a blank input and unknown uuids without firing`(@TempDir dir: Path) {
+    fun `rependReply is a no-op on an already-pending reply`(@TempDir dir: Path) {
         val store = store(dir)
-        store.save(sampleComment(uuid = "u1").copy(content = "keep me"))
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(status = CommentStatus.PENDING))))
         var fires = 0
         store.addChangeListener { fires++ }
 
-        store.reply("u1", "   ", laterTs)   // blank
-        store.edit("u1", "\n\t ", laterTs)  // blank
-        store.reply("ghost", "hi", laterTs) // unknown
-        store.edit("ghost", "hi", laterTs)  // unknown
-        store.repend("ghost", laterTs)      // unknown
+        store.rependReply("u1", 0, laterTs) // already actionable → nothing to revive
 
         assertEquals(0, fires)
-        assertEquals("keep me", store.get("u1")?.content)
+    }
+
+    @Test
+    fun `deleteReply removes one reply and keeps the others`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(
+            sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"), sampleReply(content = "b"))),
+        )
+
+        store.deleteReply("u1", 0, laterTs)
+
+        val updated = store.get("u1")!!
+        assertEquals(listOf("b"), updated.replies?.map { it.content })
+        assertEquals("b", updated.content)
+    }
+
+    @Test
+    fun `deleting the last reply drops the whole thread and unlinks the file`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "only one"))))
+
+        store.deleteReply("u1", 0, laterTs)
+
+        assertNull(store.get("u1"))
+        assertFalse(Files.exists(dir.resolve("u1.json")))
+    }
+
+    @Test
+    fun `deleting the last pending reply keeps the Seen replies but unlinks the pool file`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(
+            sampleComment(
+                uuid = "u1",
+                replies = listOf(
+                    sampleReply(content = "todo", status = CommentStatus.PENDING),
+                    sampleReply(content = "already seen", status = CommentStatus.PROCESSED),
+                ),
+            ),
+        )
+
+        store.deleteReply("u1", 0, laterTs) // remove the only actionable reply
+
+        val updated = store.get("u1")!!
+        assertEquals(CommentStatus.PROCESSED, updated.status)
+        assertEquals(listOf("already seen"), updated.replies?.map { it.content }) // Seen reply retained in-UI
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // …but off the injectable pool (reviewa parity)
+        assertFalse(store.isPersisted("u1"))
+    }
+
+    @Test
+    fun `markProcessed flips every reply to Seen and empties the derived content`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(
+            sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"), sampleReply(content = "b"))),
+        )
+
+        store.markProcessed("u1")
+
+        val seen = store.get("u1")!!
+        assertEquals(CommentStatus.PROCESSED, seen.status)
+        assertEquals("", seen.content)
+        assertTrue(seen.replies!!.all { it.status == CommentStatus.PROCESSED })
+    }
+
+    @Test
+    fun `a reply added to a thread with a Seen reply injects only the pending one`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "seen note", status = CommentStatus.PROCESSED))))
+
+        store.addReply("u1", "new note", "marlzrana", laterTs)
+
+        assertEquals("new note", store.get("u1")?.content) // the Seen reply is excluded from content
+    }
+
+    @Test
+    fun `reply ops drop a blank input, unknown uuids, and out-of-range indices without firing`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "keep me"))))
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.addReply("u1", "   ", "me", laterTs)   // blank
+        store.editReply("u1", 0, "\n\t ", laterTs)   // blank
+        store.addReply("ghost", "hi", "me", laterTs) // unknown uuid
+        store.editReply("ghost", 0, "hi", laterTs)
+        store.rependReply("ghost", 0, laterTs)
+        store.deleteReply("ghost", 0, laterTs)
+        store.editReply("u1", 5, "x", laterTs)       // out-of-range index
+        store.deleteReply("u1", 9, laterTs)
+
+        assertEquals(0, fires)
+        assertEquals(listOf("keep me"), store.get("u1")?.replies?.map { it.content })
+    }
+
+    @Test
+    fun `hydrate reconstructs a single reply for a legacy file with no replies array`(@TempDir dir: Path) {
+        // sampleComment has replies=null → the encoded JSON has no "replies" key (a reviewa/legacy file).
+        seed(dir, sampleComment(uuid = "leg", status = CommentStatus.PENDING))
+        val store = store(dir, author = "legacy-author")
+
+        store.hydrate()
+
+        val loaded = store.get("leg")!!
+        assertEquals(
+            listOf(com.marlzrana.heview.model.HeviewReply("make this a const", CommentStatus.PENDING, "legacy-author", loaded.createdAt)),
+            loaded.replies,
+        )
+    }
+
+    @Test
+    fun `hydrate loads an explicit replies array as-is`(@TempDir dir: Path) {
+        seed(
+            dir,
+            sampleComment(
+                uuid = "r",
+                status = CommentStatus.PENDING,
+                replies = listOf(sampleReply(content = "a"), sampleReply(content = "b", status = CommentStatus.PROCESSED)),
+            ),
+        )
+        val store = store(dir)
+
+        store.hydrate()
+
+        val loaded = store.get("r")!!
+        assertEquals(listOf("a", "b"), loaded.replies?.map { it.content })
+        assertEquals(
+            listOf(CommentStatus.PENDING, CommentStatus.PROCESSED),
+            loaded.replies?.map { it.status },
+        )
     }
 }

@@ -137,6 +137,7 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
                 line0Based = anchorLine,
                 lineContent = lineContent,
                 content = text,
+                author = author,
                 createdAt = HeviewTime.nowIso(),
             )
             // Promote the compose anchor (it has tracked edits since caret time) so recreated cards in
@@ -213,10 +214,10 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     }
 
     /**
-     * A [CommentThread] wired to the store: delete, and the state-machine actions (reply / edit /
-     * re-pend) that revive a comment to PENDING and re-persist it (bumping `created_at` via
-     * [HeviewTime.nowIso]). Shared by the compose and display paths so both cards offer the same
-     * actions; only [lineEndOffset] and [onDispose] differ between them.
+     * A [CommentThread] wired to the store: the per-reply state-machine actions (plan.html §5). A reply
+     * adds a new PENDING reply; edit/re-pend revive that reply; delete removes it (the last reply drops
+     * the thread). Timestamps come from [HeviewTime.nowIso] and new replies are authored by [author].
+     * Shared by the compose and display paths; only [lineEndOffset] and [onDispose] differ.
      */
     private fun newThread(
         editor: Editor,
@@ -227,10 +228,10 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         host = hostFactory(editor),
         lineEndOffset = lineEndOffset,
         author = author,
-        onDelete = { store.delete(it.uuid) },
-        onReply = { comment, text -> store.reply(comment.uuid, text, HeviewTime.nowIso()) },
-        onEdit = { comment, text -> store.edit(comment.uuid, text, HeviewTime.nowIso()) },
-        onRepend = { store.repend(it.uuid, HeviewTime.nowIso()) },
+        onReply = { comment, text -> store.addReply(comment.uuid, text, author, HeviewTime.nowIso()) },
+        onEditReply = { comment, index, text -> store.editReply(comment.uuid, index, text, HeviewTime.nowIso()) },
+        onDeleteReply = { comment, index -> store.deleteReply(comment.uuid, index, HeviewTime.nowIso()) },
+        onRependReply = { comment, index -> store.rependReply(comment.uuid, index, HeviewTime.nowIso()) },
         onDispose = onDispose,
     )
 

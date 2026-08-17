@@ -21,11 +21,29 @@ enum class IntendedConsumer {
 }
 
 /**
+ * One reply within a comment thread (heview extension to the shared schema).
+ *
+ * A thread ([HeviewComment]) holds an ordered list of these, each with its own status so the user can
+ * edit / delete / re-pend replies independently — matching reviewa's per-comment UI, which reviewa
+ * keeps only in memory. heview persists them (it reloads the pool on restart) via [HeviewComment.replies].
+ * The thread's top-level `content`/`status` stay DERIVED from these replies (see `recomputed`) so the
+ * coding-agent hooks — which read only `content` — need no change.
+ */
+data class HeviewReply(
+    @SerializedName("content") val content: String,
+    @SerializedName("status") val status: CommentStatus,
+    @SerializedName("author") val author: String,
+    @SerializedName("created_at") val createdAt: String,
+)
+
+/**
  * One comment thread, persisted as `~/.heview/comments/<uuid>.json`.
  *
- * Field names and types mirror reviewa's `ReviewaComment` exactly — this is the shared `~/.heview`
- * on-disk contract the coding-agent hooks parse (plan.html §5). Do NOT rename or drop fields.
- * `@SerializedName` fixes the on-disk keys to snake_case regardless of the Kotlin property names.
+ * The top-level fields mirror reviewa's `ReviewaComment` exactly — the shared `~/.heview` on-disk
+ * contract the coding-agent hooks parse (plan.html §5); do NOT rename or drop them. `content` is the
+ * PENDING replies joined by a blank line and `status` is PENDING iff any reply is actionable — both
+ * DERIVED from [replies]. [replies] is a heview-only superset field a foreign/legacy file may omit
+ * (then the thread is one reply reconstructed from `content`). `@SerializedName` pins snake_case keys.
  */
 data class HeviewComment(
     @SerializedName("uuid") val uuid: String,
@@ -39,4 +57,5 @@ data class HeviewComment(
     @SerializedName("side") val side: CommentSide,
     @SerializedName("content") val content: String,
     @SerializedName("intended_consumer") val intendedConsumer: IntendedConsumer? = null,
+    @SerializedName("replies") val replies: List<HeviewReply>? = null,
 )
