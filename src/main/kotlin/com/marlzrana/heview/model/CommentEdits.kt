@@ -32,5 +32,7 @@ fun HeviewComment.recomputed(now: String): HeviewComment {
 fun HeviewComment.normalizedReplies(fallbackAuthor: String): List<HeviewReply> {
     val reps = replies
     if (!reps.isNullOrEmpty()) return reps
-    return listOf(HeviewReply(content = content, status = status, author = fallbackAuthor, createdAt = createdAt))
+    // A legacy/foreign file has no per-reply id; derive a stable one from the thread uuid so repeated
+    // reconstructions (across restarts, until the first save persists it) agree.
+    return listOf(HeviewReply(content = content, status = status, author = fallbackAuthor, createdAt = createdAt, id = uuid))
 }

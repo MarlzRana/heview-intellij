@@ -68,8 +68,9 @@ class CommentEditsTest {
 
         val out = legacy.normalizedReplies("marlzrana")
 
+        // The reconstructed reply's id is derived from the thread uuid (stable across reconstructions).
         assertEquals(
-            listOf(HeviewReply("solo note", CommentStatus.PENDING, "marlzrana", legacy.createdAt)),
+            listOf(HeviewReply("solo note", CommentStatus.PENDING, "marlzrana", legacy.createdAt, id = "u1")),
             out,
         )
     }

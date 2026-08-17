@@ -85,12 +85,23 @@ class CommentStore(
     private fun fileFor(uuid: String): Path = commentsDir.resolve("$uuid.json")
 
     /** Upsert: index + fire immediately (EDT), then persist atomically on a background thread. */
-    fun save(comment: HeviewComment) {
+    fun save(comment: HeviewComment) = save(comment, afterPersist = null)
+
+    /**
+     * As [save], but [afterPersist] runs on the IO thread *only after* the write succeeds — used by
+     * [revive] to drop the consumption tombstone only once the revived thread is durably in the pool.
+     */
+    private fun save(comment: HeviewComment, afterPersist: (() -> Unit)?) {
         index[comment.uuid] = comment
         fireChanged()
         val uuid = comment.uuid
         val json = CommentJson.encode(comment)
-        runIo { if (writeAtomically(uuid, json)) persisted.add(uuid) }
+        runIo {
+            if (writeAtomically(uuid, json)) {
+                persisted.add(uuid)
+                afterPersist?.invoke()
+            }
+        }
     }
 
     /** True once [uuid] has been confirmed on disk (write succeeded or hydrated) and not since removed. */
@@ -99,17 +110,18 @@ class CommentStore(
     /**
      * The per-reply state machine (plan.html §5). Each mutates one thread's [HeviewComment.replies],
      * recomputes the thread's derived `content`/`status`/`created_at` ([recomputed]) and re-persists.
-     * The target reply is identified **by value**, not by array index: the card renders indices but a
-     * concurrent mutation (another split, or deleting an earlier reply mid-edit) can shift them, so the
-     * store locates the actual reply with [List.indexOf] and no-ops if it is gone. The replies are
-     * normalized first, so a foreign/legacy single-`content` file behaves as a one-reply thread. All are
-     * no-ops on an unknown uuid or a reply no longer present; [addReply]/[editReply] also drop blank text.
+     * The target reply is located **by its stable [HeviewReply.id]**, not by array index or by value: the
+     * card renders indices and holds a possibly-stale copy, but a concurrent change (another split, or a
+     * hook consuming the thread mid-edit) can shift indices and flip the reply's mutable fields — only the
+     * id survives. The op no-ops if the id is gone. The replies are normalized first, so a foreign/legacy
+     * single-`content` file behaves as a one-reply thread. All no-op on an unknown uuid or a missing reply;
+     * [addReply]/[editReply] also drop blank text.
      *
      * - [addReply] appends a new PENDING reply (the thread's "Leave a comment" box).
-     * - [editReply] replaces [target]'s text and revives it to PENDING (editing a Seen reply makes it
+     * - [editReply] replaces the target's text and revives it to PENDING (editing a Seen reply makes it
      *   actionable again — reviewa parity).
-     * - [rependReply] revives a Seen (PROCESSED) [target] to PENDING; a no-op if it is already actionable.
-     * - [deleteReply] removes [target]: the last reply drops the whole thread; if only Seen replies
+     * - [rependReply] revives a Seen (PROCESSED) target to PENDING; a no-op if it is already actionable.
+     * - [deleteReply] removes the target: the last reply drops the whole thread; if only Seen replies
      *   remain the thread leaves the injectable pool but stays visible (reviewa parity). It does NOT bump
      *   `created_at` (a delete must not reorder the remaining replies' injection — reviewa parity).
      */
@@ -124,26 +136,26 @@ class CommentStore(
         if (newText.isBlank()) return
         val current = index[uuid] ?: return
         val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
-        val at = replies.indexOf(target)
+        val at = replies.indexOfFirst { it.id == target.id }
         if (at < 0) return
-        replies[at] = target.copy(content = newText, status = CommentStatus.PENDING, createdAt = now)
+        // Copy the CURRENT reply (its id/author), not the possibly-stale target; editing revives it.
+        replies[at] = replies[at].copy(content = newText, status = CommentStatus.PENDING, createdAt = now)
         revive(current.copy(replies = replies).recomputed(now))
     }
 
     fun rependReply(uuid: String, target: HeviewReply, now: String) {
-        if (target.status != CommentStatus.PROCESSED) return
         val current = index[uuid] ?: return
         val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
-        val at = replies.indexOf(target)
-        if (at < 0) return
-        replies[at] = target.copy(status = CommentStatus.PENDING, createdAt = now)
+        val at = replies.indexOfFirst { it.id == target.id }
+        if (at < 0 || replies[at].status != CommentStatus.PROCESSED) return // guard on the CURRENT status
+        replies[at] = replies[at].copy(status = CommentStatus.PENDING, createdAt = now)
         revive(current.copy(replies = replies).recomputed(now))
     }
 
     fun deleteReply(uuid: String, target: HeviewReply) {
         val current = index[uuid] ?: return
         val replies = current.normalizedReplies(defaultAuthor()).toMutableList()
-        if (!replies.remove(target)) return
+        if (!replies.removeAll { it.id == target.id }) return
         if (replies.isEmpty()) {
             delete(uuid) // the last reply is gone → drop the whole thread + its pool file
             return
@@ -158,29 +170,29 @@ class CommentStore(
     }
 
     /**
-     * Persist a revived (PENDING) thread into the pool. The consumption tombstone is removed first: a
-     * tombstone in `processed/` for an in-index uuid is exactly the watcher's "Seen" signal, so leaving
-     * it would let the next catch-up reconcile flip this thread straight back to PROCESSED. The delete
-     * is enqueued on the serial IO executor before [save]'s write, so they run in order; a no-op when
-     * there was no tombstone (a mutation on an already-actionable thread).
+     * Persist a revived (PENDING) thread into the pool, then drop the consumption tombstone — but only
+     * **after** the write succeeds ([deleteTombstone] runs as the save's `afterPersist`). Writing first
+     * means a failed write can't destroy the tombstone (the sole durable copy). A tombstone present in
+     * `processed/` for an in-index uuid is the watcher's "Seen" signal, so it must be gone once the
+     * revived thread is back — but not before it is safely on disk.
      */
     private fun revive(updated: HeviewComment) {
-        clearTombstone(updated.uuid)
-        save(updated)
+        save(updated) { deleteTombstone(updated.uuid) }
     }
 
     /**
      * A thread whose last actionable reply was deleted: keep its (all-Seen) replies visible in the UI
      * but drop it from the injectable pool — reviewa's `deleteComment`-with-no-actionable behaviour. No
      * tombstone is written (unlike a hook consume), so it is not restored after a restart. `persisted`
-     * is cleared *before* the unlink so the watcher's delete-event handler (also gated on `isPersisted`)
-     * classifies the vanish as our own retain, not a peer delete, and leaves the Seen thread in the UI.
+     * is cleared on the serial IO executor (so it orders AFTER any in-flight save's `persisted.add` for
+     * this uuid) and before the unlink, so the watcher's delete-event handler — also gated on
+     * `isPersisted` — classifies the vanish as our own retain, not a peer delete, and keeps it in the UI.
      */
     private fun retainSeenOffPool(updated: HeviewComment) {
         index[updated.uuid] = updated
-        persisted.remove(updated.uuid)
         fireChanged()
         runIo {
+            persisted.remove(updated.uuid)
             try {
                 Files.deleteIfExists(fileFor(updated.uuid))
             } catch (e: IOException) {
@@ -189,16 +201,15 @@ class CommentStore(
         }
     }
 
-    private fun clearTombstone(uuid: String) {
-        runIo {
-            try {
-                // Never follow a symlinked processed/ (matches the injector + sweep guards): a planted
-                // `processed -> ~/.codex` link would make this delete a file OUTSIDE ~/.heview.
-                if (Files.isSymbolicLink(processedDir)) return@runIo
-                Files.deleteIfExists(processedDir.resolve("$uuid.json"))
-            } catch (e: IOException) {
-                LOG.warn("heview: failed to remove the consumption tombstone for $uuid", e)
-            }
+    /** Delete a consumption tombstone; runs on the IO thread (call from within a runIo task). */
+    private fun deleteTombstone(uuid: String) {
+        try {
+            // Never follow a symlinked processed/ (matches the injector + sweep guards): a planted
+            // `processed -> ~/.codex` link would make this delete a file OUTSIDE ~/.heview.
+            if (Files.isSymbolicLink(processedDir)) return
+            Files.deleteIfExists(processedDir.resolve("$uuid.json"))
+        } catch (e: IOException) {
+            LOG.warn("heview: failed to remove the consumption tombstone for $uuid", e)
         }
     }
 
@@ -261,8 +272,11 @@ class CommentStore(
             LOG.warn("heview: skipping malformed or unsafe comment file $path")
             return null
         }
-        if (comment.status == CommentStatus.PROCESSED) {
-            // plan.html §5: processed comments are not persisted/actionable — never hydrate one as pending.
+        if (comment.replies.isNullOrEmpty() && comment.status == CommentStatus.PROCESSED) {
+            // plan.html §5: a processed comment is not actionable — never hydrate one. A file that carries
+            // a replies[] array is instead re-derived below (its top-level status may be stale), so a
+            // processed file that still holds a PENDING reply loads as pending; the derived-PROCESSED
+            // check after re-derivation drops the genuinely fully-Seen ones.
             return null
         }
         return try {
@@ -282,13 +296,19 @@ class CommentStore(
     }
 
     private fun sanitizedReplies(c: HeviewComment): List<HeviewReply> {
-        // Gson (via Unsafe) can leave a null element in a non-null-typed List, so null-check each.
+        // Gson (via Unsafe) can leave a null element in a non-null-typed List (null-check each), and
+        // bypasses the constructor so an absent/null `id` in a foreign file stays null (backfill a fresh
+        // one so every indexed reply has a distinct, matchable identity).
         @Suppress("SENSELESS_COMPARISON")
-        val valid = c.replies?.filter { it != null && isWellFormedReply(it) }.orEmpty()
+        val valid = c.replies
+            ?.filter { it != null && isWellFormedReply(it) }
+            ?.map { if (it.id == null) it.copy(id = java.util.UUID.randomUUID().toString()) else it }
+            .orEmpty()
         if (valid.isNotEmpty()) return valid
-        return listOf(HeviewReply(c.content, c.status, defaultAuthor(), c.createdAt))
+        return listOf(HeviewReply(content = c.content, status = c.status, author = defaultAuthor(), createdAt = c.createdAt, id = c.uuid))
     }
 
+    // A well-formed reply needs its required content fields; a missing `id` is backfilled in [sanitizedReplies].
     @Suppress("SENSELESS_COMPARISON")
     private fun isWellFormedReply(r: HeviewReply): Boolean =
         r.content != null && r.status != null && r.author != null && r.createdAt != null

@@ -65,6 +65,14 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
             if (c is javax.swing.JLabel) c.text?.let { add(it) }
             if (c is java.awt.Container) c.components.forEach { addAll(collectLabelTexts(it)) }
         }
+
+        /** Tooltips of the icon action buttons in the placed card (Delete / Edit / Re-pend). */
+        fun buttonTooltips(): List<String> = card?.let(::collectButtonTooltips) ?: emptyList()
+
+        private fun collectButtonTooltips(c: java.awt.Component): List<String> = buildList {
+            if (c is javax.swing.JButton) c.toolTipText?.let { add(it) }
+            if (c is java.awt.Container) c.components.forEach { addAll(collectButtonTooltips(it)) }
+        }
     }
 
     /** A host that always declines placement (addComponentInlay returning null). */
@@ -329,6 +337,42 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals("new text", store.get(comment.uuid)?.replies?.get(0)?.content)
         assertEquals(1, liveCards(e1)) // same card, no duplicate
         assertTrue(card.displayRenderCount > before) // rebuilt in place with the new content
+        assertFalse(card.isEditingForTest()) // returned to display mode (editingIndex cleared before firing)
+    }
+
+    fun testReplyRowsExposeTheCorrectActionsPerStatus() {
+        val (e1, path) = openLocalEditor("W.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x").copy(
+            replies = listOf(
+                HeviewReply("pending one", CommentStatus.PENDING, "tester", "2026-01-01T00:00:00.000Z"),
+                HeviewReply("seen one", CommentStatus.PROCESSED, "tester", "2026-01-01T00:00:00.000Z"),
+            ),
+        )
+        store.save(comment)
+        manager.init()
+
+        val tips = hosts.getValue(e1).buttonTooltips()
+        // Two rows: Pending → Delete+Edit; Seen → Delete+Edit+Re-pend (re-pend only on the Seen row).
+        assertEquals(2, tips.count { it == "Delete" })
+        assertEquals(2, tips.count { it == "Edit" })
+        assertEquals(1, tips.count { it == "Re-pend" })
+    }
+
+    fun testEditSurvivesAConcurrentConsumeViaStableReplyId() {
+        val (e1, path) = openLocalEditor("V.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "original")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        card.startEditForTest(0) // the user begins editing reply 0
+        store.markProcessed(comment.uuid) // a hook consumes the whole thread mid-edit (reply 0 → Seen)
+
+        card.editReplyForTest(0, "edited") // the user saves the edit
+
+        val reply0 = store.get(comment.uuid)?.replies?.get(0)
+        assertEquals("edited", reply0?.content) // applied despite the concurrent consume — matched by id
+        assertEquals(CommentStatus.PENDING, reply0?.status) // and revived the consumed reply
+        assertFalse(card.isEditingForTest()) // the card returned to display mode (not stuck)
     }
 
     fun testReplyAddsARowAndRefreshesTheCardInPlace() {

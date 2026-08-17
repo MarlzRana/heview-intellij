@@ -34,6 +34,10 @@ data class HeviewReply(
     @SerializedName("status") val status: CommentStatus,
     @SerializedName("author") val author: String,
     @SerializedName("created_at") val createdAt: String,
+    // Stable per-reply identity so an edit / delete / re-pend targets the right reply even after a
+    // concurrent change flips its status or edits its text (its other fields are all mutable). Generated
+    // once, then persisted and preserved across mutations; heview-internal, so hooks/reviewa ignore it.
+    @SerializedName("id") val id: String = java.util.UUID.randomUUID().toString(),
 )
 
 /**

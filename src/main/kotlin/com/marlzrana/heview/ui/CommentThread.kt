@@ -93,12 +93,18 @@ internal class CommentThread(
     /**
      * Rebuild the reply stack if [comment] differs from what it currently shows — e.g. the consumption
      * watcher flipping the thread to Seen, or a reply/edit/re-pend mutating it. No-op while composing
-     * (nothing displayed yet), while an inline edit is open (its text must survive), or when unchanged.
+     * (nothing displayed yet) or when unchanged. While an inline edit is open the rebuild is deferred so
+     * the edit field survives, but [displayed] is still advanced to the latest version so Save/Cancel
+     * renders that (a consume landing mid-edit isn't lost).
      */
     fun refreshDisplay(comment: HeviewComment) {
-        if (disposed || editingIndex != null) return
+        if (disposed) return
         val shown = displayed ?: return
         if (shown == comment) return
+        if (editingIndex != null) {
+            displayed = comment
+            return
+        }
         renderThread(comment)
     }
 
@@ -283,6 +289,10 @@ internal class CommentThread(
     /** Open the inline edit on a row without submitting — for the refresh-suppression test. */
     @TestOnly
     internal fun startEditForTest(index: Int) = startEdit(index)
+
+    /** Whether an inline edit is currently open — lets a test assert the card returned to display mode. */
+    @TestOnly
+    internal fun isEditingForTest(): Boolean = editingIndex != null
 
     private fun replyAt(index: Int): HeviewReply? = displayed?.normalizedReplies(author)?.getOrNull(index)
 

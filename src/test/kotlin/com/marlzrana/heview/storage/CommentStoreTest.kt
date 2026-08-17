@@ -496,13 +496,18 @@ class CommentStoreTest {
         assertEquals("first\n\nsecond", updated.content) // derived: both pending, blank-line joined
         assertEquals(CommentStatus.PENDING, updated.status)
         assertEquals(laterTs, updated.createdAt)
-        assertEquals(HeviewReply("second", CommentStatus.PENDING, "marlzrana", laterTs), updated.replies?.last())
+        val appended = updated.replies!!.last() // its id is freshly generated, so assert the fields
+        assertEquals("second", appended.content)
+        assertEquals(CommentStatus.PENDING, appended.status)
+        assertEquals("marlzrana", appended.author)
+        assertEquals(laterTs, appended.createdAt)
+        assertTrue(appended.id.isNotBlank())
         assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json")))) // written back
         assertTrue(store.isPersisted("u1"))
     }
 
     @Test
-    fun `editReply replaces a reply's text and revives it to pending`(@TempDir dir: Path) {
+    fun `editReply replaces a reply's text and revives it, bumping both timestamps`(@TempDir dir: Path) {
         val store = store(dir)
         val r0 = sampleReply(content = "old", status = CommentStatus.PROCESSED)
         store.save(sampleComment(uuid = "u1", replies = listOf(r0)))
@@ -513,13 +518,17 @@ class CommentStoreTest {
         assertEquals("edited", updated.replies?.get(0)?.content)
         assertEquals(CommentStatus.PENDING, updated.replies?.get(0)?.status) // editing a Seen reply revives it
         assertEquals("edited", updated.content)
-        assertEquals(updated, CommentJson.decode(Files.readString(dir.resolve("u1.json"))))
+        assertEquals(laterTs, updated.createdAt) // top-level bumped (drives injection ordering)
+        assertEquals(laterTs, updated.replies?.get(0)?.createdAt) // the edited reply bumped
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(updated, onDisk)
+        assertEquals(laterTs, onDisk.replies?.get(0)?.createdAt) // and it survives the round-trip
     }
 
     @Test
-    fun `an op targets the reply by value, surviving an earlier reply's removal`(@TempDir dir: Path) {
-        // The card renders indices, but a concurrent change shifts them; the store must locate the reply
-        // by value. Edit "b" after "a" was removed: index-based would corrupt "c"; value-based hits "b".
+    fun `an op targets the reply by its stable id, surviving an earlier reply's removal`(@TempDir dir: Path) {
+        // The card renders indices and may hold a stale copy; the store must locate the reply by its id.
+        // Edit "b" after "a" was removed: an index/value match would misfire; the id hits "b".
         val store = store(dir)
         val a = sampleReply(content = "a")
         val b = sampleReply(content = "b")
@@ -545,6 +554,8 @@ class CommentStoreTest {
         assertEquals(CommentStatus.PENDING, updated.replies?.get(0)?.status)
         assertEquals("please fix", updated.replies?.get(0)?.content) // untouched by re-pend
         assertEquals("please fix", updated.content)
+        assertEquals(laterTs, updated.createdAt) // top-level bumped
+        assertEquals(laterTs, updated.replies?.get(0)?.createdAt) // the re-pended reply bumped
         assertFalse(Files.exists(tombstone)) // the "Seen" signal is gone so a reconcile can't re-mark it
         assertTrue(Files.exists(dir.resolve("u1.json")))
     }
@@ -691,7 +702,8 @@ class CommentStoreTest {
 
         val loaded = store.get("leg")!!
         assertEquals(
-            listOf(HeviewReply("make this a const", CommentStatus.PENDING, "legacy-author", loaded.createdAt)),
+            // id derived from the thread uuid (stable across reconstructions).
+            listOf(HeviewReply("make this a const", CommentStatus.PENDING, "legacy-author", loaded.createdAt, id = "leg")),
             loaded.replies,
         )
     }
@@ -756,7 +768,7 @@ class CommentStoreTest {
         store.hydrate()
 
         assertEquals(
-            listOf(HeviewReply("reconstruct me", CommentStatus.PENDING, "fallback-author", "2026-08-15T00:00:00.000Z")),
+            listOf(HeviewReply("reconstruct me", CommentStatus.PENDING, "fallback-author", "2026-08-15T00:00:00.000Z", id = "bad")),
             store.get("bad")?.replies,
         )
     }
@@ -780,6 +792,65 @@ class CommentStoreTest {
 
         assertNotNull(store.get("good")) // the neighbor loaded — the null element didn't strand the pool
         assertEquals(listOf("ok"), store.get("nul")?.replies?.map { it.content }) // null element dropped
+    }
+
+    @Test
+    fun `hydrate skips a file whose replies are all Seen even when the top-level says pending`(@TempDir dir: Path) {
+        // Inconsistent top-level (pending) vs replies (all processed) → re-derived to PROCESSED → skipped.
+        seed(
+            dir,
+            sampleComment(
+                uuid = "s",
+                status = CommentStatus.PENDING,
+                replies = listOf(
+                    sampleReply(content = "a", status = CommentStatus.PROCESSED),
+                    sampleReply(content = "b", status = CommentStatus.PROCESSED),
+                ),
+            ),
+        )
+        val store = store(dir)
+
+        store.hydrate()
+
+        assertNull(store.get("s")) // a fully-Seen thread is not actionable — not hydrated
+    }
+
+    @Test
+    fun `hydrate loads a processed file that still carries a pending reply, as pending`(@TempDir dir: Path) {
+        // A top-level `processed` file whose replies still include a PENDING one is re-derived to pending
+        // (the early skip is gated on an empty replies array).
+        seed(
+            dir,
+            sampleComment(uuid = "p", status = CommentStatus.PROCESSED, replies = listOf(sampleReply(content = "still todo"))),
+        )
+        val store = store(dir)
+
+        store.hydrate()
+
+        val loaded = store.get("p")!!
+        assertEquals(CommentStatus.PENDING, loaded.status)
+        assertEquals("still todo", loaded.content)
+    }
+
+    @Test
+    fun `reviving refuses to delete a tombstone through a symlinked processed dir`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        val outside = Files.createDirectories(dir.resolve("outside"))
+        Files.writeString(outside.resolve("u1.json"), "keep me")
+        try {
+            Files.createSymbolicLink(dir.resolve("processed"), outside)
+        } catch (e: Exception) {
+            assumeTrue(false, "symbolic links not supported on this platform")
+        }
+        val store = store(dir)
+        val r0 = sampleReply(content = "x", status = CommentStatus.PROCESSED)
+        store.save(sampleComment(uuid = "u1", replies = listOf(r0)))
+
+        store.rependReply("u1", r0, laterTs) // revive → would clear the tombstone, but processed/ is a symlink
+
+        // The outside file must be untouched — clearTombstone refuses to follow the symlink.
+        assertTrue(Files.exists(outside.resolve("u1.json")))
+        assertEquals("keep me", Files.readString(outside.resolve("u1.json")))
     }
 
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
