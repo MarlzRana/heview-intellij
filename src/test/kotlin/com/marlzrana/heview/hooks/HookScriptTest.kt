@@ -211,6 +211,30 @@ class HookScriptTest {
     }
 
     @Test
+    fun `a symlinked processed dir is refused, leaving the comment pending and the target untouched`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })
+        for ((name, cmd) in agents) {
+            val home = setupHome(dir.resolve("sym-$name"))
+            seed(home, "u1", "/tmp/proj/f.kt", 1, "x", "note")
+            val outside = Files.createDirectories(dir.resolve("outside-$name"))
+            val supported = try {
+                Files.createSymbolicLink(home.resolve(".heview/comments/processed"), outside) // processed/ -> outside
+                true
+            } catch (e: Exception) {
+                false
+            }
+            assumeTrue(supported, "symbolic links not supported on this filesystem")
+
+            val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
+
+            assertNull(out) // claim refused → nothing injected
+            assertTrue(pending(home, "u1")) // comment stays in the pending pool
+            Files.list(outside).use { assertEquals(0L, it.count()) } // nothing written through the symlink
+        }
+    }
+
+    @Test
     fun `non-ASCII content stays byte-identical between the Node and Python injectors`(@TempDir dir: Path) {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val content = "café ★ λ 日本語" // exercises ensure_ascii=False vs JSON.stringify (both keep raw UTF-8)

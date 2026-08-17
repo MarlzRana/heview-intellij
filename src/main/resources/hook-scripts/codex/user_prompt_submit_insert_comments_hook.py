@@ -39,13 +39,21 @@ def claim(comment, filepath, filename):
         os.replace(filepath, dest)
     except Exception:
         return False
+    # Won the claim. Stamp the tombstone's mtime to consumption time: replace kept the comment's original
+    # (possibly >14d old) mtime, which the watcher's retention sweep would otherwise reclaim early.
+    try:
+        os.utime(dest, None)  # None -> now
+    except Exception:
+        pass
     # Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
     # setPrettyPrinting); write to a temp then atomically replace so a crash/ENOSPC can't leave a
     # partial file — the moved original (a valid pending comment) survives instead. indent +
     # ensure_ascii=False match the Node injector byte-for-byte.
     tmp = dest + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        # Exclusive create ("x"): if tmp already exists (incl. a planted symlink) fail rather than
+        # follow/overwrite it, and keep the intact moved original.
+        with open(tmp, "x", encoding="utf-8") as fh:
             json.dump(
                 {**comment, "status": "processed"}, fh, indent=2, ensure_ascii=False
             )

@@ -39,12 +39,17 @@ function claim(comment, filePath, filename) {
 	} catch {
 		return false;
 	}
+	// Won the claim. Stamp the tombstone's mtime to consumption time: rename kept the comment's original
+	// (possibly >14d old) mtime, which the watcher's retention sweep would otherwise reclaim early.
+	try { const now = new Date(); fs.utimesSync(dest, now, now); } catch {}
 	// Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
 	// setPrettyPrinting); write to a temp then atomically replace so a crash/ENOSPC can't leave a
 	// partial file — the moved original (a valid pending comment) survives instead. Matches Python.
 	const tmp = dest + '.tmp';
 	try {
-		fs.writeFileSync(tmp, JSON.stringify({ ...comment, status: 'processed' }, null, 2));
+		// Exclusive create ('wx'): if tmp already exists (incl. a planted symlink) fail rather than
+		// follow/overwrite it, and keep the intact moved original.
+		fs.writeFileSync(tmp, JSON.stringify({ ...comment, status: 'processed' }, null, 2), { flag: 'wx' });
 		fs.renameSync(tmp, dest);
 	} catch {
 		try { fs.unlinkSync(tmp); } catch {}
