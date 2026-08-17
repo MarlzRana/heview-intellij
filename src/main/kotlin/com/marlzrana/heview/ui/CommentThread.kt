@@ -305,7 +305,14 @@ internal class CommentThread(
             isBorderPainted = false
             isContentAreaFilled = false
             isFocusable = false
-            margin = JBUI.emptyInsets()
+            isRolloverEnabled = true
+            // A plain JButton carries the platform's ~72px minimum button width, which spreads icon-only
+            // buttons far apart; pin a tight, icon-sized bound so they pack together (bypasses the UI's
+            // getPreferredSize once explicitly set).
+            border = JBUI.Borders.empty()
+            val dim = Dimension(icon.iconWidth + JBUI.scale(6), icon.iconHeight + JBUI.scale(6))
+            preferredSize = dim
+            minimumSize = dim
             addActionListener { onClick() }
         }
 
