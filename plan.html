@@ -214,8 +214,9 @@
 │  └─ consumed/                                       # hooks CLAIM a comment by moving it here (not
 │                                                     #   unlink) so any client can tell consumption
 │                                                     #   from a peer/user delete; the tombstone IS the
-│                                                     #   consumed comment (restorable) and lingers for
-│                                                     #   peers — age-swept after 14 days, not eager
+│                                                     #   consumed comment, rewritten to status=processed
+│                                                     #   (restorable), lingering for peers — age-swept
+│                                                     #   after 14 days, not eager-deleted
 ├─ claude-code/
 │  ├─ hooks/
 │  │  ├─ user_prompt_submit_insert_comments_hook.js   # comment injector (Node)

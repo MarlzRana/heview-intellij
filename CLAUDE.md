@@ -72,7 +72,8 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   startup once-guard can re-arm and retry. All paths/`PATH`/warn injectable → unit-tested against temp dirs.
   Bundled injector scripts (`src/main/resources/hook-scripts/{claude-code,codex}/`) match by directory
   boundary + normalize paths, are UTF-8 + null-tolerant, and consume by an atomic **CLAIM** — move-then-emit
-  into `comments/consumed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher reads.
+  into `comments/consumed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher
+  reads; the moved tombstone is then rewritten to `status:"processed"` (JS/Python byte-identical) so it reads back as Seen.
 - `watch/CommentsPoolWatcher.kt` — Phase 3 application `@Service` (`Disposable`): a daemon NIO WatchService on
   `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `consumed/` means an agent hook consumed
   it → `CommentStore.markProcessed` (Seen); a bare vanish → `evict` (peer/user delete). The tombstone is the
