@@ -168,6 +168,9 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         thread.submitForTest("my comment")
         assertEquals(1, liveCards(e1)) // save-triggered reconcile must not add a duplicate
         assertEquals(1, store.all().size) // persisted
+        // The save fires a synchronous reconcile while `displayed` is still null; refreshDisplay's
+        // `displayed ?: return` guard skips it, so submit renders display exactly once (no double-render).
+        assertEquals(1, thread.displayRenderCount)
 
         val e2 = split(e1)
         assertEquals(1, liveCards(e2)) // the split gets its own single card

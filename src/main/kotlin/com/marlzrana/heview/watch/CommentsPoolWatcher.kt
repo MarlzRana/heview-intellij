@@ -138,11 +138,16 @@ internal class CommentsPoolWatcher(
         }
     }
 
-    /** Create the pool dir, reclaim aged tombstones, and register a fresh watch — or null on failure. */
+    /**
+     * Create the pool dir, reclaim aged tombstones, and register a fresh watch — or null on failure.
+     * Catches broadly (not just IOException): some filesystems throw UnsupportedOperationException from
+     * newWatchService()/register(), or a SecurityException from createDirectories(); those must degrade
+     * to a retry, not escape and kill the daemon for the whole session.
+     */
     private fun openWatch(): WatchService? {
         try {
             Files.createDirectories(commentsDir)
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             LOG.warn("heview: cannot create the comments dir to watch $commentsDir", e)
             return null
         }
@@ -152,14 +157,14 @@ internal class CommentsPoolWatcher(
         sweepProcessed()
         val ws = try {
             FileSystems.getDefault().newWatchService()
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             LOG.warn("heview: cannot create a watch service for $commentsDir", e)
             return null
         }
         return try {
             commentsDir.register(ws, StandardWatchEventKinds.ENTRY_DELETE)
             ws
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             LOG.warn("heview: cannot watch the comments dir $commentsDir", e)
             closeQuietly(ws) // register failed — don't leak the native watcher / file descriptors
             null
