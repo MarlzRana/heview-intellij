@@ -37,7 +37,9 @@ function claim(comment, filePath, filename) {
 		return false;
 	}
 	try {
-		fs.writeFileSync(dest, JSON.stringify({ ...comment, status: 'processed' }));
+		// Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
+		// setPrettyPrinting); matches the Python injector byte-for-byte.
+		fs.writeFileSync(dest, JSON.stringify({ ...comment, status: 'processed' }, null, 2));
 	} catch {}
 	return true;
 }

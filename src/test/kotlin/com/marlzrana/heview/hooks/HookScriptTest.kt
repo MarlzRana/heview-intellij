@@ -85,6 +85,9 @@ class HookScriptTest {
         return JsonParser.parseString(Files.readString(f)).asJsonObject.get("status")?.asString
     }
 
+    private fun consumedRaw(home: Path, uuid: String): String =
+        Files.readString(home.resolve(".heview/comments/consumed/$uuid.json"))
+
     private fun additionalContext(stdout: String): String? {
         if (stdout.isBlank()) return null
         return JsonParser.parseString(stdout).asJsonObject
@@ -112,6 +115,11 @@ class HookScriptTest {
         assertFalse(pending(h2, "c1"))
         assertTrue(consumed(h2, "c1"))
         assertEquals("processed", consumedStatus(h2, "c1"))
+
+        // Tombstone is pretty-printed (one property per line, like an IDE-written comment) and the two
+        // injectors produce byte-identical output.
+        assertTrue(consumedRaw(h1, "c1").contains("\n  \"uuid\""))
+        assertEquals(consumedRaw(h1, "c1"), consumedRaw(h2, "c1"))
     }
 
     @Test

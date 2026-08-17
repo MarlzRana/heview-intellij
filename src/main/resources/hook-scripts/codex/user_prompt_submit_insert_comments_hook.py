@@ -28,8 +28,7 @@ def claim(comment, filepath, filename):
     # the same filesystem, so of two concurrent agents only the one that wins the move emits the comment;
     # the loser (file already gone) raises and returns False. Moving rather than unlinking also leaves the
     # intent signal heview's watcher reads to mark the thread "Seen". Having won the claim, rewrite the
-    # tombstone with status "processed" so the consumed file reads back as Seen (best-effort; compact
-    # separators match the Node injector's JSON.stringify).
+    # tombstone with status "processed" so the consumed file reads back as Seen (best-effort).
     dest = os.path.join(CONSUMED_DIR, filename)
     try:
         os.makedirs(CONSUMED_DIR, exist_ok=True)
@@ -37,8 +36,12 @@ def claim(comment, filepath, filename):
     except Exception:
         return False
     try:
+        # Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
+        # setPrettyPrinting); indent + ensure_ascii=False match the Node injector byte-for-byte.
         with open(dest, "w", encoding="utf-8") as fh:
-            json.dump({**comment, "status": "processed"}, fh, separators=(",", ":"))
+            json.dump(
+                {**comment, "status": "processed"}, fh, indent=2, ensure_ascii=False
+            )
     except Exception:
         pass
     return True
