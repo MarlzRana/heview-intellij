@@ -15,6 +15,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchService
+import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -24,20 +26,26 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * A disappearance from `comments/` has two causes that a bare `unlink` can't tell apart, so the
  * injector hooks encode the intent by **moving** a consumed file into `comments/consumed/` instead of
- * unlinking it (see the bundled scripts). This watcher reads that signal on each `ENTRY_DELETE`:
+ * unlinking it (see the bundled scripts). The move is an atomic rename, so whenever the pending file's
+ * `ENTRY_DELETE` is observed the tombstone already exists. This watcher reads that signal:
  * - the file now exists in `consumed/`  → an agent hook consumed it → [CommentStore.markProcessed]
- *   flips the thread to *Seen* (and the tombstone is deleted — retention); vs
+ *   flips the thread to *Seen*. The tombstone is **left in place** — it is the consumed comment itself
+ *   (so a future "restore" action can revive it) and every other live client (e.g. heview-vscode) must
+ *   observe it to reach the same verdict; an eager per-client delete would starve a slower peer of the
+ *   signal. Tombstones are reclaimed by age instead ([sweepConsumed], [TOMBSTONE_RETENTION]).
  * - the file simply vanished           → a peer/user delete (or our own [CommentStore.delete] already
  *   applied) → [CommentStore.evict] drops it. Both store calls are idempotent, so a self-delete the
  *   watcher later observes is a no-op — no suppression set is needed (the `consumed/` move replaces it).
  *
  * Threading: a single daemon thread owns the blocking [WatchService]; every store mutation hops to the
- * EDT via [runEdt] (the store is EDT-confined). Retention/​sweep deletes run on the watch thread (it is
- * already off-EDT). All inputs are injectable so the classification + filesystem effects unit-test
- * against temp dirs with synchronous dispatch; the live [WatchService] glue is dogfooded in `runIde`.
+ * EDT via [runEdt] (the store is EDT-confined). Sweep deletes run on the watch thread (already off-EDT).
+ * All inputs are injectable so the classification + filesystem effects unit-test against temp dirs with
+ * synchronous dispatch; the live [WatchService] glue is dogfooded in `runIde`.
  *
- * Scope note: this is the consumption slice. The full multi-client pool watcher (CREATE/MODIFY, a
- * shared tombstone contract with heview-vscode) is a later increment — see plan.html §5 "Multi-client".
+ * Scope note: this is the consumption slice + the shared multi-client tombstone contract (consume =
+ * atomic move; Seen = tombstone present for an in-index uuid; delete = vanished with no tombstone;
+ * retention = age-based sweep). Full CREATE/MODIFY sync between live clients is a later increment —
+ * see plan.html §5 "Multi-client sync".
  */
 @Service(Service.Level.APP)
 internal class CommentsPoolWatcher(
@@ -81,9 +89,8 @@ internal class CommentsPoolWatcher(
             LOG.warn("heview: cannot create the comments dir to watch $commentsDir", e)
             return
         }
-        // Clear tombstones from consumption that happened while no IDE was running — those comments
-        // never entered this session's index (their files left comments/ before hydrate), so there is
-        // nothing to mark Seen; just keep consumed/ from growing unbounded.
+        // Reclaim tombstones older than the retention window so consumed/ can't grow without bound,
+        // while leaving recent ones for live peers + a future restore action.
         sweepConsumed()
         val ws = try {
             FileSystems.getDefault().newWatchService().also {
@@ -133,19 +140,33 @@ internal class CommentsPoolWatcher(
     fun onCommentFileDeleted(uuid: String) {
         val consumed = consumedDir.resolve("$uuid.json")
         if (Files.exists(consumed)) {
+            // Consumed: mark Seen, but LEAVE the tombstone — other live clients each need to observe it,
+            // and it is the consumed comment itself (a future restore reads it back). Age-swept, never
+            // eager-deleted (an eager delete would starve a slower peer of the signal).
             runEdt { store.markProcessed(uuid) }
-            deleteQuietly(consumed) // retention: the "consumed" signal has now been read
         } else {
             runEdt { store.evict(uuid) }
         }
     }
 
-    /** Delete leftover `consumed/` tombstones. Visible for direct unit testing. */
+    /**
+     * Reclaim consumed tombstones older than [TOMBSTONE_RETENTION]; recent ones are kept so every live
+     * client can read the consumption signal and a consumed comment stays restorable. Bounds the growth
+     * of consumed/. Visible for direct unit testing.
+     */
     fun sweepConsumed() {
         if (!Files.isDirectory(consumedDir)) return
+        val cutoff = Instant.now().minus(TOMBSTONE_RETENTION)
         try {
             Files.newDirectoryStream(consumedDir, "*.json").use { stream ->
-                stream.forEach { deleteQuietly(it) }
+                stream.forEach { path ->
+                    val mtime = try {
+                        Files.getLastModifiedTime(path).toInstant()
+                    } catch (e: IOException) {
+                        return@forEach // can't stat it — leave it rather than risk dropping a fresh peer signal
+                    }
+                    if (mtime.isBefore(cutoff)) deleteQuietly(path)
+                }
             }
         } catch (e: IOException) {
             LOG.warn("heview: failed to sweep the consumed dir $consumedDir", e)
@@ -171,5 +192,9 @@ internal class CommentsPoolWatcher(
 
     companion object {
         private val LOG = logger<CommentsPoolWatcher>()
+
+        // A consumed tombstone lingers this long so every live client (and a future "restore" action)
+        // can read it; the startup sweep reclaims older ones. Not eager-deleted (that starves peers).
+        private val TOMBSTONE_RETENTION: Duration = Duration.ofDays(14)
     }
 }

@@ -11,6 +11,9 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
+import java.time.Duration
+import java.time.Instant
 
 /**
  * Deterministic coverage for the consumption watcher's classification + filesystem effects, driven by
@@ -31,7 +34,7 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `a comment moved into consumed is marked Seen and its tombstone is reclaimed`(@TempDir dir: Path) {
+    fun `a comment moved into consumed is marked Seen and its tombstone is left for peers`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val store = store(comments)
         store.save(sampleComment(uuid = "u1")) // pending, present in the index
@@ -42,7 +45,9 @@ class CommentsPoolWatcherTest {
         watcher(comments, store).onCommentFileDeleted("u1")
 
         assertEquals(CommentStatus.PROCESSED, store.get("u1")?.status) // Seen (still indexed)
-        assertFalse(Files.exists(comments.resolve("consumed/u1.json"))) // retention: tombstone deleted
+        // NOT eager-deleted: other live clients must observe the same tombstone (and it's the restore
+        // source). It is reclaimed later by the age-based sweep, not here.
+        assertTrue(Files.exists(comments.resolve("consumed/u1.json")))
     }
 
     @Test
@@ -69,18 +74,21 @@ class CommentsPoolWatcherTest {
     }
 
     @Test
-    fun `sweepConsumed deletes stale json tombstones and leaves other files alone`(@TempDir dir: Path) {
+    fun `sweepConsumed reclaims only tombstones older than the retention window`(@TempDir dir: Path) {
         val comments = Files.createDirectories(dir.resolve("comments"))
         val consumed = Files.createDirectories(comments.resolve("consumed"))
-        Files.writeString(consumed.resolve("a.json"), "{}")
-        Files.writeString(consumed.resolve("b.json"), "{}")
-        Files.writeString(consumed.resolve("keep.txt"), "x")
+        Files.writeString(consumed.resolve("old.json"), "{}")
+        Files.writeString(consumed.resolve("fresh.json"), "{}")
+        Files.writeString(consumed.resolve("old.txt"), "x") // non-json ignored even when old
+        val ancient = FileTime.from(Instant.now().minus(Duration.ofDays(20))) // past the 14-day window
+        Files.setLastModifiedTime(consumed.resolve("old.json"), ancient)
+        Files.setLastModifiedTime(consumed.resolve("old.txt"), ancient)
 
         watcher(comments, store(comments)).sweepConsumed()
 
-        assertFalse(Files.exists(consumed.resolve("a.json")))
-        assertFalse(Files.exists(consumed.resolve("b.json")))
-        assertTrue(Files.exists(consumed.resolve("keep.txt")))
+        assertFalse(Files.exists(consumed.resolve("old.json"))) // aged out → reclaimed
+        assertTrue(Files.exists(consumed.resolve("fresh.json"))) // recent → kept for peers/restore
+        assertTrue(Files.exists(consumed.resolve("old.txt"))) // non-json left alone
     }
 
     @Test
