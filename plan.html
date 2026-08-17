@@ -258,7 +258,7 @@
 
 <p class="muted"><b>v1 field simplifications (sanctioned):</b> <code>side</code> is always <code>"file"</code> (diff-side detection deferred); <code>logical_abs_path == abs_path</code> (plan remap deferred); <code>workspace</code> is the IntelliJ project base path, a v1 approximation of reviewa's git-repo root (hooks match by <code>abs_path</code> prefix, so injection is unaffected). Persistence is <b>async/off-EDT</b> (the platform forbids blocking I/O on the EDT) and atomic; <code>line_content</code> is read from the editor buffer at submit.</p>
 
-<h3>State machine (UI-side, preserved)</h3>
+<h3>State machine (UI-side, preserved) — <span class="pill v1">built</span></h3>
 <pre><code>          create                     hook / copy consumes file
  (none) ─────────▶ PENDING ───────────────────────────────▶ PROCESSED ("Seen")
                      ▲  │ edit / re-pend                          │
@@ -269,6 +269,20 @@
    • A thread is "Pending comments" if any comment is actionable, else "All comments seen".
    • Deleting the last actionable comment removes the file from disk.
    • created_at bumps on reply, edit, and re-pend (drives injection ordering).</code></pre>
+<p><b>Built (reply / edit / re-pend).</b> <code>CommentStore.reply/edit/repend</code> each revive the
+comment to <code>PENDING</code>, bump <code>created_at</code>, and re-persist it into <code>comments/</code>.
+heview's single-comment-per-card model maps reviewa's per-thread <code>content = actionableTexts.join("\n\n")</code>
+onto one string: <b>reply</b> appends after a blank line, <b>edit</b> replaces, <b>re-pend</b> leaves the
+text and just revives. <code>REPENDING</code> stays UI-only — it persists as <code>pending</code> (no new
+on-disk enum). Because editing/replying a Seen comment auto-revives it (reviewa parity), any revive first
+<b>removes the <code>processed/</code> tombstone</b>: a tombstone present for an in-index uuid is the
+consumption watcher's "Seen" signal, so leaving it would let the next catch-up reconcile flip the comment
+straight back. This revive path is also the <b>"restore a consumed comment"</b> mechanism (the tombstone is
+the full comment, so re-pend writes it back to the actionable pool). The card matches reviewa's UI — a
+header action row of icon buttons (delete / edit, and a re-pend "clock" only on a Seen card) plus a
+persistent "Leave a comment" reply box. <i>Still Later: multi-comment threads with independent per-reply
+status (heview keeps one status per card in v1); the thread-aggregate label and delete-last-actionable
+file removal follow once threads hold more than one comment.</i></p>
 
 <h3>Session lifetime — a deliberate divergence: heview comments are durable</h3>
 <div class="callout warn">
