@@ -16,7 +16,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 97 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 120 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -47,7 +47,10 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   `hydrate()` loads the pool from disk once (read on `runIo`, apply on `runEdt` — both injectable → sync in
   tests); `forAbsPath(path)` returns a file's comments (normalized-path match); `addChangeListener` returns a
   `Disposable` to unregister. `markProcessed(uuid)` (→ Seen) / `evict(uuid)` (peer/user delete) mutate the
-  index **in memory only, no disk write** — for the watcher; both idempotent.
+  index **in memory only, no disk write** — for the watcher; both idempotent. `whenHydrated(cb)` runs `cb`
+  once after hydrate applies (a one-shot for the watcher's post-hydrate reconcile — not an every-change
+  listener). `isPersisted(uuid)` (a `persisted` set: write-succeeded or hydrated, cleared on evict/delete/
+  markProcessed) lets the watcher evict only a comment that was on disk, never one whose create-save failed.
 - `ui/InlayCardHost.kt` — THE seam isolating the experimental inlay API (the ONE swap point).
 - `ui/ComponentInlayCardHost.kt` — backs it via `Editor.addComponentInlay(offset, InlayProperties().relatesToPrecedingText(true), card, FIT_VIEWPORT_WIDTH)`, wrapped in `EditorScrollingPositionKeeper`. Verified present on 2024.2.
 - `ui/CommentThread.kt` — the inlay card. Two entry points: `startCompose()` (an `EditorTextField`, so it owns
@@ -71,17 +74,22 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   follow a symlink to its real target. `installAll()` returns a success Boolean (per-agent isolated) so the
   startup once-guard can re-arm and retry. All paths/`PATH`/warn injectable → unit-tested against temp dirs.
   Bundled injector scripts (`src/main/resources/hook-scripts/{claude-code,codex}/`) match by directory
-  boundary + normalize paths, are UTF-8 + null-tolerant, and consume by an atomic **CLAIM** — move-then-emit
-  into `comments/processed/` (single-use; two agents can't double-inject), NOT `unlink` — the signal the watcher
-  reads; the moved tombstone is then rewritten to `status:"processed"` (JS/Python byte-identical) so it reads back as Seen.
+  boundary + normalize paths, are UTF-8 + null-tolerant, format each comment defensively (per-comment guard),
+  and consume by an atomic **CLAIM** — move-then-emit into `comments/processed/` (single-use; two agents can't
+  double-inject), NOT `unlink` — the signal the watcher reads. Then they stamp the tombstone's mtime to
+  consumption time and rewrite it to `status:"processed"` (JS/Python byte-identical) via an **exclusive-create**
+  temp so it reads back as Seen. Both refuse a **symlinked** `processed/` (never write outside heview).
 - `watch/CommentsPoolWatcher.kt` — Phase 3 application `@Service` (`Disposable`): a daemon NIO WatchService on
-  `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `processed/` means an agent hook consumed
-  it → `CommentStore.markProcessed` (Seen); a bare vanish → `evict` (peer/user delete). The tombstone is the
-  consumed comment itself and is **left in place** (a slower live client, e.g. heview-vscode, must observe it;
-  it's also the restore source) — reclaimed by an **age-based** startup `sweepProcessed()` (drop >14 days), never
-  an eager per-client delete. Store calls hop to the EDT. The `processed/` move replaces reviewa's suppression
-  set (idempotent evict absorbs our own `delete`). Classification + FS effects are unit-tested directly (temp
-  dirs, sync dispatch); the live WatchService thread is dogfood-only.
+  `comments/`. On a `<uuid>.json` `ENTRY_DELETE`, a matching file in `processed/` → `CommentStore.markProcessed`
+  (Seen); a bare vanish → `evict` (peer/user delete); an atomic-replace (pool file still present) is ignored.
+  A one-shot `reconcile()` (via `store.whenHydrated`, after each watch (re)registration, and on OVERFLOW)
+  catches missed events: it marks Seen a consumed comment, and — only on OVERFLOW, gated by
+  `store.isPersisted` snapshotted on the EDT — evicts a persisted-then-vanished comment (the register/rebuild
+  path never evicts, so a rebuild that recreates the dir empty can't mass-evict). The tombstone is left in
+  place (peers + restore) and reclaimed by an **age-based** `sweepProcessed()` (drop `*.json`/`*.json.tmp`
+  >14 days; refuses a symlinked dir). The daemon **self-heals** (rebuilds the watch if the dir is
+  removed/replaced, bounded retries) and drops queued EDT hops once disposed. Classification + FS effects are
+  unit-tested directly; the live WatchService loop is dogfood-only.
 - `HeviewStartupActivity.kt` — `ProjectActivity`; dispatches `CommentInlayManager.init()` to the EDT, and on an
   **application-pooled** thread (off-EDT) starts the `CommentsPoolWatcher` (idempotent) and runs
   `HookInstaller.installAll()` **once per app** — both **skipped in unit-test/headless mode** so tests never
@@ -138,6 +146,18 @@ context-blind reviewer will keep raising them:
   age-based sweep (>14 days), NEVER an eager per-client delete** (that would starve a slower peer). The
   tombstone IS the consumed comment (kept for a future UI restore). Still Later: CREATE/MODIFY sync so a
   comment created/edited in one already-open client appears in another without a restart.
+- **Phase-3 `/aeview-loop` outcomes (settled; don't re-litigate — the panel re-raises them):**
+  (a) reconcile is a one-shot catch-up (`whenHydrated` + post-register + OVERFLOW), NOT an every-change
+  listener; it marks Seen always, and **evicts a lost bare-delete only on OVERFLOW** (dir intact), gated by
+  `isPersisted` — the register/rebuild path never evicts, so a rebuild that recreates the pool dir empty
+  can't mass-evict; (b) injectors do an **atomic** tombstone rewrite (temp + exclusive-create + rename),
+  **refuse a symlinked `processed/`**, and **stamp the tombstone mtime** to consumption time; (c) accepted
+  tradeoff: **single-use over at-least-once delivery** — a hook killed between the claim (move) and the
+  stdout write marks a comment Seen the agent never saw (emit-first would reopen double-inject); (d) the
+  live `WatchService` loop is **dogfood-only** (the classification/effect logic is all unit-tested); (e)
+  the read-to-claim "stale snapshot" race is a **non-issue in v1** (no edit path → content is immutable
+  after create). Reviewer coverage note: some cycles had ~6/18 reviewers fail (harness/token infra), not
+  findings.
 </settled-decisions>
 
 <review>
@@ -153,24 +173,24 @@ Always filter findings premised on unbuilt-but-planned features or already-settl
 
 <status>
 Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** increment + **Phase 2 — agent
-hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE. Phases 1–2 were each dogfooded
-and taken through `/aeview-loop` to convergence; the end-to-end loop is **proven live** (a comment left in
-the IDE is injected into Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block and its
-`<uuid>.json` is consumed). Gate green: **97 tests** (JUnit5 unit + a JUnit3/4 `BasePlatformTestCase` +
-node/python behavioral hook-script tests), `buildPlugin` clean.
+hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
+through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
+Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
+`processed/`, and the card flips Pending→Seen). Gate green: **120 tests** (JUnit5 unit + a JUnit3/4
+`BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
-The maintainer normally runs pushes — only push when asked. **The Phase-3 commits (`e2a8b64`..`04e29c7`)
-are LOCAL / unpushed.**
+The maintainer normally runs pushes — only push when asked. **All Phase-3 commits (`e2a8b64`..HEAD,
+including the full `/aeview-loop` review-and-fix rounds) are LOCAL / unpushed.**
 
-Phase 3 just shipped (see `implementation_log.local.md` "Phase 3" + plan §4/§5/§8/§9): injectors CLAIM a
-consumed comment by an atomic move into `comments/processed/` (single-use); `CommentsPoolWatcher` flips a
-thread *Seen* on that signal vs `evict`s on a bare vanish; `CommentThread` shows a Pending/Seen chip and
-relabels in place. **Immediate next actions for this increment: (1) run `/aeview-loop`
-(`range:8a69734..HEAD`) — Phase 3 touches concurrency + a background thread + FS races, so expect real
-findings; (2) hand to the maintainer to dogfood in `runIde`.** THEN pick the next increment: remaining
-Phase 3 (comment tool window, status-bar pending-count widget, copy actions, settings page incl. Seen
-auto-collapse, scoped project-close cleanup) OR the Phase 1 reply/edit/re-pend→processed state machine.
-Full deferred backlog (durable-anchor line-number writeback, external-reload listener, `CommentJson.decode`
-validation, multi-client CREATE/MODIFY sync, GitHub identity, …) is in `implementation_log.local.md`.
+Phase 3's consumption watcher shipped AND went through a full **5-cycle `/aeview-loop`** (findings
+17→17→13→11→9; the real bugs each cycle shrank to edges of the prior cycle's own fixes — EDT/lifecycle,
+then the reconcile/whenHydrated wiring, then safe-evict edges). Everything the loop surfaced is either
+fixed (see the log's Phase-3 aeview section) or a recorded deferral / accepted tradeoff (see
+`<settled-decisions>`). **Next increment: pick one — remaining Phase 3 (comment tool window, status-bar
+pending-count widget, copy actions, settings page incl. Seen auto-collapse, scoped project-close cleanup)
+OR the Phase 1 reply/edit/re-pend→processed state machine (also the "restore a consumed comment" UI the
+tombstone was built for).** Full deferred backlog (durable-anchor line-number writeback, external-reload
+listener, `CommentJson.decode` validation, multi-client CREATE/MODIFY sync, GitHub identity, …) is in
+`implementation_log.local.md`.
 </status>

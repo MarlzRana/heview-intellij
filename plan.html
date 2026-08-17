@@ -479,7 +479,7 @@ Your comment here</code></pre>
   <div class="card">
     <h3>Watch &amp; surfaces</h3>
     <ul>
-      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice + shared tombstone contract): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>processed/</code> means an agent hook consumed it (→ <code>markProcessed</code>; the tombstone is left for peers + restore, age-swept after 14 days) vs a bare vanish → <code>evict</code>. Full CREATE/MODIFY multi-client sync is <span class="pill later">Later</span>.</li>
+      <li><code>CommentsPoolWatcher</code> — NIO WatchService on the pool → mark Seen / evict. <b>Built</b> (consumption slice + shared tombstone contract, hardened through a 5-cycle <code>/aeview-loop</code>): on a <code>comments/*.json</code> <code>ENTRY_DELETE</code>, a matching file in <code>processed/</code> means an agent hook consumed it (→ <code>markProcessed</code>; the tombstone is left for peers + restore, age-swept after 14 days) vs a bare vanish → <code>evict</code>. A one-shot <code>reconcile</code> (after startup hydrate + on OVERFLOW) catches missed events (marks Seen; safe-evicts only on OVERFLOW, gated on a persisted-uuid set); the daemon self-heals if the pool dir is removed at runtime. Full CREATE/MODIFY multi-client sync is <span class="pill later">Later</span>.</li>
       <li><code>HeviewToolWindowFactory</code> + tree model.</li>
       <li><code>PendingCountWidget</code> (status bar).</li>
       <li><code>HeviewSettings</code> + <code>HeviewConfigurable</code>.</li>
