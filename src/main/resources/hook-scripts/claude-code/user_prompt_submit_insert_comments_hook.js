@@ -106,9 +106,17 @@ async function main() {
 
 	const parts = [];
 	for (const { comment, filePath, file } of matchedComments) {
-		const displayPath = isUnderCwd(comment.abs_path, cwd) ? path.relative(cwd, comment.abs_path) : comment.abs_path;
-		const formatted = formatLineContent(comment);
-		const block = 'In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content;
+		// Format defensively (parity with the Python injector): a matched-but-schema-incomplete comment
+		// must be skipped BEFORE it is claimed, so one bad file can't abort the batch and leave an
+		// earlier, already-claimed comment consumed-but-not-injected.
+		let block;
+		try {
+			const displayPath = isUnderCwd(comment.abs_path, cwd) ? path.relative(cwd, comment.abs_path) : comment.abs_path;
+			const formatted = formatLineContent(comment);
+			block = 'In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content;
+		} catch {
+			continue;
+		}
 		// Claim after formatting, emit only if we won it: a formatting error can't leave a comment
 		// claimed-but-not-injected, and two concurrent agents never inject the same comment.
 		// Tradeoff (accepted): the claim (move) precedes the single stdout write below, so a hard crash

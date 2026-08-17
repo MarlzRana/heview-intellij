@@ -11,6 +11,9 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
+import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 
 /**
@@ -198,8 +201,12 @@ class HookScriptTest {
         for ((name, cmd) in agents) {
             val home = setupHome(dir.resolve("rw-$name"))
             seed(home, "u1", "/tmp/proj/f.kt", 1, "x", "note")
-            // Force the status-rewrite's write-to-temp to fail by pre-creating the temp path AS A DIR.
-            // The best-effort catch must leave the moved original (a valid pending comment) intact.
+            // Age the pending file past the retention window, then force the status-rewrite's write-to-temp
+            // to fail by pre-creating the temp path AS A DIR.
+            Files.setLastModifiedTime(
+                home.resolve(".heview/comments/u1.json"),
+                FileTime.from(Instant.now().minus(Duration.ofDays(20))),
+            )
             Files.createDirectories(home.resolve(".heview/comments/processed/u1.json.tmp"))
 
             val out = additionalContext(run(cmd(home), home, "/tmp/proj"))
@@ -207,6 +214,10 @@ class HookScriptTest {
             assertFalse(pending(home, "u1")) // claimed out of the pending pool
             assertTrue(inProcessed(home, "u1")) // tombstone present…
             assertEquals("pending", processedStatus(home, "u1")) // …the intact original (rewrite didn't run)
+            // …and the claim stamped its mtime to consumption time (even though the rewrite failed), so the
+            // 14-day retention sweep won't reclaim it early. Rename alone would have kept the 20-day-old mtime.
+            val tombMtime = Files.getLastModifiedTime(home.resolve(".heview/comments/processed/u1.json")).toInstant()
+            assertTrue(tombMtime.isAfter(Instant.now().minus(Duration.ofMinutes(5))))
         }
     }
 
