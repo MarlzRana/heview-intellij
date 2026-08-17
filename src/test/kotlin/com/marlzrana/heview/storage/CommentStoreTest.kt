@@ -416,4 +416,27 @@ class CommentStoreTest {
 
         assertEquals(listOf("root1"), store.all().map { it.uuid })
     }
+
+    @Test
+    fun `whenHydrated fires the callback once hydrate applies`(@TempDir dir: Path) {
+        val store = store(dir)
+        var ran = 0
+        store.whenHydrated { ran++ }
+        assertEquals(0, ran) // not hydrated yet
+
+        store.hydrate()
+
+        assertEquals(1, ran) // fired once the snapshot applied
+    }
+
+    @Test
+    fun `whenHydrated fires immediately when hydrate has already applied`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.hydrate()
+        var ran = 0
+
+        store.whenHydrated { ran++ }
+
+        assertEquals(1, ran)
+    }
 }

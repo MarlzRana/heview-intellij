@@ -38,10 +38,24 @@ class CommentStore(
     private val listeners = mutableListOf<() -> Unit>()
     private val hydrated = AtomicBoolean(false)
 
+    // Fired on the EDT once hydrate() has applied its snapshot — lets the consumption watcher run a
+    // one-shot catch-up reconcile without subscribing to (and re-scanning on) every store change.
+    private var hydrationApplied = false
+    private val onHydrated = mutableListOf<() -> Unit>()
+
     /** Register a change listener; dispose the returned handle to unregister (e.g. on project close). */
     fun addChangeListener(listener: () -> Unit): Disposable {
         listeners += listener
         return Disposable { listeners.remove(listener) }
+    }
+
+    /**
+     * Run [callback] on the EDT once [hydrate] has applied its snapshot — immediately if it already has.
+     * EDT-only. Used by the consumption watcher to reconcile the pool exactly once after the startup load
+     * (a consume that raced hydrate fired its watch event before the record was indexed).
+     */
+    fun whenHydrated(callback: () -> Unit) {
+        if (hydrationApplied) callback() else onHydrated += callback
     }
 
     // Iterate a copy so a listener may unregister itself (or another) during the callback.
@@ -76,6 +90,9 @@ class CommentStore(
                     if (index.putIfAbsent(comment.uuid, comment) == null) changed = true
                 }
                 if (changed) fireChanged()
+                hydrationApplied = true
+                onHydrated.toList().forEach { it() }
+                onHydrated.clear()
             }
         }
     }
