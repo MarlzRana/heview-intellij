@@ -35,15 +35,22 @@ def claim(comment, filepath, filename):
         os.replace(filepath, dest)
     except Exception:
         return False
+    # Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
+    # setPrettyPrinting); write to a temp then atomically replace so a crash/ENOSPC can't leave a
+    # partial file — the moved original (a valid pending comment) survives instead. indent +
+    # ensure_ascii=False match the Node injector byte-for-byte.
+    tmp = dest + ".tmp"
     try:
-        # Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
-        # setPrettyPrinting); indent + ensure_ascii=False match the Node injector byte-for-byte.
-        with open(dest, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(
                 {**comment, "status": "processed"}, fh, indent=2, ensure_ascii=False
             )
+        os.replace(tmp, dest)
     except Exception:
-        pass
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
     return True
 
 

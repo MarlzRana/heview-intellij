@@ -73,6 +73,22 @@ class HookScriptTest {
         return out
     }
 
+    /** Start a hook and push its stdin, WITHOUT reading stdout — so two can be started before either reads. */
+    private fun startHook(cmd: List<String>, home: Path, cwd: String): Process {
+        val p = ProcessBuilder(cmd)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .also { it.environment()["HOME"] = home.toString() }
+            .start()
+        p.outputStream.bufferedWriter().use { it.write("""{"cwd":"$cwd"}""") }
+        return p
+    }
+
+    private fun awaitOutput(p: Process): String {
+        val out = p.inputStream.readBytes().decodeToString()
+        p.waitFor(30, TimeUnit.SECONDS)
+        return out
+    }
+
     private fun pending(home: Path, uuid: String) = Files.exists(home.resolve(".heview/comments/$uuid.json"))
 
     private fun inProcessed(home: Path, uuid: String) =
@@ -135,6 +151,39 @@ class HookScriptTest {
             // second UserPromptSubmit finds nothing to inject — single-use holds across invocations.
             assertNull(additionalContext(run(cmd(home), home, "/tmp/proj")))
         }
+    }
+
+    @Test
+    fun `two injectors racing one comment - exactly one claims and emits`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val home = setupHome(dir)
+        seed(home, "u1", "/tmp/proj/f.kt", 1, "x", "race") // no intended_consumer → both agents match
+        // Start both before reading either so the claim (atomic rename) is genuinely contended.
+        val pj = startHook(claudeCmd(home), home, "/tmp/proj")
+        val pp = startHook(codexCmd(home), home, "/tmp/proj")
+        val outs = listOf(awaitOutput(pj), awaitOutput(pp))
+
+        // The rename is the single-use claim: exactly one process wins and emits; the loser skips.
+        assertEquals(1, outs.count { additionalContext(it) != null })
+        assertFalse(pending(home, "u1")) // consumed out of the pending pool
+        assertTrue(inProcessed(home, "u1")) // exactly one tombstone left
+    }
+
+    @Test
+    fun `non-ASCII content stays byte-identical between the Node and Python injectors`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        val content = "café ★ λ 日本語" // exercises ensure_ascii=False vs JSON.stringify (both keep raw UTF-8)
+        val h1 = setupHome(dir.resolve("na-claude"))
+        seed(h1, "u1", "/tmp/proj/f.kt", 1, "x", content)
+        val claudeOut = additionalContext(run(claudeCmd(h1), h1, "/tmp/proj"))
+        val h2 = setupHome(dir.resolve("na-codex"))
+        seed(h2, "u1", "/tmp/proj/f.kt", 1, "x", content)
+        val codexOut = additionalContext(run(codexCmd(h2), h2, "/tmp/proj"))
+
+        assertEquals(claudeOut, codexOut) // injected block identical (raw UTF-8, not \uXXXX)
+        assertTrue(claudeOut!!.contains(content))
+        assertEquals(processedRaw(h1, "u1"), processedRaw(h2, "u1")) // tombstone identical
+        assertTrue(processedRaw(h1, "u1").contains(content)) // stored raw, not escaped
     }
 
     @Test

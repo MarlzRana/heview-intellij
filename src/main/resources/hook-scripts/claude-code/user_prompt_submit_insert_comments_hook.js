@@ -36,11 +36,16 @@ function claim(comment, filePath, filename) {
 	} catch {
 		return false;
 	}
+	// Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
+	// setPrettyPrinting); write to a temp then atomically replace so a crash/ENOSPC can't leave a
+	// partial file — the moved original (a valid pending comment) survives instead. Matches Python.
+	const tmp = dest + '.tmp';
 	try {
-		// Pretty-print (2-space indent) so the tombstone reads like an IDE-written comment (Gson
-		// setPrettyPrinting); matches the Python injector byte-for-byte.
-		fs.writeFileSync(dest, JSON.stringify({ ...comment, status: 'processed' }, null, 2));
-	} catch {}
+		fs.writeFileSync(tmp, JSON.stringify({ ...comment, status: 'processed' }, null, 2));
+		fs.renameSync(tmp, dest);
+	} catch {
+		try { fs.unlinkSync(tmp); } catch {}
+	}
 	return true;
 }
 
