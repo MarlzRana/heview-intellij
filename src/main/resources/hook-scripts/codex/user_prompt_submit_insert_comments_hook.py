@@ -111,6 +111,9 @@ def main():
         except Exception:
             continue
         # Claim after formatting; emit only what we won (see claim()).
+        # Tradeoff (accepted): the claim (move) precedes the single stdout write below, so a hard crash
+        # in between marks a comment consumed that the agent never received — we prioritize single-use
+        # over at-least-once delivery. Reordering to emit-first would reopen the double-inject race.
         if not claim(comment, filepath, filename):
             continue
         parts.append(block)

@@ -73,15 +73,12 @@ class HookScriptTest {
         return out
     }
 
-    /** Start a hook and push its stdin, WITHOUT reading stdout — so two can be started before either reads. */
-    private fun startHook(cmd: List<String>, home: Path, cwd: String): Process {
-        val p = ProcessBuilder(cmd)
+    /** Start a hook WITHOUT feeding stdin, so several can be started (each blocked on stdin) before release. */
+    private fun startHook(cmd: List<String>, home: Path): Process =
+        ProcessBuilder(cmd)
             .redirectError(ProcessBuilder.Redirect.DISCARD)
             .also { it.environment()["HOME"] = home.toString() }
             .start()
-        p.outputStream.bufferedWriter().use { it.write("""{"cwd":"$cwd"}""") }
-        return p
-    }
 
     private fun awaitOutput(p: Process): String {
         val out = p.inputStream.readBytes().decodeToString()
@@ -158,9 +155,15 @@ class HookScriptTest {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val home = setupHome(dir)
         seed(home, "u1", "/tmp/proj/f.kt", 1, "x", "race") // no intended_consumer → both agents match
-        // Start both before reading either so the claim (atomic rename) is genuinely contended.
-        val pj = startHook(claudeCmd(home), home, "/tmp/proj")
-        val pp = startHook(codexCmd(home), home, "/tmp/proj")
+        // Each hook blocks reading stdin to EOF before it scans, so: start both, then close both stdins
+        // back-to-back — a barrier that releases them together and makes the claim genuinely contended.
+        val pj = startHook(claudeCmd(home), home)
+        val pp = startHook(codexCmd(home), home)
+        val wj = pj.outputStream.bufferedWriter()
+        val wp = pp.outputStream.bufferedWriter()
+        wj.write("""{"cwd":"/tmp/proj"}"""); wp.write("""{"cwd":"/tmp/proj"}""")
+        wj.flush(); wp.flush()
+        wj.close(); wp.close() // release both ~simultaneously
         val outs = listOf(awaitOutput(pj), awaitOutput(pp))
 
         // The rename is the single-use claim: exactly one process wins and emits; the loser skips.

@@ -103,6 +103,9 @@ async function main() {
 		const block = 'In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content;
 		// Claim after formatting, emit only if we won it: a formatting error can't leave a comment
 		// claimed-but-not-injected, and two concurrent agents never inject the same comment.
+		// Tradeoff (accepted): the claim (move) precedes the single stdout write below, so a hard crash
+		// in between marks a comment consumed that the agent never received — we prioritize single-use
+		// over at-least-once delivery. Reordering to emit-first would reopen the double-inject race.
 		if (!claim(comment, filePath, file)) continue;
 		parts.push(block);
 	}
