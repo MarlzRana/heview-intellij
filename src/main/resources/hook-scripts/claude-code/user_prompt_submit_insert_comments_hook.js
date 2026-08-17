@@ -26,14 +26,20 @@ function isUnderCwd(p, cwd) {
 // claim: renameSync is atomic on the same filesystem, so of two concurrent agents only the one that
 // wins the rename emits the comment — the loser's rename throws (ENOENT) and it skips. Moving (rather
 // than unlinking) also leaves the intent signal heview's watcher reads to mark the thread "Seen".
-function claim(filePath, filename) {
+// Having won the claim, rewrite the tombstone with status:"processed" so the consumed file reads back as
+// Seen (best-effort — the move already consumed it, so a failed rewrite just leaves it as pending).
+function claim(comment, filePath, filename) {
+	const dest = path.join(CONSUMED_DIR, filename);
 	try {
 		fs.mkdirSync(CONSUMED_DIR, { recursive: true });
-		fs.renameSync(filePath, path.join(CONSUMED_DIR, filename));
-		return true;
+		fs.renameSync(filePath, dest);
 	} catch {
 		return false;
 	}
+	try {
+		fs.writeFileSync(dest, JSON.stringify({ ...comment, status: 'processed' }));
+	} catch {}
+	return true;
 }
 
 async function main() {
@@ -90,7 +96,7 @@ async function main() {
 		const block = 'In `' + displayPath + '` at line ' + comment.line_number + ':\n```\n' + formatted + '\n```\n' + comment.content;
 		// Claim after formatting, emit only if we won it: a formatting error can't leave a comment
 		// claimed-but-not-injected, and two concurrent agents never inject the same comment.
-		if (!claim(filePath, file)) continue;
+		if (!claim(comment, filePath, file)) continue;
 		parts.push(block);
 	}
 

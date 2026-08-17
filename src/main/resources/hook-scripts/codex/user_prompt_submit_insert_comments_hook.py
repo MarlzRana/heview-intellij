@@ -23,17 +23,25 @@ def is_under_cwd(p, cwd):
     return np == base or np.startswith(base + os.sep)
 
 
-def claim(filepath, filename):
+def claim(comment, filepath, filename):
     # Atomically move the file into comments/consumed/ — the single-use claim. os.replace is atomic on
     # the same filesystem, so of two concurrent agents only the one that wins the move emits the comment;
     # the loser (file already gone) raises and returns False. Moving rather than unlinking also leaves the
-    # intent signal heview's watcher reads to mark the thread "Seen".
+    # intent signal heview's watcher reads to mark the thread "Seen". Having won the claim, rewrite the
+    # tombstone with status "processed" so the consumed file reads back as Seen (best-effort; compact
+    # separators match the Node injector's JSON.stringify).
+    dest = os.path.join(CONSUMED_DIR, filename)
     try:
         os.makedirs(CONSUMED_DIR, exist_ok=True)
-        os.replace(filepath, os.path.join(CONSUMED_DIR, filename))
-        return True
+        os.replace(filepath, dest)
     except Exception:
         return False
+    try:
+        with open(dest, "w", encoding="utf-8") as fh:
+            json.dump({**comment, "status": "processed"}, fh, separators=(",", ":"))
+    except Exception:
+        pass
+    return True
 
 
 def main():
@@ -93,7 +101,7 @@ def main():
         except Exception:
             continue
         # Claim after formatting; emit only what we won (see claim()).
-        if not claim(filepath, filename):
+        if not claim(comment, filepath, filename):
             continue
         parts.append(block)
 

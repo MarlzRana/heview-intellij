@@ -78,6 +78,13 @@ class HookScriptTest {
     private fun consumed(home: Path, uuid: String) =
         Files.exists(home.resolve(".heview/comments/consumed/$uuid.json"))
 
+    /** The `status` field inside the consumed tombstone (the hook rewrites it to "processed"). */
+    private fun consumedStatus(home: Path, uuid: String): String? {
+        val f = home.resolve(".heview/comments/consumed/$uuid.json")
+        if (!Files.exists(f)) return null
+        return JsonParser.parseString(Files.readString(f)).asJsonObject.get("status")?.asString
+    }
+
     private fun additionalContext(stdout: String): String? {
         if (stdout.isBlank()) return null
         return JsonParser.parseString(stdout).asJsonObject
@@ -96,6 +103,7 @@ class HookScriptTest {
         assertFalse(claudeOut!!.contains("\\`")) // clean backticks, no literal backslash
         assertFalse(pending(h1, "c1")) // left the pending pool…
         assertTrue(consumed(h1, "c1")) // …by moving into consumed/ (single-use claim)
+        assertEquals("processed", consumedStatus(h1, "c1")) // tombstone rewritten to Seen
 
         val h2 = setupHome(dir.resolve("b"))
         seed(h2, "c1", "/tmp/proj/sub/Foo.kt", 3, "val x = 1", "make it const")
@@ -103,6 +111,7 @@ class HookScriptTest {
         assertEquals(expected, codexOut) // byte-identical to Claude
         assertFalse(pending(h2, "c1"))
         assertTrue(consumed(h2, "c1"))
+        assertEquals("processed", consumedStatus(h2, "c1"))
     }
 
     @Test
