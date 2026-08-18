@@ -254,6 +254,45 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(1, host.live)
     }
 
+    fun testFileContentReloadRecreatesCardsTheReloadDisposed() {
+        val (e1, path) = openLocalEditor("RL.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "please fix")
+        store.save(comment)
+        manager.init()
+        val host = hosts.getValue(e1)
+        assertEquals(1, host.live)
+
+        // An agent rewriting the file triggers a whole-document reload that disposes the inlay; unlike a
+        // store change it fires no reconcile, so without the FileDocumentManagerListener it stays gone.
+        host.disposeLastReturned()
+        assertEquals(0, host.live)
+
+        manager.simulateFileContentReloadedForTest(e1.document)
+        assertEquals(1, host.live) // reconciled back into view
+        assertEquals(1, manager.anchorCountForTest()) // one fresh anchor, no leak
+    }
+
+    fun testFileContentReloadDropsStaleAnchorsSoLaterSplitsUsePersistedLine() {
+        val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
+        store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        // Drift the tracked marker: an insert up top moves "l2" (and its RangeMarker) down to line 3, so
+        // a split opened right now would follow it (see testSplitPlacesCardAtLiveLineAfterEditAboveComment).
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+
+        // A reload wholesale-replaces the buffer, so the drifted marker is unreliable: the handler drops
+        // it and cards fall back to the persisted line_number, the line a freshly opened editor would use.
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        val e2 = split(e1) // a split created AFTER the reload rebuilds this file's anchor
+        val persistedOffset = e1.document.getLineEndOffset(2) // rebuilt from persisted line_number
+        val driftedOffset = e1.document.getLineEndOffset(3) // where the un-dropped marker would have placed it
+        assertEquals(persistedOffset, hosts.getValue(e2).lastOffset)
+        assertTrue(persistedOffset != driftedOffset)
+    }
+
     fun testUnplaceableEditorTracksNothingAndLeaksNoAnchor() {
         val (e1, path) = openLocalEditor("L.txt", "a\n")
         manager.hostFactory = { DecliningHost() } // host cannot place a component inlay

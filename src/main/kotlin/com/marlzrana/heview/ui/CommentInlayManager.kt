@@ -1,6 +1,7 @@
 package com.marlzrana.heview.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
@@ -12,9 +13,11 @@ import com.intellij.openapi.editor.RangeMarker
 import com.intellij.openapi.editor.event.EditorFactoryEvent
 import com.intellij.openapi.editor.event.EditorFactoryListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileDocumentManagerListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.TextRange
+import com.intellij.openapi.vfs.VirtualFile
 import com.marlzrana.heview.model.HeviewComment
 import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
@@ -25,11 +28,14 @@ import org.jetbrains.annotations.TestOnly
  * Owns the inlay cards for a project: it is the single controller that creates, tracks and disposes
  * every [CommentThread], mirroring reviewa's comment controller.
  *
- * Two triggers keep the on-screen cards in sync with the shared [CommentStore]:
+ * Three triggers keep the on-screen cards in sync with the shared [CommentStore]:
  * - **Editor lifecycle** — an [EditorFactoryListener] renders display cards when an editor for a
  *   commented file opens (including splits and reopened projects) and tears them down on release.
  * - **Store changes** — a change listener reconciles every open editor so a comment added or deleted
  *   in one editor appears/disappears in every split showing the same file.
+ * - **External file reloads** — a [FileDocumentManagerListener] reconciles when an open file is
+ *   reloaded from disk (an agent editing a file to resolve a comment), which disposes the inlays and
+ *   scrambles the anchors but fires no store change. See [onFileContentReloaded].
  *
  * The create flow is routed through [compose] (rather than living in the action) precisely so this
  * manager tracks the resulting thread before [CommentStore.save] fires: reconcile then sees the card
@@ -77,6 +83,17 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
         val subscription = store.addChangeListener { onStoreChanged() }
         Disposer.register(this, subscription)
+
+        // FileDocumentManager is application-level; the connection is parented to this manager, so the
+        // subscription is removed on dispose. We receive reloads across every project — the handler's
+        // document-identity match makes an unrelated project's reload a cheap no-op.
+        ApplicationManager.getApplication().messageBus.connect(this).subscribe(
+            FileDocumentManagerListener.TOPIC,
+            object : FileDocumentManagerListener {
+                override fun fileContentReloaded(file: VirtualFile, document: Document) =
+                    onFileContentReloaded(document)
+            },
+        )
 
         EditorFactory.getInstance().addEditorFactoryListener(
             object : EditorFactoryListener {
@@ -166,6 +183,30 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     private fun onStoreChanged() {
         // The map holds every open relevant editor, so this covers them all.
         rendered.keys.toList().forEach { reconcile(it) }
+    }
+
+    /**
+     * A file open in the IDE was reloaded from disk — the core "an agent edited the file to resolve a
+     * comment" flow (plan.html §5/§6). The whole-document reload disposes the component inlays and can
+     * leave a per-uuid [RangeMarker] valid but on a shifted line, yet fires no [CommentStore] change, so
+     * nothing else reconciles: the cards would go blank/stale until the file was reopened.
+     *
+     * Drop this document's anchors so a rebuilt card places from the persisted `line_number` — the last
+     * known-good semantic line, the same one a freshly opened editor uses — rather than the marker the
+     * wholesale replace left behind (in-IDE edits still track live; only an external reload falls back).
+     * Then reconcile every open editor of the file to recreate the cards the reload disposed. All open
+     * editors of one file share this [Document] instance across a reload, so identity matches every
+     * split. EDT-confined: a reload runs on the EDT, like every other callback here.
+     */
+    private fun onFileContentReloaded(document: Document) {
+        anchors.entries
+            .filter { it.value.document === document }
+            .map { it.key }
+            .forEach { anchors.remove(it)?.dispose() }
+        rendered.keys
+            .filter { it.document === document }
+            .toList()
+            .forEach { reconcile(it) }
     }
 
     /** Bring [editor]'s display cards in line with the store: add missing, dispose deleted. */
@@ -301,4 +342,8 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     /** The display card shown for [uuid] in [editor], if any — lets a test observe its render count. */
     @TestOnly
     internal fun cardForTest(editor: Editor, uuid: String): CommentThread? = rendered[editor]?.get(uuid)
+
+    /** Drive the file-reload handler directly — a real VFS reload is flaky to script headlessly. */
+    @TestOnly
+    internal fun simulateFileContentReloadedForTest(document: Document) = onFileContentReloaded(document)
 }

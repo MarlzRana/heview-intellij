@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 170 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 172 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -83,6 +83,12 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
 - `ui/CommentInlayManager.kt` — **project** light `@Service`; the single controller that owns every
   `CommentThread`. Renders/disposes display cards per `Editor` on open/split/reopen/close (`EditorFactoryListener`),
   and reconciles all open editors on any `CommentStore` change so a comment appears/disappears in every split.
+  A third trigger — a `FileDocumentManagerListener` (app-level `TOPIC`, connection parented to the manager) —
+  handles an **external file reload** (an agent editing a file to resolve a comment): `fileContentReloaded`
+  disposes the inlays + scrambles the anchors but fires no store change, so the handler drops that document's
+  anchors (matched by `RangeMarker.document ===`, so cards rebuild from the persisted `line_number`, not the
+  drifted marker) and reconciles every open editor of the file. In-IDE edits still track the live line; only an
+  external reload falls back to `line_number`.
   Owns the create flow too (`compose(editor)`) — tracks the thread under its uuid *before* `store.save` fires, so
   reconcile never double-renders the composing editor. A shared `newThread()` wires every card's per-reply
   callbacks (`onReply`/`onEditReply`/`onDeleteReply`/`onRependReply`) to the store (`created_at` via
@@ -229,7 +235,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **170 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **172 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
@@ -244,16 +250,22 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **170 tests**, `buildPlugin` clean.
+Gate: **172 tests**, `buildPlugin` clean.
 
-**Next increment (maintainer chose): external-file-reload handling** (the deferred cycle-2 #4 gap). When an
-agent edits a file to resolve a comment, the external document reload invalidates the per-uuid `RangeMarker`s
-and can dispose the component inlays, and nothing re-reconciles afterwards → cards go blank/stale until
-reopen. Fix in `ui/CommentInlayManager`: subscribe to `FileDocumentManagerListener` (app-level TOPIC, parent
-to the manager) and on `fileContentReloaded` drop the file's anchors + reconcile its open editors. Full spec
-(listener wiring, the `currentLineEndOffset`-already-handles-invalid-anchor nuance, the `@TestOnly`-seam test
-approach) is in `implementation_log.local.md`'s RESUME banner. Runner-ups if priorities shift: the **visual
-pass**, remaining **Phase 3** (tool window / status-bar count / settings), or **multi-client sync + generation
-fencing**. Full deferred backlog (durable-anchor line-number writeback — a SEPARATE adjacent increment,
-`CommentJson.decode` validation, GitHub identity, …) is in `implementation_log.local.md`.
+**Shipped — external-file-reload handling** (the former cycle-2 #4 gap). An agent editing a file to resolve a
+comment triggers a whole-document reload that disposes the inlays and can leave the per-uuid `RangeMarker`s on
+a shifted line, and — unlike a store change — fires no reconcile, so cards went blank/stale until reopen. Fix
+in `ui/CommentInlayManager`: a `FileDocumentManagerListener` (app-level `TOPIC`, connection parented to the
+manager) whose `fileContentReloaded` drops that document's anchors (matched by `RangeMarker.document ===`, so
+cards rebuild from the persisted `line_number` — the line a fresh editor uses — rather than the drifted marker)
+then reconciles every open editor of the file. Driven in tests via a `@TestOnly`
+`simulateFileContentReloadedForTest(document)` seam (a real VFS reload is flaky headlessly): two new
+`CommentInlayManagerTest` cases cover recreate-disposed-card and anchor-drop-so-later-splits-use-persisted-line.
+NOT committed/pushed yet as of this line.
+
+**Next increment (maintainer choice):** the **visual pass**, remaining **Phase 3** (tool window / status-bar
+count / settings), **multi-client sync + generation fencing**, or the adjacent **durable-anchor line-number
+writeback** (a SEPARATE increment — `line_number` still goes stale after in-IDE edits above a comment; the
+reload handler falls back to it, so keeping it fresh compounds). Full deferred backlog (`CommentJson.decode`
+validation, GitHub identity, restore-from-tombstone, …) is in `implementation_log.local.md`.
 </status>
