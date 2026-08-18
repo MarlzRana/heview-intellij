@@ -2,8 +2,12 @@ package com.marlzrana.heview.ui
 
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.CustomShortcutSet
+import com.intellij.openapi.actionSystem.KeyboardShortcut
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileTypes.PlainTextFileType
+import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.IdeFocusManager
@@ -22,9 +26,12 @@ import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
 import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JPanel
+import javax.swing.KeyStroke
 
 /**
  * A comment thread rendered as an editor inlay card via [InlayCardHost].
@@ -71,6 +78,9 @@ internal class CommentThread(
     // The current "Leave a comment" reply input, so a rebuild (a reply/delete elsewhere, a status flip)
     // can carry over an in-progress draft instead of discarding it.
     private var replyInput: EditorTextField? = null
+    // Set by submit / reply so the next render moves focus into the fresh reply box (rather than letting
+    // it fall back to the code editor) — so the user can keep typing the next comment.
+    private var focusReplyOnNextRender = false
 
     // Bumped every time the reply stack is (re)built, so a test can prove refreshDisplay's
     // no-op-when-unchanged guard actually skips a rebuild on unrelated store changes.
@@ -139,6 +149,7 @@ internal class CommentThread(
 
     private fun renderCompose(): EditorTextField {
         val input = commentInput(text = "", placeholder = "Leave a comment…")
+        onCtrlEnter(input) { submit(input.text) }
         val submit = JButton("Submit").apply { addActionListener { submit(input.text) } }
         val cancel = JButton("Cancel").apply { addActionListener { dispose() } }
         setContent(center = input, south = buttonRow(cancel, submit))
@@ -150,6 +161,7 @@ internal class CommentThread(
         // Trim only decides emptiness; the stored content is verbatim (matches reviewa).
         if (text.isBlank()) return
         val persist = checkNotNull(composeSubmit) { "submit() is only valid after startCompose" }
+        focusReplyOnNextRender = true // land focus in the new reply box, not back in the code editor
         renderThread(persist(text))
     }
 
@@ -168,6 +180,11 @@ internal class CommentThread(
         replies.forEachIndexed { index, reply -> stack.add(replyRow(index, reply)) }
         stack.add(replyBox(draft))
         setContent(stack)
+        // After a submit/reply, land focus in the fresh reply box (not back in the code editor).
+        if (focusReplyOnNextRender) {
+            focusReplyOnNextRender = false
+            replyInput?.let(::focusLater)
+        }
     }
 
     /** One reply row: author + status chip and the edit/delete/(re-pend) icons, over its content. */
@@ -216,6 +233,7 @@ internal class CommentThread(
     /** The editing row swapped into inline edit mode (editable field + Save/Cancel). */
     private fun editRow(reply: HeviewReply): JPanel {
         val input = commentInput(text = reply.content, placeholder = "Edit comment…")
+        onCtrlEnter(input) { submitEdit(reply, input.text) }
         val save = JButton("Save").apply { addActionListener { submitEdit(reply, input.text) } }
         val cancel = JButton("Cancel").apply { addActionListener { cancelEdit() } }
         focusLater(input)
@@ -230,6 +248,7 @@ internal class CommentThread(
     private fun replyBox(draft: String): JPanel {
         val input = commentInput(text = draft, placeholder = "Leave a comment…", heightPx = 40)
         replyInput = input
+        onCtrlEnter(input) { submitReply(input.text) }
         val reply = JButton("Reply").apply { addActionListener { submitReply(input.text) } }
         return JPanel(BorderLayout()).apply {
             border = JBUI.Borders.emptyTop(6)
@@ -244,6 +263,7 @@ internal class CommentThread(
         if (text.isBlank()) return
         val current = displayed ?: return
         replyInput?.text = "" // consumed — clear before firing so the rebuild doesn't re-seed the draft
+        focusReplyOnNextRender = true // keep focus in the reply box for the next comment
         onReply(current, text)
     }
 
@@ -341,6 +361,19 @@ internal class CommentThread(
             preferredSize = Dimension(1, JBUI.scale(heightPx))
             addSettingsProvider { it.settings.isUseSoftWraps = true }
         }
+
+    /** Submit [input] on Cmd+Enter (mac) / Ctrl+Enter (win/linux) so the mouse isn't required. */
+    private fun onCtrlEnter(input: EditorTextField, action: () -> Unit) {
+        object : DumbAwareAction() {
+            override fun actionPerformed(e: AnActionEvent) = action()
+        }.registerCustomShortcutSet(
+            CustomShortcutSet(
+                KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.CTRL_DOWN_MASK), null),
+                KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.META_DOWN_MASK), null),
+            ),
+            input,
+        )
+    }
 
     /** A borderless header action button — just its icon and a tooltip. */
     private fun iconButton(icon: Icon, tooltip: String, guardDoubleClick: Boolean = false, onClick: () -> Unit): JButton =
