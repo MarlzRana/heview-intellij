@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 142 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 170 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -199,6 +199,18 @@ context-blind reviewer will keep raising them:
   `processed/` tombstone across a restart (in-session it stays visible + re-pendable); a thread-level delete
   button; per-reply multi-author; the injectors flipping `replies[]` statuses in the tombstone (only needed
   once restore-from-tombstone exists — harmless now).
+- **Phase-1 `/aeview-loop` outcomes (settled; don't re-litigate — the panel re-raises them every run):**
+  5 cycles to the cap (findings 17→19→16→15→15). Hardened: **stable per-reply `id`** for mutation targeting
+  (survives a concurrent status/content flip); `refreshDisplay` tracks the latest thread while an edit is
+  open; revive **writes first, clears the tombstone only on write success**; `deleteReply` removes exactly
+  one + sanitize backfills null/duplicate ids; **double-click Delete guard** (icon starts disabled, enable-
+  later); reply-box **draft carried across a rebuild**; `deleteTombstone` path-separator + symlink guards.
+  **Open = deferred, NOT bugs to fix now:** (a) the **multi-client / generation race family** — a
+  cross-process hook claim racing a store save/revive, and a one-shot `reconcile` racing a revive/retain —
+  belongs to the deferred multi-client-sync + generation-fencing increment (v1 is single-client; windows are
+  microsecond-narrow); (b) **visual pass** (scroll-preserve on rebuild, aggregate thread label, lazy reply
+  box, focus/caret) — maintainer-acknowledged follow-up; (c) preferences (sealed `CardState`, pass `targetId`)
+  — code is correct + tested.
 </settled-decisions>
 
 <review>
@@ -217,25 +229,27 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **142 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **170 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
 The maintainer normally runs pushes — only push when asked. Everything through the Phase-3 loop is pushed
 (`origin/main` == `287adfb`); **the new Phase-1 multi-reply commits (`2c2e4f3`..HEAD) are LOCAL / unpushed.**
 
-**Just shipped — Phase 1 multi-reply comment threads + per-reply state machine (plan §5).** A thread now
-holds an ordered `replies[]` (heview superset field), each reply with its own Pending/Seen status and its
-own edit / delete / re-pend actions (reviewa's per-comment UI, persisted because heview is durable). The
-top-level `content`/`status` stay derived so the injectors are unchanged. Two-state per reply; the card
-renders a stack of reply rows (trash/pencil always, clock re-pend on Seen) + a "Leave a comment" box. This
-superseded the earlier single-content reply/edit/re-pend. See `<settled-decisions>` ("Built (Phase 1 …)").
-**Next: (1) maintainer dogfood in `runIde`** — create a comment, add a 2nd reply (two rows), edit/delete a
+**Just shipped — Phase 1 multi-reply comment threads + per-reply state machine (plan §5), through a full
+5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field: `{content,status,
+author,created_at,id}` — the `id` is a stable per-reply identity), each reply with its own Pending/Seen
+status and its own edit / delete / re-pend actions (reviewa's per-comment UI, persisted because heview is
+durable). Top-level `content`/`status` stay derived so the injectors are unchanged. Two-state per reply; the
+card renders a stack of reply rows (trash/pencil always, clock re-pend on Seen) + a "Leave a comment" box.
+This superseded the earlier single-content reply/edit/re-pend. The `/aeview-loop` ran to the 5-cycle cap
+(findings 17→19→16→15→15); everything it surfaced is fixed or a recorded deferral — see `<settled-decisions>`
+("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes"). Gate: **170 tests**, `buildPlugin` clean.
+**Next: maintainer dogfood in `runIde`** — create a comment, add a 2nd reply (two rows), edit/delete a
 reply, consume via a hook (all rows → Seen + clock), re-pend one reply, restart and confirm a mixed thread
-reloads intact. The action path + real inlay rendering is dogfood-only. **(2) `/aeview-loop`** on this
-increment's diff (`range:287adfb..HEAD`). Then remaining Phase 3 (tool window, status-bar widget, copy
-actions, settings incl. Seen auto-collapse, scoped project-close cleanup), or the deferred restore-from-
-tombstone / thread-level-delete items. Full deferred backlog (durable-anchor line-number writeback,
-external-reload listener, `CommentJson.decode` validation, multi-client CREATE/MODIFY sync, GitHub
-identity, …) is in `implementation_log.local.md`.
+reloads intact. The action path + real inlay rendering is dogfood-only. Then remaining Phase 3 (tool window,
+status-bar widget, copy actions, settings incl. Seen auto-collapse, scoped project-close cleanup), or the
+deferred **restore-from-tombstone** / **thread-level delete** / **visual pass** / **multi-client sync** items.
+Full deferred backlog (durable-anchor line-number writeback, external-reload listener, `CommentJson.decode`
+validation, GitHub identity, …) is in `implementation_log.local.md`.
 </status>
