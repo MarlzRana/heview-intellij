@@ -934,6 +934,30 @@ class CommentStoreTest {
         assertEquals(listOf("a", "b-edited"), store.get("d")?.replies?.map { it.content }) // only it changed
     }
 
+    @Test
+    fun `re-pending a genuinely consumed thread recreates the pool file then deletes the tombstone`(@TempDir dir: Path) {
+        val store = store(dir)
+        val r0 = sampleReply(content = "please fix")
+        store.save(sampleComment(uuid = "u1", replies = listOf(r0))) // writes comments/u1.json (pending)
+        // Simulate a hook consuming it: move the pool file into processed/, mark the thread Seen in memory.
+        val processed = Files.createDirectories(dir.resolve("processed"))
+        Files.move(dir.resolve("u1.json"), processed.resolve("u1.json"))
+        store.markProcessed("u1")
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // consumed: only the tombstone is on disk
+        assertTrue(Files.exists(processed.resolve("u1.json")))
+
+        store.rependReply("u1", store.get("u1")!!.replies!![0], laterTs)
+
+        val revived = store.get("u1")!!
+        assertEquals(CommentStatus.PENDING, revived.status)
+        assertTrue(Files.exists(dir.resolve("u1.json"))) // pool file recreated…
+        assertEquals(
+            CommentStatus.PENDING,
+            CommentJson.decode(Files.readString(dir.resolve("u1.json"))).replies?.get(0)?.status,
+        ) // …with the pending reply persisted
+        assertFalse(Files.exists(processed.resolve("u1.json"))) // tombstone deleted only after the write
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))

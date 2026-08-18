@@ -139,6 +139,36 @@ class HookScriptTest {
     }
 
     @Test
+    fun `injectors handle a replies-bearing file identically and preserve the replies array in the tombstone`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        // heview now writes a `replies[]` array; the injectors read only the derived top-level `content`
+        // and must round-trip the nested array unchanged when they rewrite the tombstone (byte-identically
+        // across Node/Python), incl. a unicode author and a pre-existing id.
+        val json =
+            """{"uuid":"r1","status":"pending","created_at":"2026-01-01T00:00:00.000Z","workspace":"/tmp/proj",""" +
+                """"abs_path":"/tmp/proj/sub/Foo.kt","logical_abs_path":"/tmp/proj/sub/Foo.kt","line_number":3,""" +
+                """"line_content":"val x = 1","side":"file","content":"only the pending one",""" +
+                """"replies":[{"content":"only the pending one","status":"pending","author":"Ünïcode","created_at":"2026-01-01T00:00:00.000Z","id":"ra"},""" +
+                """{"content":"already seen","status":"processed","author":"Ünïcode","created_at":"2026-01-01T00:00:00.000Z","id":"rb"}]}"""
+        val expected = "In `sub/Foo.kt` at line 3:\n```\nval x = 1\n```\nonly the pending one"
+
+        val h1 = setupHome(dir.resolve("a"))
+        Files.writeString(h1.resolve(".heview/comments/r1.json"), json)
+        val claudeOut = additionalContext(run(claudeCmd(h1), h1, "/tmp/proj"))
+        assertEquals(expected, claudeOut) // injected from the derived top-level content (Seen reply excluded)
+        assertTrue(inProcessed(h1, "r1"))
+        assertEquals("processed", processedStatus(h1, "r1"))
+        assertTrue(processedRaw(h1, "r1").contains("\"replies\"")) // the nested array survived the rewrite
+        assertTrue(processedRaw(h1, "r1").contains("already seen"))
+
+        val h2 = setupHome(dir.resolve("b"))
+        Files.writeString(h2.resolve(".heview/comments/r1.json"), json)
+        val codexOut = additionalContext(run(codexCmd(h2), h2, "/tmp/proj"))
+        assertEquals(claudeOut, codexOut) // JS == Python injection
+        assertEquals(processedRaw(h1, "r1"), processedRaw(h2, "r1")) // …and byte-identical tombstones
+    }
+
+    @Test
     fun `a second run does not re-inject an already-consumed comment`(@TempDir dir: Path) {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })

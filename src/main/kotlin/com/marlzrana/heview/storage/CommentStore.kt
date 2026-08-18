@@ -205,6 +205,9 @@ class CommentStore(
 
     /** Delete a consumption tombstone; runs on the IO thread (call from within a runIo task). */
     private fun deleteTombstone(uuid: String) {
+        // Defence-in-depth (belt to hydrate's uuid==filename check): never resolve a uuid that isn't a
+        // single path component, so this can't delete a `.json` outside processed/ via `../` traversal.
+        if (uuid.contains('/') || uuid.contains('\\') || uuid == "." || uuid == "..") return
         try {
             // Never follow a symlinked processed/ (matches the injector + sweep guards): a planted
             // `processed -> ~/.codex` link would make this delete a file OUTSIDE ~/.heview.
