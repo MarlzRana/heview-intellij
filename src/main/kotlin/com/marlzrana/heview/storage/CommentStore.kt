@@ -108,6 +108,30 @@ class CommentStore(
     fun isPersisted(uuid: String): Boolean = persisted.contains(uuid)
 
     /**
+     * Rewrite only a thread's durable anchor — its `line_number`/`line_content` — after in-IDE edits moved
+     * its line (the manager calls this from `beforeDocumentSaving`, so the pool matches the on-disk file the
+     * agent reads; plan.html §5, cycle3 #2). Deliberately narrow:
+     * - No-op if unchanged, if the uuid is unknown, or if the thread is not persisted in `comments/`
+     *   (consumed → moved to `processed/`, evicted, or a create-save still in flight): a location writeback
+     *   must never recreate a pool file and resurrect an injectable duplicate. The write re-checks
+     *   `isPersisted` on the IO thread in case a consume/delete lands after the EDT check.
+     * - Does NOT fire the change listener: every open card already sits on the live [RangeMarker], so only
+     *   the durable copy the injector/reopen reads needs updating — not what any card shows.
+     * - Touches only these two fields (never `status`/`replies`/`created_at`), so it can't reorder injection.
+     */
+    fun updateLocation(uuid: String, line1Based: Int, lineContent: String) {
+        val current = index[uuid] ?: return
+        if (current.lineNumber == line1Based && current.lineContent == lineContent) return
+        if (!isPersisted(uuid)) return
+        val updated = current.copy(lineNumber = line1Based, lineContent = lineContent)
+        index[uuid] = updated
+        val json = CommentJson.encode(updated)
+        runIo {
+            if (isPersisted(uuid)) writeAtomically(uuid, json)
+        }
+    }
+
+    /**
      * The per-reply state machine (plan.html §5). Each mutates one thread's [HeviewComment.replies],
      * recomputes the thread's derived `content`/`status`/`created_at` ([recomputed]) and re-persists.
      * The target reply is located **by its stable [HeviewReply.id]**, not by array index or by value: the

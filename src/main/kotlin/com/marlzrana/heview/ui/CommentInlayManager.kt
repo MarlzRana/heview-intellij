@@ -35,7 +35,9 @@ import org.jetbrains.annotations.TestOnly
  *   in one editor appears/disappears in every split showing the same file.
  * - **External file reloads** — a [FileDocumentManagerListener] reconciles when an open file is
  *   reloaded from disk (an agent editing a file to resolve a comment), which disposes the inlays and
- *   scrambles the anchors but fires no store change. See [onFileContentReloaded].
+ *   scrambles the anchors but fires no store change. See [onFileContentReloaded]. The same listener's
+ *   `beforeDocumentSaving` writes each moved anchor's line back to the pool so the durable `line_number`
+ *   stays in step with the on-disk file the agent reads. See [onBeforeDocumentSaving].
  *
  * The create flow is routed through [compose] (rather than living in the action) precisely so this
  * manager tracks the resulting thread before [CommentStore.save] fires: reconcile then sees the card
@@ -92,6 +94,9 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             object : FileDocumentManagerListener {
                 override fun fileContentReloaded(file: VirtualFile, document: Document) =
                     onFileContentReloaded(document)
+
+                override fun beforeDocumentSaving(document: Document) =
+                    onBeforeDocumentSaving(document)
             },
         )
 
@@ -207,6 +212,28 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             .filter { it.document === document }
             .toList()
             .forEach { reconcile(it) }
+    }
+
+    /**
+     * [document] is being flushed to disk: write each of its comments' *current* line back to the pool
+     * (cycle3 #2). The persisted `line_number`/`line_content` were frozen at submit, so after in-IDE edits
+     * above a comment the on-disk number goes stale — and the injector, a reopen, and the reload fallback
+     * all read it. Saving is the right sync point: the agent reads the file from disk, so the pool should
+     * match it precisely when the document lands on disk (an unsaved edit correctly leaves the pool alone —
+     * the agent still sees the old file). The live [RangeMarker] gives the current line; a marker that the
+     * edit invalidated is skipped (no defensible line to record). The store no-ops when nothing changed.
+     */
+    private fun onBeforeDocumentSaving(document: Document) {
+        anchors.entries
+            .filter { it.value.document === document && it.value.isValid }
+            .toList()
+            .forEach { (uuid, marker) ->
+                val line = clampLine(document, document.getLineNumber(marker.startOffset))
+                val lineContent = document.getText(
+                    TextRange(document.getLineStartOffset(line), document.getLineEndOffset(line)),
+                )
+                store.updateLocation(uuid, line + 1, lineContent)
+            }
     }
 
     /** Bring [editor]'s display cards in line with the store: add missing, dispose deleted. */
@@ -346,4 +373,8 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     /** Drive the file-reload handler directly — a real VFS reload is flaky to script headlessly. */
     @TestOnly
     internal fun simulateFileContentReloadedForTest(document: Document) = onFileContentReloaded(document)
+
+    /** Drive the save-time line-number writeback directly — headless saves don't fire the real listener. */
+    @TestOnly
+    internal fun simulateBeforeDocumentSavingForTest(document: Document) = onBeforeDocumentSaving(document)
 }

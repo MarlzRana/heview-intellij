@@ -958,6 +958,83 @@ class CommentStoreTest {
         assertFalse(Files.exists(processed.resolve("u1.json"))) // tombstone deleted only after the write
     }
 
+    @Test
+    fun `updateLocation rewrites line_number and line_content in memory and on disk`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1")) // line_number 42, line_content "val x = 1"
+
+        store.updateLocation("u1", 7, "val y = 2")
+
+        assertEquals(7, store.get("u1")?.lineNumber)
+        assertEquals("val y = 2", store.get("u1")?.lineContent)
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(7, onDisk.lineNumber)
+        assertEquals("val y = 2", onDisk.lineContent)
+    }
+
+    @Test
+    fun `updateLocation is a no-op when the location is unchanged`(@TempDir dir: Path) {
+        var writes = 0
+        val store = CommentStore(dir, runIo = { writes++; it.run() }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1")) // 1 write
+        assertEquals(1, writes)
+
+        store.updateLocation("u1", 42, "val x = 1") // identical to the sample → no write
+        assertEquals(1, writes)
+
+        store.updateLocation("u1", 43, "moved") // a real change → one more write
+        assertEquals(2, writes)
+    }
+
+    @Test
+    fun `updateLocation never fires the change listener`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        var fired = 0
+        store.addChangeListener { fired++ } // registered AFTER the save
+        store.updateLocation("u1", 99, "moved")
+        assertEquals(0, fired) // the card already tracks the live marker; no reconcile needed
+    }
+
+    @Test
+    fun `updateLocation ignores an unknown uuid`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.updateLocation("nope", 5, "x")
+        assertNull(store.get("nope"))
+        assertFalse(Files.exists(dir.resolve("nope.json")))
+    }
+
+    @Test
+    fun `updateLocation does not resurrect a consumed thread`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        // Simulate a hook consuming the thread: its file leaves comments/ and it is no longer persisted.
+        Files.delete(dir.resolve("u1.json"))
+        store.markProcessed("u1")
+
+        store.updateLocation("u1", 7, "moved")
+
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // must NOT recreate an injectable duplicate
+        assertEquals(42, store.get("u1")?.lineNumber) // in-memory record untouched
+    }
+
+    @Test
+    fun `updateLocation leaves replies and status untouched`(@TempDir dir: Path) {
+        val store = store(dir)
+        val replies = listOf(sampleReply(content = "a"), sampleReply(content = "b", status = CommentStatus.PROCESSED))
+        store.save(sampleComment(uuid = "u1", replies = replies))
+        val before = store.get("u1")!!
+
+        store.updateLocation("u1", 7, "moved")
+
+        val after = store.get("u1")!!
+        assertEquals(before.replies, after.replies)
+        assertEquals(before.status, after.status)
+        assertEquals(before.content, after.content)
+        assertEquals(before.createdAt, after.createdAt)
+        assertEquals(7, after.lineNumber) // only the anchor moved
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))

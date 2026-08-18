@@ -293,6 +293,35 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertTrue(persistedOffset != driftedOffset)
     }
 
+    fun testSavingWritesTheMovedLineBackToTheStore() {
+        val (e1, path) = openLocalEditor("WB.txt", "l0\nl1\nl2\nl3\n")
+        val comment = commentAt(path, line0Based = 2, content = "on l2") // line_number = 3
+        store.save(comment)
+        manager.init()
+
+        // An in-IDE edit above the comment moves the tracked marker down one line.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+
+        // The document is being flushed to disk → the durable anchor is rewritten to match the on-disk file.
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        assertEquals(4, store.get(comment.uuid)?.lineNumber) // "l2" is now line 4 (1-based)
+        assertEquals("l2", store.get(comment.uuid)?.lineContent) // and its current text
+    }
+
+    fun testUnsavedEditDoesNotChangeThePersistedLine() {
+        val (e1, path) = openLocalEditor("WB2.txt", "l0\nl1\nl2\nl3\n")
+        val comment = commentAt(path, line0Based = 2, content = "on l2") // line_number = 3
+        store.save(comment)
+        manager.init()
+
+        // Edit above the comment but DON'T save: the agent still reads the old on-disk file, so the pool
+        // must keep the old line_number (the writeback is save-gated, not edit-gated).
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // unchanged until a save fires
+    }
+
     fun testUnplaceableEditorTracksNothingAndLeaksNoAnchor() {
         val (e1, path) = openLocalEditor("L.txt", "a\n")
         manager.hostFactory = { DecliningHost() } // host cannot place a component inlay
