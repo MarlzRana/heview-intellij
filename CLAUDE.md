@@ -232,24 +232,28 @@ Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uui
 `processed/`, and the card flips Pending→Seen). Gate green: **170 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
-**Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main` tracks it.
-The maintainer normally runs pushes — only push when asked. Everything through the Phase-3 loop is pushed
-(`origin/main` == `287adfb`); **the new Phase-1 multi-reply commits (`2c2e4f3`..HEAD) are LOCAL / unpushed.**
+**Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
+tracks it; `main` == `origin/main` == `41ad48f`. The maintainer normally runs pushes — only push when asked.
 
-**Just shipped — Phase 1 multi-reply comment threads + per-reply state machine (plan §5), through a full
-5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field: `{content,status,
-author,created_at,id}` — the `id` is a stable per-reply identity), each reply with its own Pending/Seen
-status and its own edit / delete / re-pend actions (reviewa's per-comment UI, persisted because heview is
-durable). Top-level `content`/`status` stay derived so the injectors are unchanged. Two-state per reply; the
-card renders a stack of reply rows (trash/pencil always, clock re-pend on Seen) + a "Leave a comment" box.
-This superseded the earlier single-content reply/edit/re-pend. The `/aeview-loop` ran to the 5-cycle cap
-(findings 17→19→16→15→15); everything it surfaced is fixed or a recorded deferral — see `<settled-decisions>`
-("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes"). Gate: **170 tests**, `buildPlugin` clean.
-**Next: maintainer dogfood in `runIde`** — create a comment, add a 2nd reply (two rows), edit/delete a
-reply, consume via a hook (all rows → Seen + clock), re-pend one reply, restart and confirm a mixed thread
-reloads intact. The action path + real inlay rendering is dogfood-only. Then remaining Phase 3 (tool window,
-status-bar widget, copy actions, settings incl. Seen auto-collapse, scoped project-close cleanup), or the
-deferred **restore-from-tombstone** / **thread-level delete** / **visual pass** / **multi-client sync** items.
-Full deferred backlog (durable-anchor line-number writeback, external-reload listener, `CommentJson.decode`
-validation, GitHub identity, …) is in `implementation_log.local.md`.
+**Shipped + dogfooded + pushed — Phase 1 multi-reply comment threads + per-reply state machine (plan §5),
+through a full 5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field:
+`{content,status,author,created_at,id}` — the `id` is a stable per-reply identity), each reply with its own
+Pending/Seen status and its own edit / delete / re-pend actions (reviewa's per-comment UI, persisted because
+heview is durable). Top-level `content`/`status` stay derived so the injectors are unchanged. Two-state per
+reply; the card renders a stack of reply rows (trash/pencil always, clock re-pend on Seen) + a "Leave a
+comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
+`/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
+recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
+Gate: **170 tests**, `buildPlugin` clean.
+
+**Next increment (maintainer chose): external-file-reload handling** (the deferred cycle-2 #4 gap). When an
+agent edits a file to resolve a comment, the external document reload invalidates the per-uuid `RangeMarker`s
+and can dispose the component inlays, and nothing re-reconciles afterwards → cards go blank/stale until
+reopen. Fix in `ui/CommentInlayManager`: subscribe to `FileDocumentManagerListener` (app-level TOPIC, parent
+to the manager) and on `fileContentReloaded` drop the file's anchors + reconcile its open editors. Full spec
+(listener wiring, the `currentLineEndOffset`-already-handles-invalid-anchor nuance, the `@TestOnly`-seam test
+approach) is in `implementation_log.local.md`'s RESUME banner. Runner-ups if priorities shift: the **visual
+pass**, remaining **Phase 3** (tool window / status-bar count / settings), or **multi-client sync + generation
+fencing**. Full deferred backlog (durable-anchor line-number writeback — a SEPARATE adjacent increment,
+`CommentJson.decode` validation, GitHub identity, …) is in `implementation_log.local.md`.
 </status>
