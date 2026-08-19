@@ -111,14 +111,16 @@ class CommentStore(
      * Rewrite only a thread's durable anchor — its `line_number`/`line_content` — after in-IDE edits moved
      * its line (the manager calls this from `beforeDocumentSaving`, so the pool matches the on-disk file the
      * agent reads; plan.html §5, cycle3 #2). Deliberately narrow:
-     * - No-op if unchanged or if the uuid is unknown.
-     * - The **in-memory** record is updated for a known uuid even when it is not persisted (a consumed/Seen
-     *   thread, or a create-save still in flight) so a later re-pend/reopen uses the moved line — but the
-     *   **disk write is skipped** unless the thread is still in `comments/`. A location writeback must never
-     *   recreate a pool file and resurrect an injectable duplicate, so the IO task re-checks `isPersisted`
-     *   AND that the file still exists (the consumption watcher's `markProcessed` can lag a hook's atomic
-     *   move by the WatchService latency; the residual sub-millisecond move-vs-write TOCTOU belongs to the
-     *   deferred cross-process generation fence).
+     * - No-op if unchanged or if the uuid is unknown. Updates the **in-memory** record for a known uuid
+     *   unconditionally (a consumed/Seen thread, or a create-save still in flight) so a later re-pend/reopen
+     *   uses the moved line.
+     * - The write is **always queued** on the serial IO executor — never short-circuited on the EDT — so a
+     *   write requested while this thread's create-save is still in flight lands *behind* that create rather
+     *   than being dropped (the EDT `isPersisted` would still be false then, silently losing the update).
+     *   The IO task then skips unless the thread is still in `comments/` (`isPersisted` AND the file exists):
+     *   a location writeback must never recreate a pool file a hook has claimed into `processed/` and
+     *   resurrect an injectable duplicate. (`markProcessed` can lag a hook's atomic move by the WatchService
+     *   latency; the residual sub-millisecond move-vs-write TOCTOU belongs to the deferred generation fence.)
      * - On a write failure the optimistic in-memory update is reverted, so the next save (with the marker
      *   unchanged) still differs from the index and retries instead of the no-op guard suppressing it forever.
      * - Does NOT fire the change listener: every open card already sits on the live [RangeMarker], so only
@@ -130,7 +132,6 @@ class CommentStore(
         if (current.lineNumber == line1Based && current.lineContent == lineContent) return
         val updated = current.copy(lineNumber = line1Based, lineContent = lineContent)
         index[uuid] = updated
-        if (!isPersisted(uuid)) return
         val json = CommentJson.encode(updated)
         runIo {
             if (!isPersisted(uuid) || !Files.exists(fileFor(uuid))) return@runIo // consumed/deleted — never recreate

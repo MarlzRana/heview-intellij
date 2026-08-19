@@ -1037,6 +1037,38 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `updateLocation does not recreate a pool file that left comments before markProcessed ran`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1"))
+        tasks.removeFirst().run() // create → file exists, persisted
+
+        store.updateLocation("u1", 7, "moved") // queues the write
+
+        // A hook atomically moved the file out of comments/, but the watcher hasn't run markProcessed yet, so
+        // isPersisted is STILL true. Only the Files.exists half of the IO recheck can prevent a resurrection.
+        Files.delete(dir.resolve("u1.json"))
+
+        tasks.removeFirst().run()
+        assertTrue(store.isPersisted("u1")) // watcher lag: still believed persisted…
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // …so the Files.exists check is what stopped recreation
+    }
+
+    @Test
+    fun `updateLocation queued during an in-flight create still writes the moved line`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1")) // queues the create write (line 42); NOT persisted yet
+
+        store.updateLocation("u1", 7, "moved") // called while the create is in flight → must still queue a write
+
+        tasks.removeFirst().run() // create write: line 42, persisted
+        tasks.removeFirst().run() // update write: now persisted + file exists → line 7 (not dropped)
+        assertEquals(7, store.get("u1")?.lineNumber)
+        assertEquals(7, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineNumber)
+    }
+
+    @Test
     fun `updateLocation persists a content-only change on the same line`(@TempDir dir: Path) {
         var writes = 0
         val store = CommentStore(dir, runIo = { writes++; it.run() }, runEdt = { it.run() }, defaultAuthor = { "tester" })
@@ -1050,8 +1082,7 @@ class CommentStoreTest {
 
     @Test
     fun `updateLocation retries on the next save after a failed write`(@TempDir dir: Path) {
-        var failNext = false
-        // Fail exactly one write by pointing the store at a dir we toggle read-only for that write.
+        // Fail exactly one write by toggling the temp dir read-only for that write.
         val store = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() }, defaultAuthor = { "tester" })
         store.save(sampleComment(uuid = "u1"))
 

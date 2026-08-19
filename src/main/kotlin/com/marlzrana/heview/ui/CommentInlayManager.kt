@@ -193,25 +193,24 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
     /**
      * A file open in the IDE was reloaded from disk — the core "an agent edited the file to resolve a
-     * comment" flow (plan.html §5/§6). The whole-document reload disposes the component inlays and can
-     * leave a per-uuid [RangeMarker] valid but on a shifted line, yet fires no [CommentStore] change, so
-     * nothing else reconciles: the cards would go blank/stale until the file was reopened.
+     * comment" flow (plan.html §5/§6). The reload can dispose the component inlays yet fires no
+     * [CommentStore] change, so nothing else reconciles: the cards would go blank until the file was
+     * reopened. Recreate them, and keep the durable pool in step with the just-changed on-disk file.
      *
-     * Drop this document's anchors so a rebuilt card places from the persisted `line_number` — the last
-     * known-good semantic line, the same one a freshly opened editor uses — rather than the marker the
-     * wholesale replace left behind (in-IDE edits still track live; only an external reload falls back).
-     * Then reconcile every open editor of the file to recreate the cards the reload disposed. All open
-     * editors of one file share this [Document] instance across a reload, so identity matches every
-     * split. EDT-confined: a reload runs on the EDT, like every other callback here.
+     * - **Trust the anchors.** IntelliJ's reload diffs the text (common prefix/suffix trimming in
+     *   `DocumentImpl.replaceString`), so a surviving [RangeMarker] is correctly shifted and beats the
+     *   persisted `line_number` an external edit never updated. We do NOT drop anchors; [currentLineEndOffset]
+     *   rebuilds only a marker the reload genuinely invalidated when a disposed card is recreated.
+     * - **Write the anchors back** ([writeBackAnchors]). The reload IS the on-disk change the save-time
+     *   writeback exists for, but an external edit doesn't dirty the document, so `beforeDocumentSaving`
+     *   never runs for it — without this the injectable `line_number` stays frozen at submit time.
+     * - **Reconcile** every open editor of the file to recreate the cards the reload disposed. All editors
+     *   of one file share this [Document] instance across a reload, so identity matches every split.
+     *
+     * EDT-confined: a reload runs on the EDT, like every other callback here.
      */
     private fun onFileContentReloaded(document: Document) {
-        // A reload fires no store change, so nothing else reconciles: cards the reload disposed (its text
-        // range was replaced) would stay gone until reopen. Reconcile every open editor of this document to
-        // recreate them. We deliberately do NOT drop the anchors: IntelliJ's reload diffs the text (common
-        // prefix/suffix trimming in DocumentImpl.replaceString), so a surviving RangeMarker is correctly
-        // shifted and stays attached to its code — trusting it beats falling back to a line_number the
-        // external edit never updated. Only a marker the reload genuinely invalidated is rebuilt from the
-        // persisted line_number, which currentLineEndOffset already handles when a disposed card is recreated.
+        writeBackAnchors(document)
         rendered.keys
             .filter { it.document === document }
             .forEach { reconcile(it) }
@@ -219,14 +218,22 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
     /**
      * [document] is being flushed to disk: write each of its comments' *current* line back to the pool
-     * (cycle3 #2). The persisted `line_number`/`line_content` were frozen at submit, so after in-IDE edits
-     * above a comment the on-disk number goes stale — and the injector, a reopen, and the reload fallback
-     * all read it. Saving is the right sync point: the agent reads the file from disk, so the pool should
-     * match it precisely when the document lands on disk (an unsaved edit correctly leaves the pool alone —
-     * the agent still sees the old file). The live [RangeMarker] gives the current line; a marker that the
-     * edit invalidated is skipped (no defensible line to record). The store no-ops when nothing changed.
+     * (cycle3 #2). The persisted `line_number`/`line_content` were frozen at submit, so after edits above a
+     * comment the on-disk number goes stale — and the injector, a reopen, and the reload fallback all read
+     * it. Saving is a correct sync point: the agent reads the file from disk, so the pool should match it
+     * when the document lands on disk (an unsaved edit correctly leaves the pool alone — the agent still
+     * sees the old file). See [writeBackAnchors].
      */
-    private fun onBeforeDocumentSaving(document: Document) {
+    private fun onBeforeDocumentSaving(document: Document) = writeBackAnchors(document)
+
+    /**
+     * Write each valid anchor on [document] back to the pool as its comment's current `line_number` /
+     * `line_content`. The live [RangeMarker] gives the current line; a marker the edit invalidated is
+     * skipped (no defensible line to record — a candidate for the deferred orphan-binning increment). The
+     * store no-ops when nothing changed and never recreates a consumed thread. Shared by the save
+     * (`beforeDocumentSaving`) and reload (`fileContentReloaded`) paths — in both, [document] equals disk.
+     */
+    private fun writeBackAnchors(document: Document) {
         anchors.entries
             .filter { it.value.document === document && it.value.isValid }
             .forEach { (uuid, marker) ->
@@ -272,10 +279,14 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             editor = editor,
             lineEndOffset = currentLineEndOffset(editor.document, comment),
             onDispose = { disposed ->
-                // If the platform disposes the inlay (e.g. its text range was deleted), drop the stale
-                // entry so a later reconcile recreates the card instead of skipping it forever.
+                // If the platform disposes the inlay (its text range was replaced — a reload, or the line
+                // was deleted), drop the stale entry so a later reconcile recreates the card. Do NOT retire
+                // the shared anchor here: a reload disposes the inlay but leaves the marker valid+shifted,
+                // and reconcile recreates the card immediately — retiring it would force currentLineEndOffset
+                // back to the stale line_number, defeating trust-the-marker. A genuinely invalid marker is
+                // disposed by currentLineEndOffset on recreation; a deleted comment / closed editor retire it
+                // explicitly (reconcile's removal branch, forget).
                 rendered[editor]?.values?.remove(disposed)
-                retireAnchorIfUnused(comment.uuid)
             },
         )
         if (thread.startDisplay(comment)) return thread

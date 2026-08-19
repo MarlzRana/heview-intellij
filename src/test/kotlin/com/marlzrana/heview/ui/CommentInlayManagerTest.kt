@@ -272,7 +272,92 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
         manager.simulateFileContentReloadedForTest(e1.document)
         assertEquals(1, host.live) // reconciled back into view
-        assertEquals(1, manager.anchorCountForTest()) // one fresh anchor, no leak
+        assertEquals(1, manager.anchorCountForTest()) // the anchor was kept (not retired) and reused, no leak
+    }
+
+    fun testFileContentReloadRecreatesADisposedCardOnTheShiftedLine() {
+        val (e1, path) = openLocalEditor("RLS.txt", "l0\nl1\nl2\nl3\n")
+        val comment = commentAt(path, line0Based = 2, content = "on l2") // line_number = 3
+        store.save(comment)
+        manager.init()
+        val host = hosts.getValue(e1)
+
+        // Shift the marker down (edit above), THEN dispose the inlay as a real reload does, THEN reload. The
+        // recreated card must reuse the kept, shifted marker — not fall back to the stale persisted line_number.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        host.disposeLastReturned() // the reload disposed the component inlay
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertEquals(1, host.live)
+        val shiftedOffset = e1.document.getLineEndOffset(3) // "l2" now on line 3
+        val staleOffset = e1.document.getLineEndOffset(2) // where fall-back-to-line_number would misplace it
+        assertEquals(shiftedOffset, host.lastOffset) // recreated on the shifted line (trust-the-marker holds)
+        assertTrue(shiftedOffset != staleOffset)
+    }
+
+    fun testFileContentReloadRecreatesCardsInEverySplit() {
+        val (e1, path) = openLocalEditor("RLSP.txt", "a\nb\n")
+        store.save(commentAt(path, line0Based = 0, content = "x"))
+        manager.init()
+        val e2 = split(e1)
+        assertEquals(1, liveCards(e1))
+        assertEquals(1, liveCards(e2))
+
+        // A reload disposes the inlay in BOTH splits of the shared document; reconcile must recreate both.
+        hosts.getValue(e1).disposeLastReturned()
+        hosts.getValue(e2).disposeLastReturned()
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertEquals(1, liveCards(e1))
+        assertEquals(1, liveCards(e2))
+    }
+
+    fun testFileContentReloadWritesMovedLinesBackToTheStore() {
+        val (e1, path) = openLocalEditor("RLWB.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        store.save(comment)
+        manager.init()
+
+        // An agent's external edit changes the on-disk file and reloads it WITHOUT a save event, so the pool's
+        // line_number would stay frozen at submit time unless the reload path also writes it back.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // "l1" now on line 3 (1-based)
+        assertEquals("l1", store.get(comment.uuid)?.lineContent)
+    }
+
+    fun testSavingWritesBackEveryCommentOnTheDocument() {
+        val (e1, path) = openLocalEditor("MULTI.txt", "l0\nl1\nl2\nl3\n")
+        val c1 = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        val c2 = commentAt(path, line0Based = 3, content = "on l3") // line_number = 4
+        store.save(c1)
+        store.save(c2)
+        manager.init()
+
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        assertEquals(3, store.get(c1.uuid)?.lineNumber) // BOTH anchors written back, not just the first
+        assertEquals(5, store.get(c2.uuid)?.lineNumber)
+    }
+
+    fun testLocationWritebackDoesNotRebuildTheCardOnAnUnrelatedReconcile() {
+        val (e1, path) = openLocalEditor("LWB.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+
+        // A save-time writeback moves the in-memory line but fires no store change (the card keeps its snapshot).
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+        val baseline = card.displayRenderCount
+
+        // A later unrelated global reconcile hands the card the new (line-only-different) comment; the
+        // sameDisplayAs guard must skip the rebuild so Delete/focus aren't clobbered.
+        store.save(commentAt("/elsewhere/Other.txt", line0Based = 0, content = "unrelated"))
+        assertEquals(baseline, card.displayRenderCount)
     }
 
     fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
