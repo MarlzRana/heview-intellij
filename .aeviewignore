@@ -1,0 +1,6 @@
+# Files aeview should never review (gitignore-style; matched at any depth).
+# Local-only, gitignored working docs (implementation_log.local.md,
+# changes_to_be_made_to_vscode_variant.local.md, *.local.json, …) — mirrors
+# the `*.local*` rule in .gitignore. They're untracked so git-scoped diffs
+# already skip them; this also covers working-tree/untracked review scopes.
+*.local.*
