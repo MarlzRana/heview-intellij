@@ -1005,7 +1005,7 @@ class CommentStoreTest {
     }
 
     @Test
-    fun `updateLocation does not resurrect a consumed thread`(@TempDir dir: Path) {
+    fun `updateLocation updates memory but never recreates a consumed thread's pool file`(@TempDir dir: Path) {
         val store = store(dir)
         store.save(sampleComment(uuid = "u1"))
         // Simulate a hook consuming the thread: its file leaves comments/ and it is no longer persisted.
@@ -1015,7 +1015,54 @@ class CommentStoreTest {
         store.updateLocation("u1", 7, "moved")
 
         assertFalse(Files.exists(dir.resolve("u1.json"))) // must NOT recreate an injectable duplicate
-        assertEquals(42, store.get("u1")?.lineNumber) // in-memory record untouched
+        assertEquals(7, store.get("u1")?.lineNumber) // in-memory record IS updated (a later re-pend uses it)
+        assertEquals("moved", store.get("u1")?.lineContent)
+    }
+
+    @Test
+    fun `updateLocation does not recreate a pool file consumed after its write was queued`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1"))
+        tasks.removeFirst().run() // complete the create-save → file exists, persisted
+
+        store.updateLocation("u1", 7, "moved") // optimistic memory update + queues the write
+
+        // A hook consumes the thread AFTER the write was queued but BEFORE the IO task runs.
+        Files.delete(dir.resolve("u1.json"))
+        store.markProcessed("u1")
+
+        tasks.removeFirst().run() // the queued write must re-check isPersisted/exists and skip
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // not resurrected
+    }
+
+    @Test
+    fun `updateLocation persists a content-only change on the same line`(@TempDir dir: Path) {
+        var writes = 0
+        val store = CommentStore(dir, runIo = { writes++; it.run() }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1")) // line 42, "val x = 1"; 1 write
+        store.updateLocation("u1", 42, "val x = 2") // SAME line, edited text → must still write (guard is OR)
+        assertEquals(2, writes)
+        assertEquals("val x = 2", store.get("u1")?.lineContent)
+        assertEquals(42, store.get("u1")?.lineNumber)
+        assertEquals("val x = 2", CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineContent)
+    }
+
+    @Test
+    fun `updateLocation retries on the next save after a failed write`(@TempDir dir: Path) {
+        var failNext = false
+        // Fail exactly one write by pointing the store at a dir we toggle read-only for that write.
+        val store = CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1"))
+
+        makeReadOnlyOrSkip(dir)
+        store.updateLocation("u1", 7, "moved") // write fails; optimistic memory update is reverted
+        dir.toFile().setWritable(true)
+        assertEquals(42, store.get("u1")?.lineNumber) // reverted, so a same-marker save still differs & retries
+
+        store.updateLocation("u1", 7, "moved") // the retry now succeeds
+        assertEquals(7, store.get("u1")?.lineNumber)
+        assertEquals(7, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineNumber)
     }
 
     @Test

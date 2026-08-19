@@ -111,10 +111,16 @@ class CommentStore(
      * Rewrite only a thread's durable anchor — its `line_number`/`line_content` — after in-IDE edits moved
      * its line (the manager calls this from `beforeDocumentSaving`, so the pool matches the on-disk file the
      * agent reads; plan.html §5, cycle3 #2). Deliberately narrow:
-     * - No-op if unchanged, if the uuid is unknown, or if the thread is not persisted in `comments/`
-     *   (consumed → moved to `processed/`, evicted, or a create-save still in flight): a location writeback
-     *   must never recreate a pool file and resurrect an injectable duplicate. The write re-checks
-     *   `isPersisted` on the IO thread in case a consume/delete lands after the EDT check.
+     * - No-op if unchanged or if the uuid is unknown.
+     * - The **in-memory** record is updated for a known uuid even when it is not persisted (a consumed/Seen
+     *   thread, or a create-save still in flight) so a later re-pend/reopen uses the moved line — but the
+     *   **disk write is skipped** unless the thread is still in `comments/`. A location writeback must never
+     *   recreate a pool file and resurrect an injectable duplicate, so the IO task re-checks `isPersisted`
+     *   AND that the file still exists (the consumption watcher's `markProcessed` can lag a hook's atomic
+     *   move by the WatchService latency; the residual sub-millisecond move-vs-write TOCTOU belongs to the
+     *   deferred cross-process generation fence).
+     * - On a write failure the optimistic in-memory update is reverted, so the next save (with the marker
+     *   unchanged) still differs from the index and retries instead of the no-op guard suppressing it forever.
      * - Does NOT fire the change listener: every open card already sits on the live [RangeMarker], so only
      *   the durable copy the injector/reopen reads needs updating — not what any card shows.
      * - Touches only these two fields (never `status`/`replies`/`created_at`), so it can't reorder injection.
@@ -122,12 +128,15 @@ class CommentStore(
     fun updateLocation(uuid: String, line1Based: Int, lineContent: String) {
         val current = index[uuid] ?: return
         if (current.lineNumber == line1Based && current.lineContent == lineContent) return
-        if (!isPersisted(uuid)) return
         val updated = current.copy(lineNumber = line1Based, lineContent = lineContent)
         index[uuid] = updated
+        if (!isPersisted(uuid)) return
         val json = CommentJson.encode(updated)
         runIo {
-            if (isPersisted(uuid)) writeAtomically(uuid, json)
+            if (!isPersisted(uuid) || !Files.exists(fileFor(uuid))) return@runIo // consumed/deleted — never recreate
+            if (!writeAtomically(uuid, json)) {
+                runEdt { if (index[uuid] === updated) index[uuid] = current } // revert so the next save retries
+            }
         }
     }
 

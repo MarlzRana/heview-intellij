@@ -1,12 +1,15 @@
 package com.marlzrana.heview.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.EditorKind
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileDocumentManagerListener
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
 import com.intellij.testFramework.PlatformTestUtil
@@ -272,25 +275,114 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(1, manager.anchorCountForTest()) // one fresh anchor, no leak
     }
 
-    fun testFileContentReloadDropsStaleAnchorsSoLaterSplitsUsePersistedLine() {
+    fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
         val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
         store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)
         manager.init()
         assertEquals(1, liveCards(e1))
 
-        // Drift the tracked marker: an insert up top moves "l2" (and its RangeMarker) down to line 3, so
-        // a split opened right now would follow it (see testSplitPlacesCardAtLiveLineAfterEditAboveComment).
+        // An edit above the comment shifts its RangeMarker down to line 3 (0-based). A reload must NOT drop
+        // that valid, correctly-shifted marker: trusting it beats the persisted line_number an external edit
+        // never updated. (IntelliJ's real reload diffs the text, so a surviving marker shifts the same way.)
         WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
-
-        // A reload wholesale-replaces the buffer, so the drifted marker is unreliable: the handler drops
-        // it and cards fall back to the persisted line_number, the line a freshly opened editor would use.
         manager.simulateFileContentReloadedForTest(e1.document)
 
-        val e2 = split(e1) // a split created AFTER the reload rebuilds this file's anchor
-        val persistedOffset = e1.document.getLineEndOffset(2) // rebuilt from persisted line_number
-        val driftedOffset = e1.document.getLineEndOffset(3) // where the un-dropped marker would have placed it
-        assertEquals(persistedOffset, hosts.getValue(e2).lastOffset)
-        assertTrue(persistedOffset != driftedOffset)
+        val e2 = split(e1) // a split opened after the reload reuses the kept anchor
+        val shiftedOffset = e1.document.getLineEndOffset(3) // where the kept marker now points ("l2")
+        val staleOffset = e1.document.getLineEndOffset(2) // where a fall-back-to-line_number would misplace it
+        assertEquals(shiftedOffset, hosts.getValue(e2).lastOffset) // followed the marker, not the stale number
+        assertTrue(shiftedOffset != staleOffset)
+    }
+
+    fun testSavingSkipsAnInvalidatedAnchorAndLeavesThePoolUnchanged() {
+        val (e1, path) = openLocalEditor("IM.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2, line_content ""
+        store.save(comment)
+        manager.init()
+
+        // Delete the whole commented line, invalidating its RangeMarker (its range is fully removed). The
+        // fake host doesn't dispose the inlay on a document change, so the now-invalid anchor stays mapped —
+        // exercising the `isValid` filter, not the anchor-retire path.
+        WriteCommandAction.runWriteCommandAction(project) {
+            e1.document.deleteString(e1.document.getLineStartOffset(1), e1.document.getLineStartOffset(2))
+        }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        // The filter must skip it: getLineNumber(invalidMarker.startOffset) would write a garbage line into
+        // the durable pool the injector reads.
+        assertEquals(2, store.get(comment.uuid)?.lineNumber)
+        assertEquals("", store.get(comment.uuid)?.lineContent)
+    }
+
+    fun testRependAfterEditingAboveAConsumedCommentUsesTheMovedLine() {
+        val (e1, path) = openLocalEditor("RP.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "fix me") // line_number = 2
+        store.save(comment)
+        manager.init()
+        store.markProcessed(comment.uuid) // a hook consumes the thread → Seen, no longer persisted
+
+        // Edit above the still-visible Seen card, then save: the writeback updates the in-memory line even
+        // though the thread isn't persisted (no disk write), so a later re-pend revives it at the moved line.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        val reply0 = store.get(comment.uuid)!!.replies!![0]
+        store.rependReply(comment.uuid, reply0, "2026-01-01T00:00:00.000Z") // revive into the pool
+
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // revived at the moved line (was 2)
+    }
+
+    fun testReloadingOneFileLeavesAnotherFilesCardUntouched() {
+        val (eA, pathA) = openLocalEditor("ISOA.txt", "a\nb\n")
+        val (eB, pathB) = openLocalEditor("ISOB.txt", "c\nd\n")
+        val ca = commentAt(pathA, line0Based = 0, content = "in A")
+        store.save(ca)
+        store.save(commentAt(pathB, line0Based = 0, content = "in B"))
+        manager.init()
+        val cardA = manager.cardForTest(eA, ca.uuid) ?: error("no card in A")
+        assertEquals(1, liveCards(eA))
+
+        manager.simulateFileContentReloadedForTest(eB.document) // reload B only
+
+        assertSame(cardA, manager.cardForTest(eA, ca.uuid)) // A untouched (document-identity scope)
+        assertEquals(1, liveCards(eA))
+    }
+
+    fun testSavingOneFileDoesNotRewriteAnotherFilesLine() {
+        val (eA, pathA) = openLocalEditor("ISOC.txt", "l0\nl1\nl2\n")
+        val (eB, _) = openLocalEditor("ISOD.txt", "x\ny\n")
+        val ca = commentAt(pathA, line0Based = 1, content = "in A") // line_number = 2
+        store.save(ca)
+        manager.init()
+
+        // Move A's marker, then save B: the writeback filters by document identity, so A's line must not change.
+        WriteCommandAction.runWriteCommandAction(project) { eA.document.insertString(0, "NEW\n") }
+        manager.simulateBeforeDocumentSavingForTest(eB.document)
+
+        assertEquals(2, store.get(ca.uuid)?.lineNumber) // untouched by B's save
+    }
+
+    fun testFileDocumentManagerListenerIsWiredToTheMessageBus() {
+        val (e1, path) = openLocalEditor("BUS.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "wire me") // line_number = 2
+        store.save(comment)
+        manager.init()
+        val host = hosts.getValue(e1)
+        assertEquals(1, host.live)
+
+        // Publish through the REAL topic (not the @TestOnly seams): proves init() subscribed the listener on
+        // the right bus/topic with both callbacks, not just that the handler bodies work.
+        val publisher = ApplicationManager.getApplication().messageBus
+            .syncPublisher(FileDocumentManagerListener.TOPIC)
+
+        host.disposeLastReturned()
+        assertEquals(0, host.live)
+        publisher.fileContentReloaded(fileOf(e1), e1.document) // reload → card recreated
+        assertEquals(1, host.live)
+
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        publisher.beforeDocumentSaving(e1.document) // save → moved line written back
+        assertEquals(3, store.get(comment.uuid)?.lineNumber)
     }
 
     fun testSavingWritesTheMovedLineBackToTheStore() {
@@ -624,10 +716,12 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
     }
 
     private fun split(editor: Editor): Editor {
-        val vf = FileDocumentManager.getInstance().getFile(editor.document)!!
+        val vf = fileOf(editor)
         val e = EditorFactory.getInstance()
             .createEditor(editor.document, project, vf, false, EditorKind.MAIN_EDITOR)
         openedEditors += e
         return e
     }
+
+    private fun fileOf(editor: Editor): VirtualFile = FileDocumentManager.getInstance().getFile(editor.document)!!
 }

@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 180 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 188 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -60,8 +60,11 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   `Disposable` to unregister. `markProcessed(uuid)` (→ flips every reply Seen) / `evict(uuid)` (peer/user delete) mutate the
   index **in memory only, no disk write** — for the watcher; both idempotent. `updateLocation(uuid, line, lineContent)`
   rewrites **only** the durable anchor (`line_number`/`line_content`) — the save-time writeback; no-op unless
-  changed / not persisted (never resurrects a consumed thread) and **fires no change listener** (the card
-  already tracks the live marker). Per-reply state
+  changed; updates the in-memory record even for a not-persisted (Seen/in-flight) thread but **skips the disk
+  write** unless the file is still in `comments/` (IO-side `isPersisted` + `Files.exists` recheck, so it never
+  recreates a consumed thread — residual move-vs-write TOCTOU → deferred generation fence); reverts the memory
+  update on a write failure so the next save retries; **fires no change listener** (the card already tracks the
+  live marker). Per-reply state
   machine (plan §5): `addReply`/`editReply`/`rependReply`/`deleteReply` mutate the reply list, `recompute`
   the derived fields, and re-persist via a private `revive()` that **first removes the `processed/`
   tombstone** (a tombstone for an in-index uuid is the watcher's Seen signal — leaving it would let the next
@@ -88,14 +91,17 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   and reconciles all open editors on any `CommentStore` change so a comment appears/disappears in every split.
   A third trigger — a `FileDocumentManagerListener` (app-level `TOPIC`, connection parented to the manager) —
   handles an **external file reload** (an agent editing a file to resolve a comment): `fileContentReloaded`
-  disposes the inlays + scrambles the anchors but fires no store change, so the handler drops that document's
-  anchors (matched by `RangeMarker.document ===`, so cards rebuild from the persisted `line_number`, not the
-  drifted marker) and reconciles every open editor of the file. The same listener's `beforeDocumentSaving`
-  does the **line_number writeback**: for each anchor on the saved document it writes the marker's current
-  line/line_content back via `store.updateLocation` (a no-op unless it moved), so the durable `line_number`
-  tracks the on-disk file the agent reads. In-IDE edits track the live line; only an external reload falls
-  back to `line_number`. Writeback is save-gated, not edit-gated — an unsaved edit leaves the pool alone (the
-  agent still reads the old on-disk file, so the stale-looking number is actually consistent with it).
+  can dispose the inlays but fires no store change, so the handler reconciles every open editor of the file
+  (matched by `document ===`) to recreate the disposed cards. It **trusts the anchors** — IntelliJ's reload
+  diffs the text (common-affix trimming in `DocumentImpl.replaceString`), so a surviving `RangeMarker` is
+  correctly shifted and beats the persisted `line_number` an external edit never updated; only a marker the
+  reload genuinely invalidated is rebuilt from `line_number` (by `currentLineEndOffset`, when a disposed card
+  is recreated). The same listener's `beforeDocumentSaving` does the **line_number writeback**: for each valid
+  anchor on the saved document it writes the marker's current line/line_content back via `store.updateLocation`
+  (a no-op unless it moved), so the durable `line_number` tracks the on-disk file the agent reads. In-IDE edits
+  track the live line; only an external reload falls back to `line_number`. Writeback is save-gated, not
+  edit-gated — an unsaved edit leaves the pool alone (the agent still reads the old on-disk file, so the
+  stale-looking number is actually consistent with it).
   Owns the create flow too (`compose(editor)`) — tracks the thread under its uuid *before* `store.save` fires, so
   reconcile never double-renders the composing editor. A shared `newThread()` wires every card's per-reply
   callbacks (`onReply`/`onEditReply`/`onDeleteReply`/`onRependReply`) to the store (`created_at` via
@@ -242,7 +248,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **180 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **188 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
@@ -257,17 +263,18 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **180 tests**, `buildPlugin` clean.
+Gate: **188 tests**, `buildPlugin` clean.
 
-**Shipped + dogfooded — external-file-reload handling** (`0af4057`, LOCAL/unpushed; former cycle-2 #4 gap). An
-agent editing a file to resolve a comment triggers a whole-document reload that disposes the inlays and can
-leave the per-uuid `RangeMarker`s on a shifted line, and — unlike a store change — fires no reconcile, so cards
-went blank/stale until reopen. Fix in `ui/CommentInlayManager`: a `FileDocumentManagerListener` (app-level
-`TOPIC`, connection parented to the manager) whose `fileContentReloaded` drops that document's anchors (matched
-by `RangeMarker.document ===`, so cards rebuild from the persisted `line_number` — the line a fresh editor
-uses — rather than the drifted marker) then reconciles every open editor of the file. Driven in tests via a
-`@TestOnly simulateFileContentReloadedForTest(document)` seam. Dogfood confirmed (a source-file reload keeps
-the card).
+**Shipped + dogfooded + `/aeview-loop`-hardened — external-file-reload handling** (former cycle-2 #4 gap). An
+agent editing a file to resolve a comment triggers a document reload that can dispose the inlays and — unlike a
+store change — fires no reconcile, so cards went blank until reopen. Fix in `ui/CommentInlayManager`: a
+`FileDocumentManagerListener` (app-level `TOPIC`, connection parented to the manager) whose `fileContentReloaded`
+reconciles every open editor of the file to recreate disposed cards. **The panel corrected the original design:**
+it now **trusts the reload-shifted anchors** rather than dropping them — IntelliJ's reload diffs the text, so a
+surviving `RangeMarker` stays correctly attached to its code and beats the stale `line_number` (an external edit
+fires a reload, not a save, so the writeback below never ran for it); only a genuinely invalidated marker falls
+back to `line_number`. Driven in tests via a `@TestOnly simulateFileContentReloadedForTest(document)` seam + a
+real-message-bus wiring test. Dogfood confirmed (a source-file reload keeps the card).
 
 **Shipped — durable-anchor line_number writeback** (LOCAL/unpushed; former cycle-3 #2 gap). The persisted
 `line_number`/`line_content` were frozen at submit, so after in-IDE edits above a comment the on-disk number
@@ -277,11 +284,17 @@ went stale — and the injector, a reopen, and the reload fallback all read it. 
 from disk, so the pool should match it precisely when the document lands on disk; an unsaved edit correctly
 leaves the pool alone (this supersedes the backlog's "coalesced document-change listener" idea, which would
 desync the pool from the unsaved on-disk file). `updateLocation` touches only `line_number`/`line_content`,
-no-ops unless changed, refuses to resurrect a consumed thread, and fires no change listener. +8 tests (6 store,
-2 manager via a `simulateBeforeDocumentSavingForTest` seam).
+no-ops unless changed, refuses to resurrect a consumed thread, and fires no change listener.
 
-**Next increment (maintainer choice):** the **visual pass**, remaining **Phase 3** (tool window / status-bar
-count / settings), **multi-client sync + generation fencing**, or **MODIFY-sync** (pick up an externally-edited
-comment's *content* into open clients — distinct from the anchor writeback above). Full deferred backlog
-(`CommentJson.decode` validation, GitHub identity, restore-from-tombstone, …) is in `implementation_log.local.md`.
+Both increments ran through a `/aeview-loop` (scope `f22ca42..HEAD`); the panel's fixes are folded in above.
+Gate: **188 tests**, `buildPlugin` clean.
+
+**Next increment (maintainer chose): orphan-comment binning.** When a reload invalidates a comment's anchor
+(the commented line was deleted/rewritten so it can no longer be tracked — *anchor-lost only*, never a mere
+re-indent or a still-valid marker), **delete** the comment from the pool (`store.delete`, so it's gone for the
+injector + peers too) instead of showing it on an unrelated line. Decided via AskUserQuestion; deferred to its
+own increment (destructive → its own careful dogfood). Runner-ups: the **visual pass**, remaining **Phase 3**
+(tool window / status-bar count / settings), **multi-client sync + generation fencing** (also owns the residual
+writeback-vs-consume TOCTOU), or **MODIFY-sync** (pick up an externally-edited comment's *content*). Full deferred
+backlog (`CommentJson.decode` validation, GitHub identity, restore-from-tombstone, …) is in `implementation_log.local.md`.
 </status>

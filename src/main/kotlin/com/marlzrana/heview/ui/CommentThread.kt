@@ -114,12 +114,24 @@ internal class CommentThread(
         if (disposed) return
         val shown = displayed ?: return
         if (shown == comment) return
+        // A location-only writeback (the save-time anchor writeback bumps line_number/line_content in the
+        // store) changes nothing the card renders. Advance the snapshot but don't rebuild — otherwise the
+        // next unrelated global reconcile would rebuild the stack, re-disabling Delete and clobbering focus.
+        if (shown.sameDisplayAs(comment)) {
+            displayed = comment
+            return
+        }
         if (editingIndex != null) {
             displayed = comment
             return
         }
         renderThread(comment)
     }
+
+    // The card renders only the replies and the derived status/content; line_number/line_content/created_at
+    // are durable-anchor bookkeeping and never shown, so a change to them alone must not trigger a rebuild.
+    private fun HeviewComment.sameDisplayAs(other: HeviewComment): Boolean =
+        status == other.status && content == other.content && replies == other.replies
 
     /** Insert the card below the target line and wire teardown. Returns false if the host declines. */
     private fun place(): Boolean {

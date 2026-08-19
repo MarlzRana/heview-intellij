@@ -34,10 +34,11 @@ import org.jetbrains.annotations.TestOnly
  * - **Store changes** — a change listener reconciles every open editor so a comment added or deleted
  *   in one editor appears/disappears in every split showing the same file.
  * - **External file reloads** — a [FileDocumentManagerListener] reconciles when an open file is
- *   reloaded from disk (an agent editing a file to resolve a comment), which disposes the inlays and
- *   scrambles the anchors but fires no store change. See [onFileContentReloaded]. The same listener's
- *   `beforeDocumentSaving` writes each moved anchor's line back to the pool so the durable `line_number`
- *   stays in step with the on-disk file the agent reads. See [onBeforeDocumentSaving].
+ *   reloaded from disk (an agent editing a file to resolve a comment), which can dispose the inlays but
+ *   fires no store change. See [onFileContentReloaded] (it trusts the reload-shifted anchors, rebuilding
+ *   only cards the reload actually disposed). The same listener's `beforeDocumentSaving` writes each moved
+ *   anchor's line back to the pool so the durable `line_number` stays in step with the on-disk file the
+ *   agent reads. See [onBeforeDocumentSaving].
  *
  * The create flow is routed through [compose] (rather than living in the action) precisely so this
  * manager tracks the resulting thread before [CommentStore.save] fires: reconcile then sees the card
@@ -204,13 +205,15 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * split. EDT-confined: a reload runs on the EDT, like every other callback here.
      */
     private fun onFileContentReloaded(document: Document) {
-        anchors.entries
-            .filter { it.value.document === document }
-            .map { it.key }
-            .forEach { anchors.remove(it)?.dispose() }
+        // A reload fires no store change, so nothing else reconciles: cards the reload disposed (its text
+        // range was replaced) would stay gone until reopen. Reconcile every open editor of this document to
+        // recreate them. We deliberately do NOT drop the anchors: IntelliJ's reload diffs the text (common
+        // prefix/suffix trimming in DocumentImpl.replaceString), so a surviving RangeMarker is correctly
+        // shifted and stays attached to its code — trusting it beats falling back to a line_number the
+        // external edit never updated. Only a marker the reload genuinely invalidated is rebuilt from the
+        // persisted line_number, which currentLineEndOffset already handles when a disposed card is recreated.
         rendered.keys
             .filter { it.document === document }
-            .toList()
             .forEach { reconcile(it) }
     }
 
@@ -226,7 +229,6 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     private fun onBeforeDocumentSaving(document: Document) {
         anchors.entries
             .filter { it.value.document === document && it.value.isValid }
-            .toList()
             .forEach { (uuid, marker) ->
                 val line = clampLine(document, document.getLineNumber(marker.startOffset))
                 val lineContent = document.getText(
