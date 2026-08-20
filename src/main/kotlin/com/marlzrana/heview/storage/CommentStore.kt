@@ -136,8 +136,13 @@ class CommentStore(
             if (!isPersisted(uuid) || !Files.exists(fileFor(uuid))) return@runIo // consumed/deleted — never recreate
             // Encode off the EDT: this runs inside FileDocumentManager's save write-action, and a large thread
             // (many replies) would otherwise stall the save. `updated` is an immutable snapshot, safe here.
-            if (!writeAtomically(uuid, CommentJson.encode(updated))) {
-                runEdt { if (index[uuid] === updated) index[uuid] = current } // revert so the next save retries
+            // replaceOnly: re-check the dest exists right before the atomic move, so the encode + tmp-write time
+            // can't let this RECREATE a file a hook claimed into processed/ in the meantime (writeAtomically
+            // otherwise creates the dest). A false result there is a consume, not a failure — leave memory at
+            // the new line (harmless for the now-Seen thread) and don't revert; only a genuine write failure,
+            // where the pool file is still present, reverts so the next save retries.
+            if (!writeAtomically(uuid, CommentJson.encode(updated), replaceOnly = true) && Files.exists(fileFor(uuid))) {
+                runEdt { if (index[uuid] === updated) index[uuid] = current }
             }
         }
     }
@@ -440,13 +445,22 @@ class CommentStore(
      * Write to a temp file in the same directory, then atomically move it over the target. Returns true
      * if the comment is now on disk — the caller records it as persisted only then, so a failed write
      * keeps the in-memory record without the watcher later treating the missing file as a delete.
+     *
+     * [replaceOnly] (the location writeback) re-checks the destination still exists immediately before the
+     * move and returns false without writing if it is gone — so the encode + tmp-write time can't let a
+     * writeback RECREATE a file a hook has claimed into `processed/` (create-or-replace is only for a genuine
+     * save/revive). The rename-vs-rename sliver that remains is the deferred cross-process generation fence.
      */
-    private fun writeAtomically(uuid: String, json: String): Boolean {
+    private fun writeAtomically(uuid: String, json: String, replaceOnly: Boolean = false): Boolean {
         return try {
             Files.createDirectories(commentsDir)
             val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
             try {
                 Files.writeString(tmp, json)
+                if (replaceOnly && !Files.exists(fileFor(uuid))) {
+                    Files.deleteIfExists(tmp) // dest claimed away during the write — never recreate it
+                    return false
+                }
                 try {
                     Files.move(tmp, fileFor(uuid), StandardCopyOption.ATOMIC_MOVE)
                 } catch (e: IOException) {

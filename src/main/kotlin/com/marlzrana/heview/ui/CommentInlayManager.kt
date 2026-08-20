@@ -234,7 +234,17 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * when the document lands on disk (an unsaved edit correctly leaves the pool alone — the agent still
      * sees the old file). See [writeBackAnchors].
      */
-    private fun onBeforeDocumentSaving(document: Document) = writeBackAnchors(document)
+    private fun onBeforeDocumentSaving(document: Document) {
+        writeBackAnchors(document)
+        // Deferred-close cleanup: if the last editor of this document already closed, `forget` left its
+        // anchors in place (the document was unsaved and this pending save-on-close still needed them for the
+        // writeback above). Retire them now that the write has read them.
+        if (rendered.keys.none { it.document === document }) {
+            anchors.entries.filter { it.value.document === document }
+                .map { it.key }.toList()
+                .forEach { anchors.remove(it)?.dispose() }
+        }
+    }
 
     /**
      * Write each valid anchor on [document] back to the pool as its comment's current `line_number` /
@@ -266,12 +276,16 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         val cards = rendered.getOrPut(editor) { LinkedHashMap() }
         val desired = if (path == null) emptyMap() else store.forAbsPath(path).associateBy { it.uuid }
 
-        // Remove cards whose comment is gone. Drop from the map before disposing so the card's
-        // onDispose never observes a stale entry; retire the anchor once no editor shows the comment.
-        cards.keys.filter { it !in desired }.forEach { uuid ->
-            cards.remove(uuid)?.dispose()
-            retireAnchorIfUnused(uuid)
-        }
+        // Remove cards whose comment is gone (dropped from the map before dispose so onDispose sees no stale
+        // entry). Then retire anchors on THIS document whose comment left the store — gated on STORE presence,
+        // not card presence: a comment whose inlay the platform already disposed (card stripped from `cards`)
+        // is still cleaned up on delete, while a reload-transient (comment still in the store, card momentarily
+        // absent) keeps its shifted marker so trust-the-marker holds.
+        cards.keys.filter { it !in desired }.forEach { uuid -> cards.remove(uuid)?.dispose() }
+        anchors.entries
+            .filter { (uuid, m) -> m.document === editor.document && store.get(uuid) == null }
+            .map { it.key }.toList()
+            .forEach { anchors.remove(it)?.dispose() }
 
         // Add cards for comments not yet shown; refresh a shown card whose comment changed in place
         // (e.g. the consumption watcher flipping a comment to PROCESSED → the card relabels to "Seen").
@@ -365,15 +379,18 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         composing.remove(editor)?.toList()?.forEach { it.dispose(preserveScroll = false) }
         val cards = rendered.remove(editor) ?: return
         cards.values.toList().forEach { it.dispose(preserveScroll = false) }
-        // Retire markers whose Document no longer has ANY open editor. A RangeMarker pins its Document, so
-        // closing the last editor of a file must drop its markers — including ones whose card the platform
-        // already stripped from `cards` via onDispose (which no longer retires, so a reload can reuse a
-        // shifted marker). We key on the Document, NOT "no card shows it": a still-open split whose inlay was
-        // transiently disposed has an empty card map but a live, reusable marker — retiring it here would send
-        // its next reconcile back to the stale line_number.
+        // Retire markers whose Document no longer has ANY open editor (a RangeMarker pins its Document, so the
+        // last editor of a file closing must drop its markers — including ones whose card the platform stripped
+        // from `cards` via onDispose). Keyed on the Document, NOT "no card shows it", so a still-open split
+        // whose inlay was transiently disposed keeps its live marker. BUT skip an **unsaved** document: closing
+        // its last editor triggers a save-on-close whose `beforeDocumentSaving` still needs these anchors for
+        // the line_number writeback, and editorReleased fires first — onBeforeDocumentSaving retires them once
+        // it has written them (an unsaved doc that is never saved leaves the disk unchanged, so its stale
+        // line_number stays consistent, and manager.dispose() sweeps the lingering anchors on project close).
+        val fdm = FileDocumentManager.getInstance()
         anchors.entries
-            .filter { (_, marker) -> rendered.keys.none { it.document === marker.document } }
-            .map { it.key }
+            .filter { (_, m) -> rendered.keys.none { it.document === m.document } && !fdm.isDocumentUnsaved(m.document) }
+            .map { it.key }.toList()
             .forEach { anchors.remove(it)?.dispose() }
     }
 

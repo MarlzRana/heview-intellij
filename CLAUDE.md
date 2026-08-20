@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 205 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 209 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -63,10 +63,11 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   changed; updates the in-memory record for any known uuid (even a not-persisted Seen/in-flight thread, so a
   later re-pend uses the moved line). The disk write is **always queued** on the serial IO executor (never
   short-circuited on the EDT — so a write requested while the create-save is in flight lands *behind* it rather
-  than being dropped), and the IO task **skips** unless the file is still in `comments/` (`isPersisted` +
-  `Files.exists` recheck, so it never recreates a consumed thread — residual move-vs-write TOCTOU → deferred
-  generation fence); reverts the memory update on a write failure so the next save retries; **fires no change
-  listener** (the card already tracks the live marker). Per-reply state
+  than being dropped), the encode runs off the EDT, and the write is **replace-only** (`writeAtomically(…,
+  replaceOnly = true)` re-checks the dest exists right before the atomic move) so it never recreates a thread a
+  hook has claimed into `processed/` — the residual rename-vs-rename sliver → deferred generation fence; a real
+  write failure reverts the memory update so the next save retries; **fires no change listener** (the card
+  already tracks the live marker). Per-reply state
   machine (plan §5): `addReply`/`editReply`/`rependReply`/`deleteReply` mutate the reply list, `recompute`
   the derived fields, and re-persist via a private `revive()` that **first removes the `processed/`
   tombstone** (a tombstone for an in-index uuid is the watcher's Seen signal — leaving it would let the next
@@ -97,10 +98,14 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   (matched by `document ===`) to recreate the disposed cards. It **trusts the anchors** — IntelliJ's reload
   diffs the text (common-affix trimming in `DocumentImpl.replaceString`), so a surviving `RangeMarker` is
   correctly shifted and beats the persisted `line_number` an external edit never updated; only a marker the
-  reload genuinely invalidated is rebuilt from `line_number` (by `currentLineEndOffset`). Crucially, the display
-  card's `onDispose` does **not** retire the shared anchor (a transient reload-dispose keeps the valid marker so
-  the immediately-recreated card reuses its shifted position; a deleted comment / closed editor still retire it
-  via reconcile's removal branch / `forget`). Both `fileContentReloaded` and `beforeDocumentSaving` run the same
+  reload genuinely invalidated is rebuilt from `line_number` (by `currentLineEndOffset`). **Anchor retirement is
+  keyed on the real conditions, never on transient card presence** (the display card's `onDispose` does NOT
+  retire — a reload-dispose must keep the valid marker for the immediately-recreated card): reconcile retires a
+  marker when its comment has left the **store** (`store.get(uuid) == null`, so a delete is cleaned up even if
+  the card was already stripped); `forget` retires a marker when no open editor shares its **`Document`** — but
+  DEFERS an **unsaved** document (its pending save-on-close still needs the anchor for the writeback, and
+  editorReleased fires first), which `beforeDocumentSaving` then retires after writing. Both `fileContentReloaded`
+  and `beforeDocumentSaving` run the same
   **line_number writeback** (`writeBackAnchors`): for each valid anchor on the document, write the marker's
   current line/line_content back via `store.updateLocation` (a no-op unless it moved), so the durable
   `line_number` tracks the on-disk file the agent reads. Both are correct sync points — in each, the document
@@ -252,7 +257,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **205 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **209 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
@@ -267,7 +272,7 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **205 tests**, `buildPlugin` clean.
+Gate: **209 tests**, `buildPlugin` clean.
 
 **Shipped + dogfooded + `/aeview-loop`-hardened — external-file-reload handling** (former cycle-2 #4 gap). An
 agent editing a file to resolve a comment triggers a document reload that can dispose the inlays and — unlike a
@@ -293,15 +298,16 @@ file). `updateLocation` touches only `line_number`/`line_content`, no-ops unless
 on the serial IO executor (so an in-flight-create write isn't dropped) which skips unless the file is still in
 `comments/` (never resurrects a consumed thread), reverts on write failure, and fires no change listener.
 
-Both increments went through a **5-cycle `/aeview-loop`** (scope `f22ca42..HEAD`; findings 13→12→12→7→2, stopped
-at the cap). Each cycle's fixes are folded in above; the loop twice caught a regression in its own prior fix
-around anchor lifecycle (cycle 3: a `RangeMarker`/`Document` leak on close; cycle 5: `forget` over-retiring a
-still-open editor's marker — now keyed on `RangeMarker.document`) and moved the writeback's Gson encode off the
-EDT. Cycle 5's fix is gate-green (205 tests) but wasn't independently re-reviewed (cap) — a 6th verification
-cycle is opt-in. Deferred (recorded): the cross-process
+Both increments went through a **6-cycle `/aeview-loop`** (scope `f22ca42..HEAD`; findings 13→12→12→7→2→6). The
+anchor lifecycle was the recurring hot-spot — the panel caught a regression in the prior cycle's fix three times
+(c3 leak on close → c5 over-retire → c6 conf-1.0 loss of the writeback when an unsaved file's last editor
+closes), which drove the **final, correct retirement model** now documented above (store-absence + document
+has-no-editor, unsaved-deferred; never card-presence). c6 also gave the writeback a replace-only write path.
+Cycle 6's fixes are gate-green (209 tests) but weren't independently re-reviewed (stopped there) — dogfooding
+the anchor lifecycle is the better next signal than more cycles. Deferred (recorded): the cross-process
 **generation fence** (a residual writeback-vs-consume TOCTOU + a peer-overwrite window on the shared pool) and
 the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
-Gate: **205 tests**, `buildPlugin` clean.
+Gate: **209 tests**, `buildPlugin` clean.
 
 **Next increment (maintainer chose): orphan-comment binning.** When a reload invalidates a comment's anchor
 (the commented line was deleted/rewritten so it can no longer be tracked — *anchor-lost only*, never a mere

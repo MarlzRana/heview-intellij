@@ -519,6 +519,66 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals("l1", store.get(comment.uuid)?.lineContent)
     }
 
+    fun testStoreDeleteRetiresTheAnchorWhileTheEditorStaysOpen() {
+        val (e1, path) = openLocalEditor("DEL.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x")
+        store.save(comment)
+        manager.init()
+        assertEquals(1, manager.anchorCountForTest())
+
+        store.delete(comment.uuid) // editor stays open
+        assertEquals(0, manager.anchorCountForTest()) // reconcile's store-gone sweep retires it (no Document leak)
+    }
+
+    fun testDeletingACommentWhoseInlayWasDisposedRetiresTheAnchor() {
+        val (e1, path) = openLocalEditor("DEL2.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x")
+        store.save(comment)
+        manager.init()
+        hosts.getValue(e1).disposeLastReturned() // platform disposes the inlay; card stripped from `rendered`
+        assertEquals(1, manager.anchorCountForTest()) // anchor kept (onDispose no longer retires)
+
+        store.evict(comment.uuid) // then the comment leaves the store, editor still open
+        // The removal branch (cards.keys) can't see the stripped uuid; the store-gone sweep retires it anyway.
+        assertEquals(0, manager.anchorCountForTest())
+    }
+
+    fun testFileContentReloadDoesNotDoubleRenderASurvivingCard() {
+        val (e1, path) = openLocalEditor("NODUP.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "x")
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        val baseline = card.displayRenderCount
+
+        // A reload with the inlay NOT disposed: reconcile must refresh the surviving card in place, never place
+        // a second inlay over it.
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertEquals(1, liveCards(e1))
+        assertEquals(baseline, card.displayRenderCount) // refreshed in place (unchanged), not rebuilt/duplicated
+    }
+
+    fun testClosingAnUnsavedFileDefersAnchorRetirementUntilTheWriteback() {
+        val (e1, path) = openLocalEditor("UNSAVED.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        store.save(comment)
+        manager.init()
+        val doc = e1.document
+
+        WriteCommandAction.runWriteCommandAction(project) { doc.insertString(0, "NEW\n") } // shift + modify
+        // Premise: the edit leaves the document unsaved (else forget would retire at close, losing the shift).
+        assertTrue(FileDocumentManager.getInstance().isDocumentUnsaved(doc))
+
+        EditorFactory.getInstance().releaseEditor(e1) // editorReleased → forget; fires BEFORE the save-on-close
+        openedEditors.remove(e1)
+        assertEquals(1, manager.anchorCountForTest()) // NOT retired — the pending save still needs the anchor
+
+        manager.simulateBeforeDocumentSavingForTest(doc) // the deferred save-on-close
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // writeback captured the shift…
+        assertEquals(0, manager.anchorCountForTest()) // …and only then was the anchor retired
+    }
+
     fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
         val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
         store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)
