@@ -259,7 +259,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadRecreatesCardsTheReloadDisposed() {
         val (e1, path) = openLocalEditor("RL.txt", "a\nb\n")
-        val comment = commentAt(path, line0Based = 0, content = "please fix")
+        val comment = commentAt(path, line0Based = 0, content = "please fix", lineContent = "a")
         store.save(comment)
         manager.init()
         val host = hosts.getValue(e1)
@@ -277,7 +277,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadRecreatesADisposedCardOnTheShiftedLine() {
         val (e1, path) = openLocalEditor("RLS.txt", "l0\nl1\nl2\nl3\n")
-        val comment = commentAt(path, line0Based = 2, content = "on l2") // line_number = 3
+        val comment = commentAt(path, line0Based = 2, content = "on l2", lineContent = "l2") // line_number = 3
         store.save(comment)
         manager.init()
         val host = hosts.getValue(e1)
@@ -297,7 +297,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadRecreatesCardsInEverySplit() {
         val (e1, path) = openLocalEditor("RLSP.txt", "a\nb\n")
-        store.save(commentAt(path, line0Based = 0, content = "x"))
+        store.save(commentAt(path, line0Based = 0, content = "x", lineContent = "a"))
         manager.init()
         val e2 = split(e1)
         assertEquals(1, liveCards(e1))
@@ -314,7 +314,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadWritesMovedLinesBackToTheStore() {
         val (e1, path) = openLocalEditor("RLWB.txt", "l0\nl1\nl2\n")
-        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1") // line_number = 2
         store.save(comment)
         manager.init()
 
@@ -392,28 +392,97 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(0, manager.anchorCountForTest()) // last editor gone → retired
     }
 
-    fun testFileContentReloadReplacesACardWhoseAnchorWasInvalidated() {
+    // A reload mutates the whole document via a diffing replaceString (common-affix trim) — NOT a raw
+    // deleteString — so a surviving marker SHIFTS and stays valid; orphan-binning keys on content drift, not
+    // isValid. These tests reproduce that by replacing the full document text, then firing the reload handler.
+    private fun reloadWith(editor: Editor, newText: String) {
+        WriteCommandAction.runWriteCommandAction(project) {
+            editor.document.replaceString(0, editor.document.textLength, newText)
+        }
+        manager.simulateFileContentReloadedForTest(editor.document)
+    }
+
+    fun testFileContentReloadBinsACommentWhoseLineWasDeleted() {
         val (e1, path) = openLocalEditor("INV.txt", "l0\nl1\nl2\n")
-        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
         store.save(comment)
         manager.init()
-        val before = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        assertNotNull(manager.cardForTest(e1, comment.uuid))
 
-        // Invalidate the marker (delete the commented line's range) WITHOUT disposing the inlay (the fake host
-        // ignores document changes), so the card stays tracked with an invalid anchor — the [5] gap.
-        WriteCommandAction.runWriteCommandAction(project) {
-            e1.document.deleteString(e1.document.getLineStartOffset(1), e1.document.getLineStartOffset(2))
-        }
-        manager.simulateFileContentReloadedForTest(e1.document)
+        // The agent deleted the commented line "l1" on disk. A real reload shifts the (still-valid) marker onto
+        // "l2", so its current line no longer matches the stored line_content "l1" — content drift ⇒ ORPHANED
+        // ⇒ store.delete'd from the pool (gone for the injector + peers too), not re-placed on unrelated code.
+        reloadWith(e1, "l0\nl2\n")
 
-        val after = manager.cardForTest(e1, comment.uuid)
-        assertNotNull(after) // still shown (re-placed, not stuck/blank at a stale offset)
-        assertNotSame(before, after) // dropped + recreated via the line_number fallback, not merely refreshed
+        assertNull(store.get(comment.uuid)) // binned from the shared pool
+        assertNull(manager.cardForTest(e1, comment.uuid)) // card gone (delete's reconcile disposed it)
+        assertEquals(0, liveCards(e1))
+        assertEquals(0, manager.anchorCountForTest()) // the anchor was swept — no RangeMarker leak
+    }
+
+    fun testFileContentReloadBinsACommentWhoseLineTextWasExternallyRewritten() {
+        val (e1, path) = openLocalEditor("EDIT.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+
+        // An external edit rewrote the commented line's code ("l1" -> "l1-edited"). The marker survives but its
+        // line no longer matches the stored line_content — a real content change (not whitespace) ⇒ binned.
+        reloadWith(e1, "l0\nl1-edited\nl2\n")
+
+        assertNull(store.get(comment.uuid))
+        assertEquals(0, liveCards(e1))
+    }
+
+    fun testFileContentReloadKeepsACommentWhenOnlyLinesAboveChanged() {
+        val (e1, path) = openLocalEditor("KEEP.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+
+        // A reload that inserted a line ABOVE the comment shifts the marker but keeps it on "l1" — content
+        // still matches the stored line_content, so the comment is KEPT (trust-the-marker) and the writeback
+        // advances its line_number. This is the case orphan-binning must NOT touch.
+        reloadWith(e1, "NEW\nl0\nl1\nl2\n")
+
+        assertNotNull(store.get(comment.uuid))
+        assertNotNull(manager.cardForTest(e1, comment.uuid))
         assertEquals(1, liveCards(e1))
-        // writeBackAnchors skipped the invalid marker, so the recreated card falls back to the persisted
-        // line_number (clamped into the now-shorter document), NOT offset 0 or the stale invalid-marker offset.
-        val fallbackLine = (comment.lineNumber - 1).coerceIn(0, e1.document.lineCount - 1)
-        assertEquals(e1.document.getLineEndOffset(fallbackLine), hosts.getValue(e1).lastOffset)
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // "l1" now on line 3 (1-based) — survivor written back
+    }
+
+    fun testFileContentReloadKeepsAReindentedComment() {
+        val (e1, path) = openLocalEditor("REIND.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+
+        // An external reformat only re-indented the commented line ("l1" -> "    l1"): a whitespace-only change,
+        // so stored.trim() == current.trim() and the comment is KEPT (the trimmed-match strictness decision).
+        reloadWith(e1, "l0\n    l1\nl2\n")
+
+        assertNotNull(store.get(comment.uuid)) // not binned — re-indent tolerated
+        assertNotNull(manager.cardForTest(e1, comment.uuid))
+    }
+
+    fun testFileContentReloadBinsAnOrphanedCommentAcrossEverySplit() {
+        val (e1, path) = openLocalEditor("INVSP.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+        val e2 = split(e1)
+        assertEquals(1, liveCards(e1))
+        assertEquals(1, liveCards(e2))
+
+        // Both splits share one Document and one anchor. Deleting the commented line drifts that single marker
+        // off "l1"; on reload a single store.delete must cascade the removal to BOTH splits and drop the record
+        // from the shared pool exactly once.
+        reloadWith(e1, "l0\nl2\n")
+
+        assertNull(store.get(comment.uuid))
+        assertEquals(0, liveCards(e1))
+        assertEquals(0, liveCards(e2))
+        assertEquals(0, manager.anchorCountForTest())
     }
 
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
@@ -504,7 +573,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadWritesBackAfterTheInlayWasDisposed() {
         val (e1, path) = openLocalEditor("RLWB2.txt", "l0\nl1\nl2\n")
-        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number 2
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1") // line_number 2
         store.save(comment)
         manager.init()
 
@@ -545,7 +614,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadDoesNotDoubleRenderASurvivingCard() {
         val (e1, path) = openLocalEditor("NODUP.txt", "a\nb\n")
-        val comment = commentAt(path, line0Based = 0, content = "x")
+        val comment = commentAt(path, line0Based = 0, content = "x", lineContent = "a")
         store.save(comment)
         manager.init()
         val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
@@ -581,7 +650,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
         val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
-        store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)
+        store.save(commentAt(path, line0Based = 2, content = "on l2", lineContent = "l2")) // line_number = 3 (0-based 2)
         manager.init()
         assertEquals(1, liveCards(e1))
 
@@ -613,7 +682,10 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         manager.simulateBeforeDocumentSavingForTest(e1.document)
 
         // The filter must skip it: getLineNumber(invalidMarker.startOffset) would write a garbage line into
-        // the durable pool the injector reads.
+        // the durable pool the injector reads. And binning is RELOAD-ONLY — a save must NOT delete the comment
+        // for an invalidated anchor (an in-IDE line deletion stays undoable until the file is reloaded), so the
+        // record survives with its original line untouched.
+        assertNotNull(store.get(comment.uuid)) // not binned on save (reload-only)
         assertEquals(2, store.get(comment.uuid)?.lineNumber)
         assertEquals("", store.get(comment.uuid)?.lineContent)
     }
@@ -639,9 +711,9 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
     fun testReloadingOneFileLeavesAnotherFilesCardUntouched() {
         val (eA, pathA) = openLocalEditor("ISOA.txt", "a\nb\n")
         val (eB, pathB) = openLocalEditor("ISOB.txt", "c\nd\n")
-        val ca = commentAt(pathA, line0Based = 0, content = "in A")
+        val ca = commentAt(pathA, line0Based = 0, content = "in A", lineContent = "a")
         store.save(ca)
-        store.save(commentAt(pathB, line0Based = 0, content = "in B"))
+        store.save(commentAt(pathB, line0Based = 0, content = "in B", lineContent = "c"))
         manager.init()
         val cardA = manager.cardForTest(eA, ca.uuid) ?: error("no card in A")
         assertEquals(1, liveCards(eA))
@@ -668,7 +740,7 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     fun testFileDocumentManagerListenerIsWiredToTheMessageBus() {
         val (e1, path) = openLocalEditor("BUS.txt", "l0\nl1\nl2\n")
-        val comment = commentAt(path, line0Based = 1, content = "wire me") // line_number = 2
+        val comment = commentAt(path, line0Based = 1, content = "wire me", lineContent = "l1") // line_number = 2
         store.save(comment)
         manager.init()
         val host = hosts.getValue(e1)
@@ -996,12 +1068,12 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
     private fun liveCards(editor: Editor): Int = hosts[editor]?.live ?: 0
 
-    private fun commentAt(absPath: String, line0Based: Int, content: String) =
+    private fun commentAt(absPath: String, line0Based: Int, content: String, lineContent: String = "") =
         newFileComment(
             workspace = project.basePath ?: tempDir.toString(),
             absPath = absPath,
             line0Based = line0Based,
-            lineContent = "",
+            lineContent = lineContent,
             content = content,
             author = "tester",
             createdAt = "2026-01-01T00:00:00.000Z",

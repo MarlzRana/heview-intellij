@@ -36,9 +36,10 @@ import org.jetbrains.annotations.TestOnly
  * - **External file reloads** — a [FileDocumentManagerListener] reconciles when an open file is
  *   reloaded from disk (an agent editing a file to resolve a comment), which can dispose the inlays but
  *   fires no store change. See [onFileContentReloaded] (it trusts the reload-shifted anchors, rebuilding
- *   only cards the reload actually disposed). The same listener's `beforeDocumentSaving` writes each moved
- *   anchor's line back to the pool so the durable `line_number` stays in step with the on-disk file the
- *   agent reads. See [onBeforeDocumentSaving].
+ *   only cards the reload actually disposed, and binning a comment the reload *orphaned* — its commented
+ *   line deleted/rewritten, so its anchor drifted onto different code). The same listener's `beforeDocumentSaving` writes
+ *   each moved anchor's line back to the pool so the durable `line_number` stays in step with the on-disk
+ *   file the agent reads. See [onBeforeDocumentSaving].
  *
  * The create flow is routed through [compose] (rather than living in the action) precisely so this
  * manager tracks the resulting thread before [CommentStore.save] fires: reconcile then sees the card
@@ -197,33 +198,62 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * [CommentStore] change, so nothing else reconciles: the cards would go blank until the file was
      * reopened. Recreate them, and keep the durable pool in step with the just-changed on-disk file.
      *
-     * - **Trust the anchors.** IntelliJ's reload diffs the text (common prefix/suffix trimming in
-     *   `DocumentImpl.replaceString`), so a surviving [RangeMarker] is correctly shifted and beats the
-     *   persisted `line_number` an external edit never updated. We do NOT drop anchors; [currentLineEndOffset]
-     *   rebuilds only a marker the reload genuinely invalidated when a disposed card is recreated.
+     * - **Bin orphaned comments** ([binOrphanedAnchors]) — FIRST, before the writeback overwrites the
+     *   baseline. A real reload diffs the text (common-affix trimming in `DocumentImpl.replaceString`) and
+     *   **shifts** a surviving [RangeMarker] rather than invalidating it, so `isValid` alone never detects a
+     *   deleted line. The robust signal is **content drift**: if the marker's current line no longer matches
+     *   the comment's stored `line_content` (trimmed, so a re-indent is tolerated), the anchor drifted onto
+     *   different code — the commented line was deleted or externally rewritten — so the comment is orphaned
+     *   and [CommentStore.delete]d (gone for the injector + peers too). A marker that merely shifted with
+     *   inserted/removed lines above keeps the SAME content, so it matches and is kept (trust-the-marker).
      * - **Write the anchors back** ([writeBackAnchors]). The reload IS the on-disk change the save-time
      *   writeback exists for, but an external edit doesn't dirty the document, so `beforeDocumentSaving`
-     *   never runs for it — without this the injectable `line_number` stays frozen at submit time.
-     * - **Re-place invalidated anchors.** A card whose inlay survived the reload but whose [RangeMarker] the
-     *   reload *invalidated* would otherwise only refresh in place at a stale offset (reconcile treats an
-     *   existing card as current). Drop those cards so reconcile recreates them via [currentLineEndOffset]'s
-     *   `line_number` fallback. (When the orphan-binning increment lands, this is the hook that deletes them.)
-     * - **Reconcile** every open editor of the file to recreate the cards the reload disposed. All editors
-     *   of one file share this [Document] instance across a reload, so identity matches every split.
+     *   never runs for it — without this the injectable `line_number` stays frozen at submit time. (This runs
+     *   AFTER binning, since it rewrites the very `line_content` the drift check compares against.)
+     * - **Reconcile** every open editor of the file to recreate the cards the reload disposed (a binned
+     *   orphan's card + anchor were already torn down by [CommentStore.delete]'s synchronous reconcile). All
+     *   editors of one file share this [Document] instance across a reload, so identity matches every split.
      *
      * EDT-confined: a reload runs on the EDT, like every other callback here.
      */
     private fun onFileContentReloaded(document: Document) {
+        binOrphanedAnchors(document)
         writeBackAnchors(document)
-        val affectedEditors = rendered.filterKeys { it.document === document }
-        // Phase 1: drop cards whose anchor the reload invalidated (their inlay may have survived), so...
-        affectedEditors.values.forEach { cards ->
-            cards.keys.filter { anchors[it]?.isValid != true }.toList().forEach { uuid ->
-                cards.remove(uuid)?.dispose()
-            }
-        }
-        // Phase 2: ...reconcile recreates them (and any the reload disposed) at the current/fallback line.
-        affectedEditors.keys.forEach(::reconcile)
+        rendered.keys.filter { it.document === document }.forEach(::reconcile)
+    }
+
+    /**
+     * Delete comments the reload orphaned — a comment whose anchor no longer sits on the line it was left on
+     * (its commented line was deleted or externally rewritten). See [isOrphaned] for the content-drift signal.
+     * Binning is **reload-only** (a save never calls this: an in-IDE edit's [writeBackAnchors] keeps the stored
+     * `line_content` in step, so only an *external* change diverges) and **silent** (no notification, matching
+     * delete/evict/markProcessed). One [CommentStore.delete] cascades card + anchor teardown across every split
+     * via the change listener; collect the orphans first, since deleting mid-iteration would re-enter through
+     * that reconcile.
+     */
+    private fun binOrphanedAnchors(document: Document) {
+        anchors.entries
+            .filter { it.value.document === document && isOrphaned(it.key, it.value) }
+            .map { it.key }.toSet()
+            .forEach(store::delete)
+    }
+
+    /**
+     * True if [marker] no longer tracks the code its comment was left on. A reload shifts a surviving marker,
+     * so the position alone is trusted; the identity check is the line's *content*. Compared **trimmed** so a
+     * pure re-indent/reformat is tolerated (kept); a deleted or rewritten line drifts the marker onto text that
+     * doesn't match the stored `line_content` (binned). An invalidated marker (no current line to read) or a
+     * comment the store no longer holds is handled defensively (invalid → orphan; absent → nothing to bin).
+     */
+    private fun isOrphaned(uuid: String, marker: RangeMarker): Boolean {
+        if (!marker.isValid) return true
+        val stored = store.get(uuid)?.lineContent ?: return false
+        val document = marker.document
+        val line = document.getLineNumber(marker.startOffset)
+        val current = document.getText(
+            TextRange(document.getLineStartOffset(line), document.getLineEndOffset(line)),
+        )
+        return stored.trim() != current.trim()
     }
 
     /**
@@ -248,10 +278,11 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
 
     /**
      * Write each valid anchor on [document] back to the pool as its comment's current `line_number` /
-     * `line_content`. The live [RangeMarker] gives the current line; a marker the edit invalidated is
-     * skipped (no defensible line to record — a candidate for the deferred orphan-binning increment). The
-     * store no-ops when nothing changed and never recreates a consumed thread. Shared by the save
-     * (`beforeDocumentSaving`) and reload (`fileContentReloaded`) paths — in both, [document] equals disk.
+     * `line_content`. The live [RangeMarker] gives the current line; an invalidated marker is skipped (no
+     * defensible line to record). The store no-ops when nothing changed and never recreates a consumed thread.
+     * Shared by the save (`beforeDocumentSaving`) and reload (`fileContentReloaded`) paths — in both, [document]
+     * equals disk. On the reload path, orphans were already binned by [binOrphanedAnchors] *before* this runs
+     * (this rewrites the very `line_content` the drift check reads), so here it only advances survivors.
      */
     private fun writeBackAnchors(document: Document) {
         anchors.entries
