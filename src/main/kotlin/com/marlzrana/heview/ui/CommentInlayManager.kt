@@ -18,6 +18,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.VirtualFile
+import com.marlzrana.heview.model.CommentStatus
 import com.marlzrana.heview.model.HeviewComment
 import com.marlzrana.heview.model.newFileComment
 import com.marlzrana.heview.storage.CommentStore
@@ -223,31 +224,50 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
     }
 
     /**
-     * Delete comments the reload orphaned — a comment whose anchor no longer sits on the line it was left on
-     * (its commented line was deleted or externally rewritten). See [isOrphaned] for the content-drift signal.
-     * Binning is **reload-only** (a save never calls this: an in-IDE edit's [writeBackAnchors] keeps the stored
-     * `line_content` in step, so only an *external* change diverges) and **silent** (no notification, matching
-     * delete/evict/markProcessed). One [CommentStore.delete] cascades card + anchor teardown across every split
-     * via the change listener; collect the orphans first, since deleting mid-iteration would re-enter through
-     * that reconcile.
+     * Delete comments the reload orphaned — a comment whose anchor drifted onto different code (its commented
+     * line was deleted or externally rewritten). See [isOrphaned] for the (deliberately conservative)
+     * content-drift signal. Binning is **reload-only** (a save never calls this: an in-IDE edit's
+     * [writeBackAnchors] keeps the stored `line_content` in step, so only an *external* change diverges) and
+     * **silent** (no notification, matching delete/evict/markProcessed).
+     *
+     * Collect the orphans first, then delete: [CommentStore.delete] fires a synchronous change listener that
+     * reconciles every editor and mutates [anchors], so deleting mid-iteration would re-enter this teardown. A
+     * single delete cascades card + anchor removal across every split via that reconcile — but only for a
+     * document with an open editor; the trailing `anchors.remove` also retires an anchor whose document has no
+     * open editor (a deferred-close orphan), which reconcile would never sweep, so the [RangeMarker] can't leak.
      */
     private fun binOrphanedAnchors(document: Document) {
         anchors.entries
             .filter { it.value.document === document && isOrphaned(it.key, it.value) }
             .map { it.key }.toSet()
-            .forEach(store::delete)
+            .forEach { uuid ->
+                store.delete(uuid)
+                anchors.remove(uuid)?.dispose()
+            }
     }
 
     /**
-     * True if [marker] no longer tracks the code its comment was left on. A reload shifts a surviving marker,
-     * so the position alone is trusted; the identity check is the line's *content*. Compared **trimmed** so a
-     * pure re-indent/reformat is tolerated (kept); a deleted or rewritten line drifts the marker onto text that
-     * doesn't match the stored `line_content` (binned). An invalidated marker (no current line to read) or a
-     * comment the store no longer holds is handled defensively (invalid → orphan; absent → nothing to bin).
+     * True if [marker] no longer tracks the code its comment was left on — the signal for binning on reload.
+     * Deliberately **conservative**, because a mis-fire silently deletes a user's comment for every client:
+     * - **Invalid marker → NOT an orphan** (`false`). A reload can invalidate a marker whose line was *never
+     *   touched*: IntelliJ replays the reload as one `replaceString` with only a common-affix trim, so an edit
+     *   that changes both the top and bottom of the file (e.g. an agent adding an import *and* a function)
+     *   replaces the whole middle and invalidates every marker in it. Binning on `!isValid` would mass-delete
+     *   untouched comments; instead keep them and let [currentLineEndOffset] re-anchor from `line_number`.
+     * - **Non-pending (Seen/consumed) comment → NOT an orphan.** When an agent resolves a comment it consumes
+     *   the thread (→ Seen) *and* edits the code, so the line legitimately drifts; a Seen thread must survive
+     *   (its per-reply re-pend + its `processed/` tombstone), never be deleted by that same edit.
+     * - **Blank stored `line_content` → NOT an orphan.** An empty baseline can't be meaningfully compared, and
+     *   a comment on a genuinely blank line shouldn't vanish because the line later gains code.
+     * Otherwise: the marker's current line, compared **trimmed** (so a pure re-indent/reformat is tolerated),
+     * no longer matches the stored `line_content` → the anchor drifted onto different code → orphan.
      */
     private fun isOrphaned(uuid: String, marker: RangeMarker): Boolean {
-        if (!marker.isValid) return true
-        val stored = store.get(uuid)?.lineContent ?: return false
+        if (!marker.isValid) return false
+        val comment = store.get(uuid) ?: return false
+        if (comment.status != CommentStatus.PENDING) return false
+        val stored = comment.lineContent
+        if (stored.isBlank()) return false
         val document = marker.document
         val line = document.getLineNumber(marker.startOffset)
         val current = document.getText(

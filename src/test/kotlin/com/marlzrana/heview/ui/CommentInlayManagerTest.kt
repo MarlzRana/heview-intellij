@@ -485,6 +485,94 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(0, manager.anchorCountForTest())
     }
 
+    fun testFileContentReloadKeepsACommentWhenAnUntouchedMarkerIsInvalidatedByABothEndsEdit() {
+        val (e1, path) = openLocalEditor("BOTHENDS.txt", "top\nA\nB\nC\nbot\n")
+        val comment = commentAt(path, line0Based = 2, content = "on B", lineContent = "B") // middle line "B"
+        store.save(comment)
+        manager.init()
+
+        // A reload that changed BOTH the top and the bottom of the file replays as a single replaceString with no
+        // common affix, so the whole middle is replaced and the untouched "B" marker is INVALIDATED (confirmed by
+        // a real-VFS probe). An invalidated marker is NOT a reliable orphan signal — binning on it would
+        // mass-delete comments an agent never touched — so the comment is KEPT (reconcile re-anchors it from
+        // line_number), not binned.
+        reloadWith(e1, "IMPORT\ntop\nA\nB\nC\nbot\nFUNC\n")
+
+        assertNotNull(store.get(comment.uuid)) // kept — an invalidated marker is not treated as an orphan
+        assertNotNull(manager.cardForTest(e1, comment.uuid)) // recreated (re-anchored from line_number)
+    }
+
+    fun testFileContentReloadKeepsAConsumedCommentWhoseLineTheAgentFixed() {
+        val (e1, path) = openLocalEditor("SEENFIX.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "fix me", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+        store.markProcessed(comment.uuid) // the hook consumed it → Seen, before the agent edits the code
+
+        // The agent then rewrote the commented line to resolve it → content drift. A Seen/consumed thread must
+        // NOT be binned by that same edit — it keeps its per-reply re-pend and its processed/ tombstone. Only a
+        // still-PENDING comment is eligible for orphan-binning.
+        reloadWith(e1, "l0\nl1-fixed\nl2\n")
+
+        assertNotNull(store.get(comment.uuid)) // the Seen thread survives the agent's own fix
+        assertEquals(CommentStatus.PROCESSED, store.get(comment.uuid)?.status)
+    }
+
+    fun testFileContentReloadBinsOnlyTheDriftedCommentAndKeepsItsSurvivingSibling() {
+        val (e1, path) = openLocalEditor("MIX.txt", "l0\nl1\nl2\nl3\n")
+        val gone = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1") // its line is deleted
+        val kept = commentAt(path, line0Based = 3, content = "on l3", lineContent = "l3") // shifts up, survives
+        store.save(gone)
+        store.save(kept)
+        manager.init()
+        assertEquals(2, liveCards(e1))
+
+        // Delete only "l1": `gone`'s marker drifts onto "l2" (mismatch → binned); `kept`'s marker shifts up but
+        // still sits on "l3" (match → kept). Guards against a regression that bins EVERY comment on a document
+        // once any single marker drifts (the per-uuid, trust-the-survivor contract).
+        reloadWith(e1, "l0\nl2\nl3\n")
+
+        assertNull(store.get(gone.uuid)) // the drifted one is binned
+        assertNotNull(store.get(kept.uuid)) // its sibling survives
+        assertEquals(1, liveCards(e1))
+        assertEquals(1, manager.anchorCountForTest()) // only kept's anchor remains
+    }
+
+    fun testFileContentReloadBinsMultipleOrphansOnOneDocumentInOneReload() {
+        val (e1, path) = openLocalEditor("MULTIORPH.txt", "l0\nl1\nl2\n")
+        // Two comments whose stored line_content deliberately no longer matches their live lines (as if the file
+        // already diverged externally), so BOTH are orphaned on the next reload — a deterministic way to exercise
+        // binning two orphans on one document in a single pass without a multi-hunk edit invalidating the markers.
+        val a = commentAt(path, line0Based = 1, content = "a", lineContent = "OLD-A")
+        val b = commentAt(path, line0Based = 2, content = "b", lineContent = "OLD-B")
+        store.save(a)
+        store.save(b)
+        manager.init()
+        assertEquals(2, liveCards(e1))
+
+        // A reload with the same text: both markers stay valid on their (mismatched) lines → both orphaned. The
+        // collect-first-then-delete order must survive store.delete's re-entrant reconcile (no ConcurrentModification).
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertNull(store.get(a.uuid))
+        assertNull(store.get(b.uuid))
+        assertEquals(0, liveCards(e1))
+        assertEquals(0, manager.anchorCountForTest())
+    }
+
+    fun testFileContentReloadKeepsACommentWithABlankStoredBaseline() {
+        val (e1, path) = openLocalEditor("BLANK.txt", "l0\n\nl2\n") // line 1 is genuinely blank
+        val comment = commentAt(path, line0Based = 1, content = "on the blank line", lineContent = "") // stored ""
+        store.save(comment)
+        manager.init()
+
+        // A blank stored line_content is not a meaningful baseline to compare drift against, so a reload that
+        // puts code on that line must NOT bin the comment.
+        reloadWith(e1, "l0\nNOW-CODE\nl2\n")
+
+        assertNotNull(store.get(comment.uuid)) // kept — blank baseline is never treated as drift
+    }
+
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
         val (e1, path) = openLocalEditor("DISP.txt", "l0\nl1\nl2\n")
         val comment = commentAt(path, line0Based = 1, content = "x") // line_number 2
