@@ -1117,6 +1117,21 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `updateLocation persists the whole comment on disk, not just the two fields`(@TempDir dir: Path) {
+        val store = store(dir)
+        val replies = listOf(sampleReply(content = "a"), sampleReply(content = "b", status = CommentStatus.PROCESSED))
+        val before = sampleComment(uuid = "u1", replies = replies)
+        store.save(before)
+
+        store.updateLocation("u1", 7, "moved")
+
+        // The on-disk file must round-trip the full schema (replies/status/created_at/paths/side) with only
+        // the two anchor fields changed — a stripped/partial encode would corrupt the contract the hooks read.
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(before.copy(lineNumber = 7, lineContent = "moved"), onDisk)
+    }
+
+    @Test
     fun `updateLocation leaves replies and status untouched`(@TempDir dir: Path) {
         val store = store(dir)
         val replies = listOf(sampleReply(content = "a"), sampleReply(content = "b", status = CommentStatus.PROCESSED))

@@ -410,6 +410,58 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertNotNull(after) // still shown (re-placed, not stuck/blank at a stale offset)
         assertNotSame(before, after) // dropped + recreated via the line_number fallback, not merely refreshed
         assertEquals(1, liveCards(e1))
+        // writeBackAnchors skipped the invalid marker, so the recreated card falls back to the persisted
+        // line_number (clamped into the now-shorter document), NOT offset 0 or the stale invalid-marker offset.
+        val fallbackLine = (comment.lineNumber - 1).coerceIn(0, e1.document.lineCount - 1)
+        assertEquals(e1.document.getLineEndOffset(fallbackLine), hosts.getValue(e1).lastOffset)
+    }
+
+    fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
+        val (e1, path) = openLocalEditor("DISP.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "x") // line_number 2
+        store.save(comment)
+        manager.init()
+        assertEquals(1, liveCards(e1))
+
+        Disposer.dispose(manager) // project close / plugin unload — forgets editors, clears anchors
+        assertEquals(0, liveCards(e1))
+
+        // The listener is parented to the manager via connect(this), so it must be detached. If it were
+        // leaked (unparented), publishing on the app bus would reconcile the dead manager and resurrect the
+        // card / rewrite the pool. Assert neither happens (and nothing throws).
+        val publisher = ApplicationManager.getApplication().messageBus
+            .syncPublisher(FileDocumentManagerListener.TOPIC)
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        publisher.fileContentReloaded(fileOf(e1), e1.document)
+        publisher.beforeDocumentSaving(e1.document)
+
+        assertEquals(0, liveCards(e1)) // not resurrected
+        assertEquals(2, store.get(comment.uuid)?.lineNumber) // writeback did not run
+    }
+
+    fun testDeletingASeenReplyRebuildsTheCardThoughContentAndStatusAreUnchanged() {
+        val (e1, path) = openLocalEditor("SEENDEL.txt", "a\nb\n")
+        val comment = commentAt(path, line0Based = 0, content = "a").copy(
+            replies = listOf(
+                HeviewReply("a", CommentStatus.PENDING, "tester", "2026-01-01T00:00:00.000Z"),
+                HeviewReply("b", CommentStatus.PROCESSED, "tester", "2026-01-01T00:00:00.000Z"),
+            ),
+        )
+        store.save(comment)
+        manager.init()
+        val card = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+        assertTrue(hosts.getValue(e1).labelTexts().contains("Seen"))
+        val before = card.displayRenderCount
+
+        // Delete the PROCESSED reply: derived content ("a", only the PENDING reply) and status (PENDING) are
+        // UNCHANGED, so ONLY sameDisplayAs's `replies` term can force the rebuild that drops the Seen row.
+        val seen = store.get(comment.uuid)!!.replies!!.first { it.status == CommentStatus.PROCESSED }
+        store.deleteReply(comment.uuid, seen)
+
+        assertEquals("a", store.get(comment.uuid)?.content) // content unchanged (guard for the test's premise)
+        assertEquals(CommentStatus.PENDING, store.get(comment.uuid)?.status) // status unchanged
+        assertTrue(card.displayRenderCount > before) // …yet the card rebuilt (replies differ)
+        assertFalse(hosts.getValue(e1).labelTexts().contains("Seen")) // Seen row gone
     }
 
     fun testSavingWritesBackAnInPlaceLineEditWithoutMovingTheLine() {

@@ -215,14 +215,15 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      */
     private fun onFileContentReloaded(document: Document) {
         writeBackAnchors(document)
-        rendered.filterKeys { it.document === document }.forEach { (_, cards) ->
+        val affectedEditors = rendered.filterKeys { it.document === document }
+        // Phase 1: drop cards whose anchor the reload invalidated (their inlay may have survived), so...
+        affectedEditors.values.forEach { cards ->
             cards.keys.filter { anchors[it]?.isValid != true }.toList().forEach { uuid ->
                 cards.remove(uuid)?.dispose()
             }
         }
-        rendered.keys
-            .filter { it.document === document }
-            .forEach { reconcile(it) }
+        // Phase 2: ...reconcile recreates them (and any the reload disposed) at the current/fallback line.
+        affectedEditors.keys.forEach(::reconcile)
     }
 
     /**
