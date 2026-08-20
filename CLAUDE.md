@@ -260,8 +260,10 @@ Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uui
 `processed/`, and the card flips Pending→Seen). Gate green: **209 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
-**Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
-tracks it; `main` == `origin/main` == `41ad48f`. The maintainer normally runs pushes — only push when asked.
+**Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
+`41ad48f`; **10 local unpushed commits on top (HEAD `4c87533`, `f22ca42`..`4c87533`)** — the external-file-reload
++ line_number-writeback increments + their 6-cycle `/aeview-loop` + `.aeviewignore`, all gate-green. The
+maintainer runs pushes — **do NOT push; ask/wait**.
 
 **Shipped + dogfooded + pushed — Phase 1 multi-reply comment threads + per-reply state machine (plan §5),
 through a full 5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field:
@@ -309,12 +311,21 @@ the anchor lifecycle is the better next signal than more cycles. Deferred (recor
 the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
 Gate: **209 tests**, `buildPlugin` clean.
 
-**Next increment (maintainer chose): orphan-comment binning.** When a reload invalidates a comment's anchor
-(the commented line was deleted/rewritten so it can no longer be tracked — *anchor-lost only*, never a mere
-re-indent or a still-valid marker), **delete** the comment from the pool (`store.delete`, so it's gone for the
-injector + peers too) instead of showing it on an unrelated line. Decided via AskUserQuestion; deferred to its
-own increment (destructive → its own careful dogfood). Runner-ups: the **visual pass**, remaining **Phase 3**
-(tool window / status-bar count / settings), **multi-client sync + generation fencing** (also owns the residual
-writeback-vs-consume TOCTOU), or **MODIFY-sync** (pick up an externally-edited comment's *content*). Full deferred
-backlog (`CommentJson.decode` validation, GitHub identity, restore-from-tombstone, …) is in `implementation_log.local.md`.
+**Next — TWO increments, in order (maintainer chose both; full specs in `implementation_log.local.md`'s RESUME banner):**
+1. **Orphan-comment binning** (first, smaller). A comment whose anchor is **invalidated** (commented line
+   deleted/rewritten — *anchor-lost only*, never a re-indent or still-valid marker) is **deleted** from the pool
+   (`store.delete`, gone for injector + peers) instead of shown on unrelated code. Hook point already exists:
+   `onFileContentReloaded`'s phase-1 invalid-anchor loop (change dispose→`store.delete`). Open sub-question to
+   settle (AskUserQuestion): also bin on an in-IDE line deletion, or reload-only? Destructive → dogfood + `/aeview-loop`.
+2. **Generation fence** (second, larger; needs an AskUserQuestion + a SHARED cross-tool contract). Optimistic
+   compare-and-swap on a per-file **generation** token (a `generation:int` / mtime / content-hash — the design
+   fork) to close the two deferred multi-client races: the **claim-vs-write TOCTOU** (hook moves the file to
+   `processed/` in the rename sliver after the replace-only exists-check) and **peer-overwrite** (a writeback
+   serializes the whole snapshot, clobbering a concurrent foreign edit). Every write + every hook claim reads the
+   on-disk generation and commits only on a match; else abort/re-merge (or skip a consumed file). Mirror in
+   `changes_to_be_made_to_vscode_variant.local.md` + the Node/Python injector hooks.
+
+Later: MODIFY-sync (externally-edited *content* into open clients), the visual pass, remaining Phase 3 (tool
+window / status-bar count / settings). Full deferred backlog (`CommentJson.decode` validation, GitHub identity,
+restore-from-tombstone, …) is in `implementation_log.local.md`.
 </status>
