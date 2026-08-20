@@ -132,10 +132,11 @@ class CommentStore(
         if (current.lineNumber == line1Based && current.lineContent == lineContent) return
         val updated = current.copy(lineNumber = line1Based, lineContent = lineContent)
         index[uuid] = updated
-        val json = CommentJson.encode(updated)
         runIo {
             if (!isPersisted(uuid) || !Files.exists(fileFor(uuid))) return@runIo // consumed/deleted — never recreate
-            if (!writeAtomically(uuid, json)) {
+            // Encode off the EDT: this runs inside FileDocumentManager's save write-action, and a large thread
+            // (many replies) would otherwise stall the save. `updated` is an immutable snapshot, safe here.
+            if (!writeAtomically(uuid, CommentJson.encode(updated))) {
                 runEdt { if (index[uuid] === updated) index[uuid] = current } // revert so the next save retries
             }
         }

@@ -1055,6 +1055,26 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `updateLocation failure rollback does not clobber a newer queued update`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1"))
+        tasks.removeFirst().run() // create → persisted, file exists
+
+        store.updateLocation("u1", 7, "seven") // task A (older); memory → 7
+        store.updateLocation("u1", 9, "nine") // task B (newer); memory → 9
+
+        makeReadOnlyOrSkip(dir)
+        tasks.removeFirst().run() // task A: write fails; its identity-guarded revert must NOT fire (index is B)
+        dir.toFile().setWritable(true)
+        assertEquals(9, store.get("u1")?.lineNumber) // newer in-memory update preserved
+
+        tasks.removeFirst().run() // task B: writes line 9
+        assertEquals(9, store.get("u1")?.lineNumber)
+        assertEquals(9, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineNumber)
+    }
+
+    @Test
     fun `updateLocation queued during an in-flight create still writes the moved line`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
         val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })

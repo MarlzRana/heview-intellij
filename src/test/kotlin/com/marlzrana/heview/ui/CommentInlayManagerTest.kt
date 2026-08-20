@@ -360,6 +360,75 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(baseline, card.displayRenderCount)
     }
 
+    fun testEditorCloseRetiresAnchorAfterAPlatformInlayDispose() {
+        val (e1, path) = openLocalEditor("LEAK.txt", "a\nb\n")
+        store.save(commentAt(path, line0Based = 0, content = "x"))
+        manager.init()
+        assertEquals(1, manager.anchorCountForTest())
+
+        // The platform disposes the inlay with NO following reconcile (e.g. the line was deleted); onDispose
+        // no longer retires the shared marker (so a reload can reuse it), so closing the tab must — else the
+        // RangeMarker (which pins its Document) leaks for the whole session.
+        hosts.getValue(e1).disposeLastReturned()
+        EditorFactory.getInstance().releaseEditor(e1)
+        openedEditors.remove(e1)
+
+        assertEquals(0, manager.anchorCountForTest()) // forget retired the orphaned marker
+    }
+
+    fun testClosingOneSplitKeepsTheAnchorForTheOther() {
+        val (e1, path) = openLocalEditor("LEAK2.txt", "a\nb\n")
+        store.save(commentAt(path, line0Based = 0, content = "x"))
+        manager.init()
+        val e2 = split(e1)
+        assertEquals(1, manager.anchorCountForTest())
+
+        EditorFactory.getInstance().releaseEditor(e1) // close one split
+        openedEditors.remove(e1)
+        assertEquals(1, manager.anchorCountForTest()) // e2 still shows it → marker kept
+
+        EditorFactory.getInstance().releaseEditor(e2)
+        openedEditors.remove(e2)
+        assertEquals(0, manager.anchorCountForTest()) // last editor gone → retired
+    }
+
+    fun testFileContentReloadReplacesACardWhoseAnchorWasInvalidated() {
+        val (e1, path) = openLocalEditor("INV.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number = 2
+        store.save(comment)
+        manager.init()
+        val before = manager.cardForTest(e1, comment.uuid) ?: error("no card")
+
+        // Invalidate the marker (delete the commented line's range) WITHOUT disposing the inlay (the fake host
+        // ignores document changes), so the card stays tracked with an invalid anchor — the [5] gap.
+        WriteCommandAction.runWriteCommandAction(project) {
+            e1.document.deleteString(e1.document.getLineStartOffset(1), e1.document.getLineStartOffset(2))
+        }
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        val after = manager.cardForTest(e1, comment.uuid)
+        assertNotNull(after) // still shown (re-placed, not stuck/blank at a stale offset)
+        assertNotSame(before, after) // dropped + recreated via the line_number fallback, not merely refreshed
+        assertEquals(1, liveCards(e1))
+    }
+
+    fun testSavingWritesBackAnInPlaceLineEditWithoutMovingTheLine() {
+        val (e1, path) = openLocalEditor("INPLACE.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number 2, line_content ""
+        store.save(comment)
+        manager.init()
+
+        // Edit the commented line's TEXT in place (append to it) — line_number is unchanged, so writeback must
+        // still fire on the line_content change (the guard is OR, not just line-number).
+        WriteCommandAction.runWriteCommandAction(project) {
+            e1.document.insertString(e1.document.getLineEndOffset(1), "x") // "l1" -> "l1x"
+        }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        assertEquals(2, store.get(comment.uuid)?.lineNumber) // unchanged
+        assertEquals("l1x", store.get(comment.uuid)?.lineContent) // new text persisted
+    }
+
     fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
         val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
         store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)

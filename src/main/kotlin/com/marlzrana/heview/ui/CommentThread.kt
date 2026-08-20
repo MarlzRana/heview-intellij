@@ -114,14 +114,11 @@ internal class CommentThread(
         if (disposed) return
         val shown = displayed ?: return
         if (shown == comment) return
-        // A location-only writeback (the save-time anchor writeback bumps line_number/line_content in the
-        // store) changes nothing the card renders. Advance the snapshot but don't rebuild — otherwise the
-        // next unrelated global reconcile would rebuild the stack, re-disabling Delete and clobbering focus.
-        if (shown.sameDisplayAs(comment)) {
-            displayed = comment
-            return
-        }
-        if (editingIndex != null) {
+        // Advance the snapshot without rebuilding when the change isn't visible: a location-only writeback
+        // (the save-time anchor writeback bumps line_number/line_content) renders nothing new — rebuilding
+        // would flicker, re-disable Delete, and clobber focus on the next unrelated reconcile — and while an
+        // inline edit is open the rebuild is deferred so the edit field survives (Save/Cancel renders latest).
+        if (shown.sameDisplayAs(comment) || editingIndex != null) {
             displayed = comment
             return
         }

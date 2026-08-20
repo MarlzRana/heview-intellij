@@ -204,6 +204,10 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * - **Write the anchors back** ([writeBackAnchors]). The reload IS the on-disk change the save-time
      *   writeback exists for, but an external edit doesn't dirty the document, so `beforeDocumentSaving`
      *   never runs for it — without this the injectable `line_number` stays frozen at submit time.
+     * - **Re-place invalidated anchors.** A card whose inlay survived the reload but whose [RangeMarker] the
+     *   reload *invalidated* would otherwise only refresh in place at a stale offset (reconcile treats an
+     *   existing card as current). Drop those cards so reconcile recreates them via [currentLineEndOffset]'s
+     *   `line_number` fallback. (When the orphan-binning increment lands, this is the hook that deletes them.)
      * - **Reconcile** every open editor of the file to recreate the cards the reload disposed. All editors
      *   of one file share this [Document] instance across a reload, so identity matches every split.
      *
@@ -211,6 +215,11 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      */
     private fun onFileContentReloaded(document: Document) {
         writeBackAnchors(document)
+        rendered.filterKeys { it.document === document }.forEach { (_, cards) ->
+            cards.keys.filter { anchors[it]?.isValid != true }.toList().forEach { uuid ->
+                cards.remove(uuid)?.dispose()
+            }
+        }
         rendered.keys
             .filter { it.document === document }
             .forEach { reconcile(it) }
@@ -237,7 +246,8 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         anchors.entries
             .filter { it.value.document === document && it.value.isValid }
             .forEach { (uuid, marker) ->
-                val line = clampLine(document, document.getLineNumber(marker.startOffset))
+                // The isValid filter guarantees an in-range startOffset, so getLineNumber needs no clamp.
+                val line = document.getLineNumber(marker.startOffset)
                 val lineContent = document.getText(
                     TextRange(document.getLineStartOffset(line), document.getLineEndOffset(line)),
                 )
@@ -353,9 +363,12 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         // Close path: the editor is going away, so skip scroll preservation on its cards.
         composing.remove(editor)?.toList()?.forEach { it.dispose(preserveScroll = false) }
         val cards = rendered.remove(editor) ?: return
-        val uuids = cards.keys.toList()
         cards.values.toList().forEach { it.dispose(preserveScroll = false) }
-        uuids.forEach { retireAnchorIfUnused(it) } // drop anchors for comments no other editor shows
+        // Retire EVERY now-unused anchor, not just this editor's still-mapped `cards`: a platform inlay
+        // dispose (a reload, or the commented line deleted) already stripped some uuids from `cards` via the
+        // card's onDispose — which no longer retires (so a reload can reuse a shifted marker). Those markers
+        // would otherwise linger in `anchors`, and a RangeMarker pins its Document, leaking it for the session.
+        anchors.keys.toList().forEach { retireAnchorIfUnused(it) }
     }
 
     private fun isRelevant(editor: Editor): Boolean =
