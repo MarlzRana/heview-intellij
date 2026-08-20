@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 203 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 205 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -252,7 +252,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **203 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **205 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published + pushed**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH, `main`
@@ -267,7 +267,7 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **203 tests**, `buildPlugin` clean.
+Gate: **205 tests**, `buildPlugin` clean.
 
 **Shipped + dogfooded + `/aeview-loop`-hardened — external-file-reload handling** (former cycle-2 #4 gap). An
 agent editing a file to resolve a comment triggers a document reload that can dispose the inlays and — unlike a
@@ -293,13 +293,15 @@ file). `updateLocation` touches only `line_number`/`line_content`, no-ops unless
 on the serial IO executor (so an in-flight-create write isn't dropped) which skips unless the file is still in
 `comments/` (never resurrects a consumed thread), reverts on write failure, and fires no change listener.
 
-Both increments are in a `/aeview-loop` (scope `f22ca42..HEAD`; findings 13→12→12→7, each cycle's fixes applied
-above — cycle 3 fixed a regression from cycle 2 (a `RangeMarker`/`Document` leak on editor close) and moved the
-writeback's Gson encode off the EDT; cycle 4 was test-gaps + a cleanup, its two HIGHs re-flags of the deferred
-items below; cycle 5 (the cap) verifies). Deferred (recorded): the cross-process
+Both increments went through a **5-cycle `/aeview-loop`** (scope `f22ca42..HEAD`; findings 13→12→12→7→2, stopped
+at the cap). Each cycle's fixes are folded in above; the loop twice caught a regression in its own prior fix
+around anchor lifecycle (cycle 3: a `RangeMarker`/`Document` leak on close; cycle 5: `forget` over-retiring a
+still-open editor's marker — now keyed on `RangeMarker.document`) and moved the writeback's Gson encode off the
+EDT. Cycle 5's fix is gate-green (205 tests) but wasn't independently re-reviewed (cap) — a 6th verification
+cycle is opt-in. Deferred (recorded): the cross-process
 **generation fence** (a residual writeback-vs-consume TOCTOU + a peer-overwrite window on the shared pool) and
 the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
-Gate: **203 tests**, `buildPlugin` clean.
+Gate: **205 tests**, `buildPlugin` clean.
 
 **Next increment (maintainer chose): orphan-comment binning.** When a reload invalidates a comment's anchor
 (the commented line was deleted/rewritten so it can no longer be tracked — *anchor-lost only*, never a mere

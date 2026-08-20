@@ -365,11 +365,16 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         composing.remove(editor)?.toList()?.forEach { it.dispose(preserveScroll = false) }
         val cards = rendered.remove(editor) ?: return
         cards.values.toList().forEach { it.dispose(preserveScroll = false) }
-        // Retire EVERY now-unused anchor, not just this editor's still-mapped `cards`: a platform inlay
-        // dispose (a reload, or the commented line deleted) already stripped some uuids from `cards` via the
-        // card's onDispose — which no longer retires (so a reload can reuse a shifted marker). Those markers
-        // would otherwise linger in `anchors`, and a RangeMarker pins its Document, leaking it for the session.
-        anchors.keys.toList().forEach { retireAnchorIfUnused(it) }
+        // Retire markers whose Document no longer has ANY open editor. A RangeMarker pins its Document, so
+        // closing the last editor of a file must drop its markers — including ones whose card the platform
+        // already stripped from `cards` via onDispose (which no longer retires, so a reload can reuse a
+        // shifted marker). We key on the Document, NOT "no card shows it": a still-open split whose inlay was
+        // transiently disposed has an empty card map but a live, reusable marker — retiring it here would send
+        // its next reconcile back to the stale line_number.
+        anchors.entries
+            .filter { (_, marker) -> rendered.keys.none { it.document === marker.document } }
+            .map { it.key }
+            .forEach { anchors.remove(it)?.dispose() }
     }
 
     private fun isRelevant(editor: Editor): Boolean =

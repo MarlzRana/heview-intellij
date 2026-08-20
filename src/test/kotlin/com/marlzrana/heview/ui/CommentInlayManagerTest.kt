@@ -481,6 +481,44 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals("l1x", store.get(comment.uuid)?.lineContent) // new text persisted
     }
 
+    fun testClosingAnUnrelatedEditorKeepsAStrippedFilesAnchor() {
+        val (eA, pathA) = openLocalEditor("KEEPA.txt", "a\nb\n")
+        val (eB, pathB) = openLocalEditor("KEEPB.txt", "l0\nl1\nl2\n")
+        store.save(commentAt(pathA, line0Based = 0, content = "in A"))
+        store.save(commentAt(pathB, line0Based = 1, content = "in B"))
+        manager.init()
+        assertEquals(2, manager.anchorCountForTest())
+
+        // eB's inlay is transiently disposed with NO reconcile following, so eB stays open with an empty card
+        // map but a live, reusable marker.
+        hosts.getValue(eB).disposeLastReturned()
+
+        // Closing the UNRELATED eA must retire only A's marker — eB's document still has an open editor, so
+        // its marker must survive (else eB's next reconcile falls back to the stale line_number). forget must
+        // key on the Document, not "no card shows it".
+        EditorFactory.getInstance().releaseEditor(eA)
+        openedEditors.remove(eA)
+
+        assertEquals(1, manager.anchorCountForTest()) // A's retired, B's kept (a card-based sweep gives 0)
+    }
+
+    fun testFileContentReloadWritesBackAfterTheInlayWasDisposed() {
+        val (e1, path) = openLocalEditor("RLWB2.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1") // line_number 2
+        store.save(comment)
+        manager.init()
+
+        // The defining agent-edit flow: shift the comment, the reload disposes the inlay (card stripped from
+        // `rendered`), THEN fileContentReloaded fires. writeBackAnchors must walk `anchors` (not the now-empty
+        // cards), so the durable line still moves.
+        WriteCommandAction.runWriteCommandAction(project) { e1.document.insertString(0, "NEW\n") }
+        hosts.getValue(e1).disposeLastReturned()
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        assertEquals(3, store.get(comment.uuid)?.lineNumber) // "l1" now on line 3 (1-based)
+        assertEquals("l1", store.get(comment.uuid)?.lineContent)
+    }
+
     fun testFileContentReloadKeepsValidAnchorsSoLaterSplitsUseTheShiftedLine() {
         val (e1, path) = openLocalEditor("RL2.txt", "l0\nl1\nl2\nl3\n")
         store.save(commentAt(path, line0Based = 2, content = "on l2")) // line_number = 3 (0-based 2)
