@@ -169,6 +169,31 @@ class HookScriptTest {
     }
 
     @Test
+    fun `the consumption tombstone preserves the generation-fence token verbatim`(@TempDir dir: Path) {
+        assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
+        // The injectors never write comments/ (they only claim-by-move), so their sole role in the
+        // generation fence (plan.html §5) is to carry the token through the tombstone rewrite unchanged —
+        // the `{...comment}` spread does this for free. Lock it (and byte-identically across Node/Python).
+        val json =
+            """{"uuid":"g1","status":"pending","created_at":"2026-01-01T00:00:00.000Z","workspace":"/tmp/proj",""" +
+                """"abs_path":"/tmp/proj/f.kt","logical_abs_path":"/tmp/proj/f.kt","line_number":1,""" +
+                """"line_content":"x","side":"file","content":"note","generation":7}"""
+
+        val h1 = setupHome(dir.resolve("a"))
+        Files.writeString(h1.resolve(".heview/comments/g1.json"), json)
+        assertNotNull(additionalContext(run(claudeCmd(h1), h1, "/tmp/proj")))
+        assertEquals(
+            7,
+            JsonParser.parseString(processedRaw(h1, "g1")).asJsonObject.get("generation").asInt,
+        ) // token survived the rewrite
+
+        val h2 = setupHome(dir.resolve("b"))
+        Files.writeString(h2.resolve(".heview/comments/g1.json"), json)
+        assertNotNull(additionalContext(run(codexCmd(h2), h2, "/tmp/proj")))
+        assertEquals(processedRaw(h1, "g1"), processedRaw(h2, "g1")) // byte-identical tombstones
+    }
+
+    @Test
     fun `a second run does not re-inject an already-consumed comment`(@TempDir dir: Path) {
         assumeTrue(toolAvailable("node", "--version") && toolAvailable("python3", "--version"))
         val agents = listOf<Pair<String, (Path) -> List<String>>>("claude" to { claudeCmd(it) }, "codex" to { codexCmd(it) })

@@ -1183,6 +1183,129 @@ class CommentStoreTest {
         assertEquals(7, after.lineNumber) // only the anchor moved
     }
 
+    // ---- generation fence (optimistic-concurrency CAS on the shared pool; plan.html §5) ----
+
+    @Test
+    fun `create starts at generation 0 and each reply mutation bumps it`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
+        assertEquals(0, store.get("u1")?.generation)
+        assertEquals(0, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation)
+
+        store.addReply("u1", "b", "me", laterTs)
+        assertEquals(1, store.get("u1")?.generation) // in memory…
+        assertEquals(1, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation) // …and on disk
+
+        val second = store.get("u1")!!.replies!![1]
+        store.editReply("u1", second, "b-edited", laterTs)
+        assertEquals(2, store.get("u1")?.generation)
+        assertEquals(2, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation)
+    }
+
+    @Test
+    fun `hydrate loads the on-disk generation`(@TempDir dir: Path) {
+        seed(dir, sampleComment(uuid = "u1").copy(generation = 5))
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(5, store.get("u1")?.generation)
+    }
+
+    @Test
+    fun `a legacy file without a generation loads at 0 and its first mutation writes generation 1`(@TempDir dir: Path) {
+        // A genuinely pre-fence / foreign file has no `generation` key → Gson decodes it as 0.
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("u1.json"),
+            """{"uuid":"u1","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+               "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":42,
+               "line_content":"x","side":"file","content":"hi"}""".trimIndent(),
+        )
+        val store = store(dir)
+        store.hydrate()
+        assertEquals(0, store.get("u1")?.generation) // absent field → 0
+
+        store.addReply("u1", "reply", "me", laterTs)
+        assertEquals(1, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation)
+    }
+
+    @Test
+    fun `addReply merges onto a peer's concurrent reply instead of clobbering it`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val a = sampleReply(content = "a")
+        store.save(sampleComment(uuid = "u1", replies = listOf(a)))
+        tasks.removeFirst().run() // create → disk gen 0, [a]
+
+        store.addReply("u1", "mine", "me", laterTs) // optimistic [a, mine] gen 1; queues the commit
+
+        // A peer appends its own reply to the on-disk file (bumping the generation) BEFORE our commit runs.
+        val peer = sampleReply(content = "peer", author = "peer")
+        Files.writeString(
+            dir.resolve("u1.json"),
+            CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a, peer)).copy(generation = 1)),
+        )
+
+        tasks.removeFirst().run() // commit reads [a, peer] gen 1, re-applies "mine" on top, writes gen 2
+
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(listOf("a", "peer", "mine"), onDisk.replies?.map { it.content }) // peer's reply preserved
+        assertEquals(2, onDisk.generation) // base gen 1 + 1
+        assertEquals(listOf("a", "peer", "mine"), store.get("u1")?.replies?.map { it.content }) // memory adopted the merge
+    }
+
+    @Test
+    fun `editing a reply a peer already deleted reconciles to the peer's thread`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val a = sampleReply(content = "a")
+        val b = sampleReply(content = "b")
+        store.save(sampleComment(uuid = "u1", replies = listOf(a, b)))
+        tasks.removeFirst().run() // disk gen 0, [a, b]
+
+        store.editReply("u1", b, "b-edited", laterTs) // optimistic edits b; queues the commit
+
+        // A peer deletes reply b on disk (leaving [a]) and bumps the generation.
+        Files.writeString(
+            dir.resolve("u1.json"),
+            CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a)).copy(generation = 1)),
+        )
+
+        tasks.removeFirst().run() // commit: b is gone on disk → adopt the peer's thread, drop our edit
+
+        assertEquals(listOf("a"), store.get("u1")?.replies?.map { it.content })
+        assertEquals(1, store.get("u1")?.generation) // in-memory now tracks the peer's generation
+        assertEquals(listOf("a"), CommentJson.decode(Files.readString(dir.resolve("u1.json"))).replies?.map { it.content })
+    }
+
+    @Test
+    fun `updateLocation skips a thread a peer changed instead of clobbering it`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1")) // disk gen 0
+        // A peer rewrites the thread on disk (new reply, bumped generation) after our create.
+        val peerThread = sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "peer note"))).copy(generation = 1)
+        Files.writeString(dir.resolve("u1.json"), CommentJson.encode(peerThread))
+
+        store.updateLocation("u1", 7, "moved") // our base gen is 0 but disk is gen 1 → must skip, not clobber
+
+        assertEquals(peerThread, CommentJson.decode(Files.readString(dir.resolve("u1.json")))) // untouched
+        assertEquals(7, store.get("u1")?.lineNumber) // the line still moved in memory (a race doesn't revert it)
+    }
+
+    @Test
+    fun `re-pending a consumed thread resurrects it at the next generation`(@TempDir dir: Path) {
+        val store = store(dir)
+        val r0 = sampleReply(content = "fix", status = CommentStatus.PROCESSED)
+        // The thread was last written at generation 3, so its in-memory record carries gen 3.
+        store.save(sampleComment(uuid = "u1", replies = listOf(r0)).copy(generation = 3))
+        Files.deleteIfExists(dir.resolve("u1.json")) // consumed: the pool file is gone
+        store.markProcessed("u1")
+
+        store.rependReply("u1", r0, laterTs)
+
+        assertTrue(Files.exists(dir.resolve("u1.json"))) // resurrected…
+        assertEquals(4, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation) // …at base 3 + 1
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))

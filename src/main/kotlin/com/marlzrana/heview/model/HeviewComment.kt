@@ -62,4 +62,10 @@ data class HeviewComment(
     @SerializedName("content") val content: String,
     @SerializedName("intended_consumer") val intendedConsumer: IntendedConsumer? = null,
     @SerializedName("replies") val replies: List<HeviewReply>? = null,
+    // Optimistic-concurrency token for the shared pool (plan.html §5 "generation fence"). Every durable
+    // write to `comments/<uuid>.json` bumps it, and every writer commits only if the on-disk value still
+    // equals the base it edited (CAS) — so a peer's concurrent edit is merged, never clobbered. A
+    // heview-only superset field: a foreign/legacy file omits it (Gson decodes absent → 0), and the
+    // injector hooks preserve it verbatim into the consumption tombstone (they never write `comments/`).
+    @SerializedName("generation") val generation: Int = 0,
 )
