@@ -106,7 +106,10 @@ class CommentStoreTest {
     fun `binFromPool of a genuine orphan unlinks the live pool file and drops the record`(@TempDir dir: Path) {
         val store = store(dir)
         store.save(sampleComment(uuid = "u1"))
+        var fires = 0
+        store.addChangeListener { fires++ }
         store.binFromPool("u1")
+        assertEquals(1, fires) // drops the record + fires (matches evict/delete/markProcessed)
         assertNull(store.get("u1"))
         assertFalse(Files.exists(dir.resolve("u1.json")))
     }

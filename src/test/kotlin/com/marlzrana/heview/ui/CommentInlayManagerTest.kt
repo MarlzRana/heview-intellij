@@ -530,13 +530,14 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         manager.init()
         assertEquals(2, liveCards(e1))
 
-        // Delete only "l1": `gone`'s marker drifts onto "l2" (mismatch → binned); `kept`'s marker shifts up but
-        // still sits on "l3" (match → kept). Guards against a regression that bins EVERY comment on a document
-        // once any single marker drifts (the per-uuid, trust-the-survivor contract).
+        // Delete only "l1": its text is gone → `gone` is binned; "l3" is still present → `kept` survives and its
+        // marker shifts up. Guards against a regression that bins EVERY comment on a document once any one is an
+        // orphan (the per-uuid, trust-the-survivor contract).
         reloadWith(e1, "l0\nl2\nl3\n")
 
-        assertNull(store.get(gone.uuid)) // the drifted one is binned
+        assertNull(store.get(gone.uuid)) // the orphan is binned
         assertNotNull(store.get(kept.uuid)) // its sibling survives
+        assertEquals(3, store.get(kept.uuid)?.lineNumber) // survivor written back to its shifted line (was 4, now 3)
         assertEquals(1, liveCards(e1))
         assertEquals(1, manager.anchorCountForTest()) // only kept's anchor remains
     }
@@ -635,26 +636,61 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertEquals(0, manager.anchorCountForTest()) // …and the anchor retired despite no open editor
     }
 
-    fun testFileContentReloadDoesNotWriteBackAnInvalidatedSiblingViaTheBinReconcile() {
-        val (e1, path) = openLocalEditor("SIB.txt", "l0\nl1\nl2\nl3\n")
-        val orphan = commentAt(path, line0Based = 0, content = "orphan", lineContent = "MISMATCH") // valid + drifted → binned
-        val sibling = commentAt(path, line0Based = 2, content = "sibling", lineContent = "l2") // line_number 3
+    fun testFileContentReloadDoesNotWriteBackAnInvalidatedSurvivorViaTheBinReconcile() {
+        val (e1, path) = openLocalEditor("SIB.txt", "top\nAAA\nBBB\nbot\n")
+        val orphan = commentAt(path, line0Based = 1, content = "orphan", lineContent = "AAA") // "AAA" deleted → binned
+        val survivor = commentAt(path, line0Based = 2, content = "survivor", lineContent = "BBB") // line_number 3, kept
         store.save(orphan)
-        store.save(sibling)
+        store.save(survivor)
         manager.init()
 
-        // Invalidate the sibling's marker (as a both-ends reload would), leaving the orphan's marker valid+drifted.
-        WriteCommandAction.runWriteCommandAction(project) {
-            e1.document.deleteString(e1.document.getLineStartOffset(2), e1.document.getLineStartOffset(3)) // delete "l2\n"
-        }
-        manager.simulateFileContentReloadedForTest(e1.document)
+        // A both-ends reload: no common affix, so the whole middle is replaced and BOTH markers invalidate. "AAA"
+        // is gone from the file → orphan → binned; "BBB" is still present → survivor kept, but its marker is
+        // invalid, so reconcile re-creates its card from line_number (minting a fresh valid marker).
+        reloadWith(e1, "IMPORT\ntop\nBBB\nbot\nFUNC\n")
 
-        // Binning the orphan fires a reconcile that recreates the sibling's card from line_number (minting a fresh
-        // valid marker). Because writeBack runs BEFORE the bin (and skips the orphan), that fallback marker must
-        // NOT be persisted — the sibling's durable line_number/line_content stay at their pre-reload values.
-        assertNull(store.get(orphan.uuid)) // orphan binned
-        assertEquals(3, store.get(sibling.uuid)?.lineNumber) // unchanged — not rewritten to the fallback line
-        assertEquals("l2", store.get(sibling.uuid)?.lineContent) // unchanged
+        assertNull(store.get(orphan.uuid)) // orphan binned (its line's text is gone)
+        // The survivor is kept. Its durable line_number/line_content must NOT be rewritten to the freshly-minted
+        // fallback marker's line: writeBack runs BEFORE the bin's reconcile (and skips invalid markers), so the
+        // survivor's stored values stay at their pre-reload state (guards the write-back-first ordering).
+        assertNotNull(store.get(survivor.uuid))
+        assertEquals(3, store.get(survivor.uuid)?.lineNumber) // unchanged
+        assertEquals("BBB", store.get(survivor.uuid)?.lineContent) // unchanged
+    }
+
+    fun testReloadBinningUnlinksTheLivePoolFileButPreservesAConsumedTombstone() {
+        val (e1, path) = openLocalEditor("RLTOMB.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "fix", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+        // Simulate a hook that already CONSUMED the comment: plant its processed/ tombstone. (In the real race
+        // the live file is already moved away too; here it stays, so we also prove the live file is unlinked.)
+        val commentsDir = tempDir.resolve("comments")
+        val processed = Files.createDirectories(commentsDir.resolve("processed"))
+        val tomb = processed.resolve("${comment.uuid}.json")
+        Files.writeString(tomb, CommentJson.encode(comment))
+
+        reloadWith(e1, "l0\nl2\n") // "l1" gone → orphan → binned through the reload path
+
+        assertNull(store.get(comment.uuid)) // dropped from the index
+        assertFalse(Files.exists(commentsDir.resolve("${comment.uuid}.json"))) // live pool file unlinked
+        assertTrue(Files.exists(tomb)) // tombstone PRESERVED → binFromPool, not store.delete (peers stay Seen)
+    }
+
+    fun testFileContentReloadKeepsABothEndsInvalidatedCommentAcrossASecondReload() {
+        val (e1, path) = openLocalEditor("TWICE.txt", "top\nA\nB\nC\nbot\n")
+        val comment = commentAt(path, line0Based = 2, content = "on B", lineContent = "B")
+        store.save(comment)
+        manager.init()
+
+        // First reload: a both-ends edit invalidates B's (untouched) marker; "B" is still present → kept + re-anchored.
+        reloadWith(e1, "IMPORT\ntop\nA\nB\nC\nbot\nFUNC\n")
+        assertNotNull(store.get(comment.uuid)) // kept after the first reload
+
+        // Second, unrelated reload: content-presence (not marker drift) means "B" still in the file → still kept.
+        // A drift-based check would have binned it here, having re-anchored it onto the wrong line the first time.
+        reloadWith(e1, "IMPORT\ntop\nA\nB\nC\nbot\nFUNC2\n")
+        assertNotNull(store.get(comment.uuid)) // still kept — no deferred mass-delete
     }
 
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {

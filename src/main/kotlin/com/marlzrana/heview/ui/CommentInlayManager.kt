@@ -38,7 +38,7 @@ import org.jetbrains.annotations.TestOnly
  *   reloaded from disk (an agent editing a file to resolve a comment), which can dispose the inlays but
  *   fires no store change. See [onFileContentReloaded] (it trusts the reload-shifted anchors, rebuilding
  *   only cards the reload actually disposed, and binning a comment the reload *orphaned* — its commented
- *   line deleted/rewritten, so its anchor drifted onto different code). The same listener's `beforeDocumentSaving` writes
+ *   line's text is gone from the reloaded file). The same listener's `beforeDocumentSaving` writes
  *   each moved anchor's line back to the pool so the durable `line_number` stays in step with the on-disk
  *   file the agent reads. See [onBeforeDocumentSaving].
  *
@@ -199,77 +199,85 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * [CommentStore] change, so nothing else reconciles: the cards would go blank until the file was
      * reopened. Recreate them, and keep the durable pool in step with the just-changed on-disk file.
      *
-     * The order matters — all three mutate [anchors] / fire reconciles that would trip over each other:
-     * 1. **Classify against the current markers**, before any step below shifts them: **orphans** (a valid
-     *    marker on a PENDING comment whose line drifted — see [isOrphaned]) and **invalidated** markers.
+     * The order matters — each step mutates [anchors] / fires reconciles that would trip over the others:
+     * 1. **Classify** the document's anchors against the reloaded text: **orphans** (see [isOrphaned] — their
+     *    commented line's text is gone from the file) and **invalidated** markers that are NOT orphans.
      * 2. **Write back survivors' moved lines** ([writeBackAnchors], skipping the orphans). The reload IS the
      *    on-disk change the save-time writeback exists for, but an external edit doesn't dirty the document, so
      *    `beforeDocumentSaving` never runs for it. This runs FIRST so that [CommentStore.binFromPool]'s
      *    synchronous reconcile (below) can't mint a `line_number`-fallback marker that this writeback would
      *    then persist as the disk position (it wouldn't be one).
-     * 3. **Re-anchor invalidated markers.** A real reload diffs the text (common-affix trim in
-     *    `DocumentImpl.replaceString`) and *shifts* a surviving marker rather than invalidating it — but a
-     *    both-ends edit (e.g. an agent adding an import at the top *and* a function at the bottom) replaces
-     *    the whole middle and DOES invalidate untouched interior markers (verified by a real-VFS probe). Such
-     *    a marker is NOT an orphan (its line wasn't the thing that changed), so drop its dead anchor + stranded
-     *    card and let reconcile rebuild the card from `line_number`, rather than binning it or leaving it pinned.
+     * 3. **Re-anchor invalidated survivors.** A real reload diffs the text (common-affix trim in
+     *    `DocumentImpl.replaceString`) and usually *shifts* a marker, but a both-ends edit (an import at the top
+     *    *and* a function at the bottom) replaces the whole middle and invalidates untouched interior markers
+     *    (real-VFS-probe confirmed). Such a marker's LINE still exists (so it isn't an orphan) — drop its dead
+     *    anchor + stranded card so reconcile rebuilds the card from `line_number`.
      * 4. **Bin the orphans** via [CommentStore.binFromPool] (unlinks the live pool file, keeps any tombstone —
-     *    a reload can race a hook consume). Gone for the injector + peers. The trailing `anchors.remove` also
-     *    retires an anchor whose document has no open editor (a deferred-close orphan reconcile can't sweep).
+     *    a reload can race a hook consume). Gone for the injector + peers.
      * 5. **Reconcile** every open editor to recreate the cards the reload disposed / we dropped. All editors of
      *    one file share this [Document] instance across a reload, so identity matches every split.
+     * 6. **Sweep editorless anchors.** If the reload cleared the document's unsaved state and no editor of it is
+     *    open, no save-on-close `beforeDocumentSaving` will run its deferred-anchor sweep — so retire the
+     *    document's remaining anchors here (the writeback already ran), so a `RangeMarker` (which pins its
+     *    `Document`) can't leak. Also mops up an anchor a *peer project's* manager binned from the shared store.
      *
      * Binning is **reload-only** (a save never runs steps 3-4: an in-IDE edit's writeback keeps the stored
      * `line_content` in step, so only an *external* change diverges) and **silent**. EDT-confined.
      */
     private fun onFileContentReloaded(document: Document) {
         val onDoc = anchors.entries.filter { it.value.document === document }
-        val orphaned = onDoc.filter { isOrphaned(it.key, it.value) }.map { it.key }.toSet()
-        val invalidated = onDoc.filter { !it.value.isValid }.map { it.key }.toSet()
+        if (onDoc.isNotEmpty()) {
+            val presentLines = document.text.lineSequence().mapTo(HashSet()) { it.trim() }
+            val orphaned = onDoc.filter { isOrphaned(it.key, presentLines) }.map { it.key }.toSet()
+            val invalidated = onDoc.filter { !it.value.isValid && it.key !in orphaned }.map { it.key }.toSet()
 
-        writeBackAnchors(document, skip = orphaned)
+            writeBackAnchors(document, skip = orphaned)
 
-        invalidated.forEach { uuid ->
-            anchors.remove(uuid)?.dispose()
-            rendered.values.forEach { it.remove(uuid)?.dispose() }
-        }
+            invalidated.forEach { uuid ->
+                anchors.remove(uuid)?.dispose()
+                rendered.values.forEach { it.remove(uuid)?.dispose() }
+            }
 
-        orphaned.forEach { uuid ->
-            store.binFromPool(uuid)
-            anchors.remove(uuid)?.dispose()
+            orphaned.forEach { uuid ->
+                store.binFromPool(uuid)
+                anchors.remove(uuid)?.dispose()
+            }
         }
 
         rendered.keys.filter { it.document === document }.forEach(::reconcile)
+
+        if (rendered.keys.none { it.document === document }) {
+            anchors.entries.filter { it.value.document === document }
+                .map { it.key }.toList()
+                .forEach { anchors.remove(it)?.dispose() }
+        }
     }
 
     /**
-     * True if [marker] no longer tracks the code its comment was left on — the signal for binning on reload.
-     * Deliberately **conservative**, because a mis-fire silently deletes a user's comment for every client:
-     * - **Invalid marker → NOT an orphan** (`false`). A reload can invalidate a marker whose line was *never
-     *   touched*: IntelliJ replays the reload as one `replaceString` with only a common-affix trim, so an edit
-     *   that changes both the top and bottom of the file (e.g. an agent adding an import *and* a function)
-     *   replaces the whole middle and invalidates every marker in it. Binning on `!isValid` would mass-delete
-     *   untouched comments; instead keep them and let [currentLineEndOffset] re-anchor from `line_number`.
-     * - **Non-pending (Seen/consumed) comment → NOT an orphan.** When an agent resolves a comment it consumes
-     *   the thread (→ Seen) *and* edits the code, so the line legitimately drifts; a Seen thread must survive
-     *   (its per-reply re-pend + its `processed/` tombstone), never be deleted by that same edit.
-     * - **Blank stored `line_content` → NOT an orphan.** An empty baseline can't be meaningfully compared, and
-     *   a comment on a genuinely blank line shouldn't vanish because the line later gains code.
-     * Otherwise: the marker's current line, compared **trimmed** (so a pure re-indent/reformat is tolerated),
-     * no longer matches the stored `line_content` → the anchor drifted onto different code → orphan.
+     * True if the comment [uuid] is orphaned by the reload — the signal for binning. Deliberately
+     * **conservative**, because a mis-fire silently deletes a user's comment for every client, so the test is
+     * **content presence, not marker position**: the comment is orphaned iff its stored `line_content` (trimmed)
+     * is no longer any line in the reloaded file ([presentLines]).
+     *
+     * Why presence and not "the marker drifted": a real reload replays as one `DocumentImpl.replaceString` with
+     * a common-affix trim, so whether the *deleted line's own* marker survives-and-shifts or is invalidated
+     * depends on the surrounding text — an unreliable, input-dependent signal. "Is the commented text still in
+     * the file?" is marker-validity-independent and correct for every case: a deleted/rewritten line → text gone
+     * → orphan; a line merely moved (or an interior line a both-ends edit invalidated the marker for) → text
+     * still present → kept; a re-indent → the trimmed text is present → kept. It also means a card re-anchored
+     * from a stale `line_number` isn't re-examined for drift on the next reload (which would bin it a cycle late).
+     *
+     * Guards: a **non-pending** (Seen/consumed) comment is never binned (an agent resolving a comment consumes
+     * it AND edits the line, so its drift is expected — keep its re-pend + `processed/` tombstone); a **blank**
+     * baseline is uncomparable. Accepted false-negative: if the deleted line's trimmed text happens to match a
+     * *different* surviving line (blank, `}`, boilerplate), the comment is kept on that line (safe-fail).
      */
-    private fun isOrphaned(uuid: String, marker: RangeMarker): Boolean {
-        if (!marker.isValid) return false
+    private fun isOrphaned(uuid: String, presentLines: Set<String>): Boolean {
         val comment = store.get(uuid) ?: return false
         if (comment.status != CommentStatus.PENDING) return false
-        val stored = comment.lineContent
-        if (stored.isBlank()) return false
-        val document = marker.document
-        val line = document.getLineNumber(marker.startOffset)
-        val current = document.getText(
-            TextRange(document.getLineStartOffset(line), document.getLineEndOffset(line)),
-        )
-        return stored.trim() != current.trim()
+        val stored = comment.lineContent.trim()
+        if (stored.isEmpty()) return false
+        return stored !in presentLines
     }
 
     /**
