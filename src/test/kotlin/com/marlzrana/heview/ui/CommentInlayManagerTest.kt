@@ -961,6 +961,15 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         val comment = commentAt(path, line0Based = 1, content = "fix me") // line_number = 2
         store.save(comment)
         manager.init()
+        // Simulate a hook consuming the thread: it MOVES the pool file into processed/ (so comments/<uuid>.json
+        // is absent) and the watcher then marks it Seen. markProcessed is in-memory only, so the move must
+        // happen first — else the CAS re-pend re-reads the still-present, stale PENDING file and (correctly)
+        // reconciles to it. Production always moves before markProcessed (the watcher reacts to the delete).
+        val processed = Files.createDirectories(tempDir.resolve("comments").resolve("processed"))
+        Files.move(
+            tempDir.resolve("comments").resolve("${comment.uuid}.json"),
+            processed.resolve("${comment.uuid}.json"),
+        )
         store.markProcessed(comment.uuid) // a hook consumes the thread → Seen, no longer persisted
 
         // Edit above the still-visible Seen card, then save: the writeback updates the in-memory line even

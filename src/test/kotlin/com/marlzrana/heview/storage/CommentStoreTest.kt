@@ -895,7 +895,8 @@ class CommentStoreTest {
         store.save(sampleComment(uuid = "u1", replies = listOf(r0)))
         val tomb = tombstone(dir, "u1")
         Files.deleteIfExists(dir.resolve("u1.json")) // a genuinely consumed thread: only the tombstone remains
-        makeReadOnlyOrSkip(dir) // the revive's write will now fail
+        store.markProcessed("u1") // …and off-pool (isPersisted=false), so the revive is a legitimate resurrect
+        makeReadOnlyOrSkip(dir) // whose write will now fail
         try {
             store.rependReply("u1", r0, laterTs)
             assertTrue(Files.exists(tomb)) // write failed → the only durable copy is retained
@@ -1304,6 +1305,130 @@ class CommentStoreTest {
 
         assertTrue(Files.exists(dir.resolve("u1.json"))) // resurrected…
         assertEquals(4, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).generation) // …at base 3 + 1
+    }
+
+    @Test
+    fun `an id-less replies file persists an edit to disk with a stable backfilled id`(@TempDir dir: Path) {
+        // A foreign/legacy file with a replies[] array but NO id keys. hydrate backfills a deterministic id;
+        // the CAS merge re-reads the file on commit and must produce the SAME id, or the durable re-apply
+        // never matches and the edit silently fails to persist (only the optimistic in-memory would show it).
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("f.json"),
+            """
+            {"uuid":"f","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+             "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":42,
+             "line_content":"x","side":"file","content":"a\n\nb",
+             "replies":[{"content":"a","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z"},
+                        {"content":"b","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z"}]}
+            """.trimIndent(),
+        )
+        val store = store(dir)
+        store.hydrate()
+        val second = store.get("f")!!.replies!![1] // its id was backfilled on hydrate
+
+        store.editReply("f", second, "b-edited", laterTs)
+
+        // The edit must reach DISK (not just the optimistic in-memory), which requires readDisk to backfill
+        // the SAME id the edit targeted — a random id per read would miss and drop the persist.
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("f.json")))
+        assertEquals(listOf("a", "b-edited"), onDisk.replies?.map { it.content })
+        assertTrue(onDisk.replies!![1].id.isNotBlank())
+    }
+
+    @Test
+    fun `a delete racing an in-flight reply mutation is not resurrected`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
+        tasks.removeFirst().run() // create → disk gen 0
+
+        store.addReply("u1", "b", "me", laterTs) // optimistic + queues the commit
+        store.delete("u1")                        // the user/peer deletes the thread; queues the unlink
+
+        while (tasks.isNotEmpty()) tasks.removeFirst().run() // drain: the commit must not resurrect it
+
+        assertNull(store.get("u1"))                       // index stays gone (adopt is identity-guarded)
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // and no pool file is left behind
+    }
+
+    @Test
+    fun `deleteReply keeps a peer's concurrent reply instead of nuking the pool file`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val only = sampleReply(content = "only")
+        store.save(sampleComment(uuid = "u1", replies = listOf(only)))
+        tasks.removeFirst().run() // create → disk gen 0, [only]
+
+        store.deleteReply("u1", only) // optimistic drops the thread; queues the commit (would delete the file)
+
+        // A peer adds a reply on disk (bumping the generation) before our destructive commit runs.
+        val peer = sampleReply(content = "peer", author = "peer")
+        Files.writeString(
+            dir.resolve("u1.json"),
+            CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(only, peer)).copy(generation = 1)),
+        )
+
+        tasks.removeFirst().run() // commit re-reads [only, peer]; removing `only` leaves [peer] → keeps the file
+
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(listOf("peer"), onDisk.replies?.map { it.content }) // peer's reply survives — not nuked
+        assertEquals(2, onDisk.generation)
+    }
+
+    @Test
+    fun `a reply mutation does not resurrect a hook-claimed pool file`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
+        tasks.removeFirst().run() // create → disk gen 0, persisted
+
+        store.addReply("u1", "b", "me", laterTs) // optimistic + queues the commit
+
+        // A hook claims the thread (moves the file into processed/) AFTER our commit was queued but BEFORE it
+        // runs. The watcher hasn't run markProcessed yet, so isPersisted is still true.
+        val processed = Files.createDirectories(dir.resolve("processed"))
+        Files.move(dir.resolve("u1.json"), processed.resolve("u1.json"))
+
+        tasks.removeFirst().run() // the commit must NOT recreate comments/u1.json nor wipe the tombstone
+
+        assertFalse(Files.exists(dir.resolve("u1.json")))      // not resurrected into the injectable pool
+        assertTrue(Files.exists(processed.resolve("u1.json"))) // the hook's Seen tombstone is preserved
+        assertTrue(store.isPersisted("u1"))                    // still believed persisted (watcher lag)
+    }
+
+    @Test
+    fun `a location writeback does not regress a concurrent reply mutation`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a")))) // line 42
+        tasks.removeFirst().run() // create → disk gen 0
+
+        store.addReply("u1", "b", "me", laterTs) // optimistic [a,b] gen 1; queues the reply commit
+        store.updateLocation("u1", 7, "moved")   // no-bump location writeback at the SAME generation; queues its write
+
+        while (tasks.isNotEmpty()) tasks.removeFirst().run() // reply commit first, then the location writeback
+
+        val after = store.get("u1")!!
+        assertEquals(listOf("a", "b"), after.replies?.map { it.content }) // the reply survived
+        assertEquals(7, after.lineNumber) // …and the same-generation commit did NOT regress the moved line
+        assertEquals(7, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineNumber)
+    }
+
+    @Test
+    fun `a reply mutation over an unreadable pool file is skipped without clobbering it`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
+        tasks.removeFirst().run() // create → disk gen 0
+
+        store.addReply("u1", "b", "me", laterTs) // optimistic + queues the commit
+
+        Files.writeString(dir.resolve("u1.json"), "{ not valid json") // a foreign writer left it unparseable
+
+        tasks.removeFirst().run() // the commit must skip — never clobber a file it can't read
+
+        assertEquals("{ not valid json", Files.readString(dir.resolve("u1.json"))) // untouched
     }
 
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
