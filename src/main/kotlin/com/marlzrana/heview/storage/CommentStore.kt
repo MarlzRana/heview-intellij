@@ -422,6 +422,39 @@ class CommentStore(
         fireChanged()
     }
 
+    /**
+     * Remove an **orphaned** comment — its commented line was deleted or externally rewritten, so a reload
+     * left its anchor drifted onto unrelated code (the manager's reload path; plan.html §5 session-lifetime
+     * exception). Like [evict] it drops the in-memory record + fires, and it unlinks the live pool file
+     * `comments/<uuid>.json` so the comment is gone for the injector + peers — but, unlike [delete], it
+     * **never removes a `processed/` tombstone**.
+     *
+     * This is the safe difference from [delete]: a hook consumes a comment by an atomic *move* into
+     * `processed/`, and in the sliver between that move and the watcher's [markProcessed] the in-memory
+     * status still reads PENDING, so a reload could classify the just-consumed thread as an orphan. Unlinking
+     * only the live file (a no-op if the hook already moved it away) preserves the tombstone, so the consume
+     * still resolves to *Seen* for peers + a restart rather than being mistaken for a user delete. A genuine
+     * orphan (never consumed) has no tombstone, so it simply vanishes — peers `evict` it, which is correct:
+     * binning means "gone everywhere," the same end state as an explicit [delete]. (The residual window where
+     * this client drops a raced-consume thread from its own index belongs to the deferred generation fence.)
+     */
+    fun binFromPool(uuid: String) {
+        if (index.remove(uuid) == null) return
+        fireChanged()
+        runIo {
+            // Serial IO executor so it orders after any in-flight save's persisted.add (see delete()).
+            persisted.remove(uuid)
+            try {
+                // Unlink ONLY the live comment file, never the processed/ tombstone. deleteIfExists is a
+                // no-op if a hook already claimed the file into processed/ — so a raced consume keeps its
+                // tombstone (and stays Seen for peers/restart) instead of being wiped.
+                Files.deleteIfExists(fileFor(uuid))
+            } catch (e: IOException) {
+                LOG.warn("heview: failed to unlink the orphaned comment file $uuid", e)
+            }
+        }
+    }
+
     /** Drop the record and fire immediately; unlink the pool file (and any tombstone) in the background. */
     fun delete(uuid: String) {
         if (index.remove(uuid) == null) return

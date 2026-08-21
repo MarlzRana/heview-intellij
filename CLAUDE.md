@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 218 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 225 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -100,8 +100,10 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   correctly shifted and beats the persisted `line_number` an external edit never updated. The orphan signal is
   **content drift**: after the reload, if a marker's current line no longer matches its comment's stored
   `line_content` (compared **trimmed**, so a re-indent is tolerated), the anchor drifted onto different code (its
-  commented line was deleted or externally rewritten) → the comment is **orphaned** and **binned**
-  (`store.delete` — gone for the injector + peers too). A marker that merely shifted with lines inserted/removed
+  commented line was deleted or externally rewritten) → the comment is **orphaned** and **binned** via
+  `store.binFromPool` (unlinks the live pool file but **keeps any `processed/` tombstone** — a reload can race a
+  hook consume, and the tombstone is the Seen signal peers rely on — never `store.delete`, which would wipe it;
+  gone for the injector + peers). A marker that merely shifted with lines inserted/removed
   above keeps the SAME content → kept (trust-the-marker). Binning is deliberately **conservative** — a mis-fire
   silently deletes a comment for every client — so `isOrphaned` bins ONLY a **valid** marker, on a **PENDING**
   comment, with a **non-blank** baseline: an *invalid* marker is kept (a both-ends edit — import at top + fn at
@@ -249,30 +251,38 @@ context-blind reviewer will keep raising them:
   microsecond-narrow); (b) **visual pass** (scroll-preserve on rebuild, aggregate thread label, lazy reply
   box, focus/caret) — maintainer-acknowledged follow-up; (c) preferences (sealed `CardState`, pass `targetId`)
   — code is correct + tested.
-- **Built — orphan-comment binning (reload-only, silent).** After an external file reload, a comment whose
-  anchor has **drifted onto different code** — its marker's current line no longer matches the comment's stored
-  `line_content` (its commented line was deleted or externally rewritten) — is **orphaned** and `store.delete`d
-  from the pool (gone for the injector + peers too) rather than left on unrelated code. **Empirical basis
-  (dogfood + a probe test):** a real IntelliJ reload diffs the text (`DocumentImpl.replaceString` common-affix
-  trim) and *shifts* a surviving `RangeMarker` — it does **not** invalidate it — so `isValid` alone never
-  detects a deleted line (the first cut used `isValid == false` and was a no-op in practice). The robust signal
-  is content drift. Decisions (AskUserQuestion): (a) **trimmed compare** — a pure re-indent/reformat is
-  tolerated (kept); a real content change or line deletion bins it; a marker that only shifted with lines above
-  keeps the SAME content → kept (trust-the-marker); (b) **reload-only** — a *save* never bins (its writeback
-  keeps stored `line_content` in step with in-IDE edits, so only an *external* change diverges; extending to the
-  in-IDE case is deferred); (c) **silent** — no notification (matches delete/evict/markProcessed). **Conservative
-  guards (from the increment's own `/aeview-loop`, since a false bin silently deletes a comment for every
-  client):** `isOrphaned` bins ONLY a (i) **valid** marker — an *invalid* one is kept, because a both-ends edit
-  (import at top + fn at bottom) replays as one whole-middle `replaceString` that invalidates untouched middle
-  markers, and binning on `!isValid` would mass-delete comments the agent never touched (verified by a real-VFS
-  probe); (ii) on a **PENDING** comment — a Seen/consumed thread is kept, since an agent resolving a comment
-  consumes it (→ Seen, before it edits the code) AND rewrites the line, so that drift must not delete it; (iii)
-  with a **non-blank** baseline — an empty `line_content` is uncomparable. Where: `onFileContentReloaded` →
-  `binOrphanedAnchors` (BEFORE the writeback overwrites the baseline) → `isOrphaned`; a single `store.delete`
-  cascades card + anchor teardown across every split via the change listener (with a trailing `anchors.remove`
-  for a deferred-close editorless document reconcile would miss). **Deferred:** extending binning to the in-IDE
-  line-deletion case; a content-drift *false-negative* when a deleted line's marker shifts onto a different line
-  with identical trimmed text (blank, `}`, boilerplate) — the comment is kept on unrelated code (safe-fail).
+- **Built — orphan-comment binning (reload-only, silent). This is a sanctioned §5 session-lifetime DIVERGENCE
+  from reviewa** (which removes a comment from the pool ONLY on explicit Delete or hook-consume): heview adds a
+  third exit — after an external reload, a comment whose anchor has **drifted onto different code** (its marker's
+  current line no longer matches, trimmed, the stored `line_content` — its commented line was deleted or
+  externally rewritten) is **orphaned** and removed from the pool. Consequence the maintainer accepted (via
+  AskUserQuestion): a `git checkout` / external formatter / branch switch that rewrites a commented line also
+  drops that pending comment for every client. **Empirical basis:** a real IntelliJ reload diffs the text
+  (`DocumentImpl.replaceString` common-affix trim) and *shifts* a surviving `RangeMarker` — it does **not**
+  invalidate it — so `isValid` alone never detects a deleted line (the first cut used `isValid == false` and was
+  a no-op; verified by a real-VFS probe). The robust signal is content drift. Decisions (AskUserQuestion):
+  **trimmed compare** (re-indent/reformat kept; real change or deletion binned; a marker that only shifted with
+  lines above keeps the SAME content → kept), **reload-only** (a *save* never bins — its writeback keeps stored
+  `line_content` in step, so only an external change diverges; in-IDE binning deferred), **silent**.
+  **Conservative guards (from the increment's own 3-cycle `/aeview-loop`, since a false bin deletes a comment
+  for every client):** `isOrphaned` bins ONLY a (i) **valid** marker — an *invalid* one is kept + re-anchored
+  from `line_number`, because a both-ends edit (import at top + fn at bottom) replays as one whole-middle
+  `replaceString` that invalidates untouched interior markers, and binning those would mass-delete; (ii) on a
+  **PENDING** comment — a Seen/consumed thread is kept (an agent resolving a comment consumes it AND rewrites
+  the line, so that drift must not delete it); (iii) with a **non-blank** baseline. **Removal path =
+  `store.binFromPool` (NOT `store.delete`):** it unlinks only the live `comments/<uuid>.json` and **preserves
+  any `processed/` tombstone** — in the sliver between a hook's consume-move and the watcher's `markProcessed`
+  the in-memory status still reads PENDING, so binning must not wipe the tombstone (else a peer reads the vanish
+  as a user-delete instead of Seen). Peer semantics: a genuine orphan vanishes with no tombstone → peers
+  `evict` (correct — "gone everywhere", same end state as delete). **Reload flow order (all mutate anchors /
+  fire reconciles):** classify orphans + invalidated from the current markers → `writeBackAnchors` survivors
+  FIRST (skipping orphans, so `binFromPool`'s synchronous reconcile can't mint a `line_number`-fallback marker
+  that writeback would then persist) → drop invalidated markers' cards+anchors (reconcile re-anchors from
+  `line_number`) → `binFromPool` orphans (+ trailing `anchors.remove` for a deferred-close editorless document
+  reconcile can't sweep) → reconcile. **Deferred:** in-IDE line-deletion binning; the raced-consume residual
+  (this client drops a just-consumed thread from its own index — tombstone survives) → generation fence; a
+  content-drift *false-negative* when a deleted line's marker shifts onto a line with identical trimmed text
+  (blank, `}`, boilerplate) — kept on unrelated code (safe-fail).
 </settled-decisions>
 
 <review>
@@ -291,7 +301,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **218 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **225 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
@@ -308,7 +318,7 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **218 tests**, `buildPlugin` clean.
+Gate: **225 tests**, `buildPlugin` clean.
 
 **Shipped + dogfooded + `/aeview-loop`-hardened — external-file-reload handling** (former cycle-2 #4 gap). An
 agent editing a file to resolve a comment triggers a document reload that can dispose the inlays and — unlike a
@@ -339,29 +349,27 @@ anchor lifecycle was the recurring hot-spot — the panel caught a regression in
 (c3 leak on close → c5 over-retire → c6 conf-1.0 loss of the writeback when an unsaved file's last editor
 closes), which drove the **final, correct retirement model** now documented above (store-absence + document
 has-no-editor, unsaved-deferred; never card-presence). c6 also gave the writeback a replace-only write path.
-Cycle 6's fixes are gate-green (218 tests) but weren't independently re-reviewed (stopped there) — dogfooding
+Cycle 6's fixes are gate-green (225 tests) but weren't independently re-reviewed (stopped there) — dogfooding
 the anchor lifecycle is the better next signal than more cycles. Deferred (recorded): the cross-process
 **generation fence** (a residual writeback-vs-consume TOCTOU + a peer-overwrite window on the shared pool) and
 the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
-Gate: **218 tests**, `buildPlugin` clean.
+Gate: **225 tests**, `buildPlugin` clean.
 
-**Shipped — orphan-comment binning (reload-only, silent)** (LOCAL/unpushed; dogfood-corrected). After an
-external reload, a comment whose anchor has **drifted onto different code** — the marker's current line no
-longer matches (trimmed) the stored `line_content`, i.e. its commented line was deleted or externally rewritten
-— is `store.delete`d from the pool (gone for the injector + peers too) instead of left on unrelated code.
-**Dogfooding caught that the first cut (`isValid == false`) was a no-op:** a real IntelliJ reload *shifts* a
-surviving `RangeMarker`, it never invalidates it (confirmed by a throwaway probe test), so the robust signal is
-content drift, not `isValid`. `onFileContentReloaded` → `binOrphanedAnchors` (before the writeback overwrites
-the baseline) → `isOrphaned` compares `store.get(uuid).lineContent.trim()` vs the marker's current line; one
-`store.delete` cascades card + anchor teardown across every split. Three AskUserQuestions settled: **reload-only**
-(a save's writeback keeps stored `line_content` in step, so only an external change diverges); **silent** (no
-notification); **trimmed compare** (a re-indent/reformat is kept, a real content change or deletion binned).
-Tests use a faithful `reloadWith` full-text replace (a raw `deleteString` invalidates and misrepresents a
-reload): line deleted / text rewritten → binned (+ across splits); insert-above / re-indent → kept. **Dogfooded
-green**, then hardened by the increment's **`/aeview-loop`** (in progress; scope `range:7d9757e..HEAD`): cycle 1
-(9 findings) drove the conservative guards above — **valid-marker + PENDING + non-blank** — closing a mass-delete
-on a both-ends edit (invalidated middle markers) and never binning a Seen/consumed thread; a real-VFS probe
-confirmed the both-ends invalidation. Gate: **218 tests**, `buildPlugin` clean.
+**Shipped — orphan-comment binning (reload-only, silent)** (LOCAL/unpushed; dogfood- + loop-corrected; a
+sanctioned §5 divergence — see `<settled-decisions>`). After an external reload, a comment whose anchor has
+**drifted onto different code** (its marker's current line no longer matches, trimmed, the stored
+`line_content`) is removed from the pool via `store.binFromPool` (unlinks the live file, **keeps any
+`processed/` tombstone**) instead of left on unrelated code. The signal is **content drift, not `isValid`** — a
+real reload *shifts* a surviving marker, never invalidates it (probe-confirmed; the first cut used `isValid` and
+was a no-op). Three AskUserQuestions: **reload-only**, **silent**, **trimmed compare**; plus the maintainer
+accepted that a `git checkout`/formatter rewriting a commented line also drops the pending comment. The
+increment's **`/aeview-loop` (in progress; scope `range:7d9757e..HEAD`)** hardened it over 2 cycles: cycle 1 (9
+findings) → the conservative guards (**valid + PENDING + non-blank**), closing a both-ends-edit mass-delete
+(invalidated interior markers are kept + re-anchored) and never binning a Seen thread; cycle 2 (8 findings) →
+route removal through `binFromPool` not `store.delete` (preserve the tombstone across a raced consume — peers
+still read Seen), and the reload flow now **writes back survivors BEFORE binning** so `binFromPool`'s
+synchronous reconcile can't mint a `line_number`-fallback marker that writeback would persist. Gate:
+**225 tests**, `buildPlugin` clean.
 
 **Next — the generation fence** (larger; needs an AskUserQuestion + a SHARED cross-tool contract). Optimistic
    compare-and-swap on a per-file **generation** token (a `generation:int` / mtime / content-hash — the design

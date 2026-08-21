@@ -103,6 +103,38 @@ class CommentStoreTest {
     }
 
     @Test
+    fun `binFromPool of a genuine orphan unlinks the live pool file and drops the record`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        store.binFromPool("u1")
+        assertNull(store.get("u1"))
+        assertFalse(Files.exists(dir.resolve("u1.json")))
+    }
+
+    @Test
+    fun `binFromPool keeps the tombstone of a comment a hook already consumed`(@TempDir dir: Path) {
+        val store = store(dir)
+        store.save(sampleComment(uuid = "u1"))
+        val tomb = tombstone(dir, "u1")              // the hook's atomic move: comments/u1.json -> processed/u1.json …
+        Files.deleteIfExists(dir.resolve("u1.json")) // … which removed the live file
+
+        store.binFromPool("u1") // a reload raced the consume and saw a still-PENDING, drifted thread
+
+        assertNull(store.get("u1"))    // dropped from this client's index (the narrow race residual)
+        assertTrue(Files.exists(tomb)) // but the tombstone SURVIVES → peers + a restart still resolve it to Seen
+    }
+
+    @Test
+    fun `binFromPool is a no-op for an unknown uuid`(@TempDir dir: Path) {
+        val store = store(dir)
+        var fires = 0
+        store.addChangeListener { fires++ }
+        store.binFromPool("ghost")
+        assertEquals(0, fires)
+        assertNull(store.get("ghost"))
+    }
+
+    @Test
     fun `upsert replaces the on-disk file`(@TempDir dir: Path) {
         val store = store(dir)
         store.save(sampleComment(uuid = "u1", status = CommentStatus.PENDING))

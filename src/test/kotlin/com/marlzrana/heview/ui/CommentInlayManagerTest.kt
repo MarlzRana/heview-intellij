@@ -500,6 +500,9 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
         assertNotNull(store.get(comment.uuid)) // kept — an invalidated marker is not treated as an orphan
         assertNotNull(manager.cardForTest(e1, comment.uuid)) // recreated (re-anchored from line_number)
+        // Recreated at the line_number fallback (clamped), NOT stuck at the dead marker's offset or 0.
+        val fallbackLine = (comment.lineNumber - 1).coerceIn(0, e1.document.lineCount - 1)
+        assertEquals(e1.document.getLineEndOffset(fallbackLine), hosts.getValue(e1).lastOffset)
     }
 
     fun testFileContentReloadKeepsAConsumedCommentWhoseLineTheAgentFixed() {
@@ -571,6 +574,87 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         reloadWith(e1, "l0\nNOW-CODE\nl2\n")
 
         assertNotNull(store.get(comment.uuid)) // kept — blank baseline is never treated as drift
+    }
+
+    fun testFileContentReloadDoesNotBinADriftedCommentOnAnotherFile() {
+        val (eA, pathA) = openLocalEditor("SCOPEA.txt", "l0\nl1\nl2\n")
+        val (eB, pathB) = openLocalEditor("SCOPEB.txt", "x0\nx1\nx2\n")
+        // A's comment is already drifted (stored line_content deliberately mismatches its live line "l1"); if
+        // binning dropped the `document ===` filter it would delete A when only B reloads.
+        val a = commentAt(pathA, line0Based = 1, content = "in A", lineContent = "OLD-A")
+        val b = commentAt(pathB, line0Based = 1, content = "in B", lineContent = "x1")
+        store.save(a)
+        store.save(b)
+        manager.init()
+
+        manager.simulateFileContentReloadedForTest(eB.document) // reload B only
+
+        assertNotNull(store.get(a.uuid)) // A untouched — binning is scoped to the reloaded document, not the session
+        assertNotNull(store.get(b.uuid)) // B matches its baseline → kept
+        assertNotNull(manager.cardForTest(eA, a.uuid))
+    }
+
+    fun testSavingDoesNotBinAValidDriftedPendingComment() {
+        val (e1, path) = openLocalEditor("SAVEBIN.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+
+        // Rewrite the commented line's text in place (marker stays valid) so it drifts from the stored
+        // line_content — the exact shape binning acts on — then SAVE. Binning is reload-only, so a save must
+        // NOT delete it (an in-IDE edit stays undoable until reload). This fails if binning ever leaked onto
+        // the save path; the invalidated-marker save test can't catch it (its guard short-circuits on !isValid).
+        WriteCommandAction.runWriteCommandAction(project) {
+            e1.document.insertString(e1.document.getLineStartOffset(1) + 1, "-edited-") // "l1" -> "l-edited-1", marker valid
+        }
+        manager.simulateBeforeDocumentSavingForTest(e1.document)
+
+        assertNotNull(store.get(comment.uuid)) // not binned on save (reload-only), even though it drifted
+    }
+
+    fun testFileContentReloadBinsAnOrphanWhoseEditorAlreadyClosed() {
+        val (e1, path) = openLocalEditor("EDITORLESS.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "MISMATCH") // already drifted
+        store.save(comment)
+        manager.init()
+        val doc = e1.document
+
+        // Leave the document unsaved so closing DEFERS the anchor (forget keeps it for the pending save-on-close),
+        // then close the only editor.
+        WriteCommandAction.runWriteCommandAction(project) { doc.insertString(0, "NEW\n") }
+        assertTrue(FileDocumentManager.getInstance().isDocumentUnsaved(doc))
+        EditorFactory.getInstance().releaseEditor(e1)
+        openedEditors.remove(e1)
+        assertEquals(1, manager.anchorCountForTest()) // deferred: no open editor, yet the anchor lingers
+
+        // A reload for that editorless document: binFromPool's reconcile has no editor to sweep the anchor, so
+        // the bin loop's trailing anchors.remove must retire it — else the RangeMarker (which pins its Document) leaks.
+        manager.simulateFileContentReloadedForTest(doc)
+
+        assertNull(store.get(comment.uuid)) // binned
+        assertEquals(0, manager.anchorCountForTest()) // …and the anchor retired despite no open editor
+    }
+
+    fun testFileContentReloadDoesNotWriteBackAnInvalidatedSiblingViaTheBinReconcile() {
+        val (e1, path) = openLocalEditor("SIB.txt", "l0\nl1\nl2\nl3\n")
+        val orphan = commentAt(path, line0Based = 0, content = "orphan", lineContent = "MISMATCH") // valid + drifted → binned
+        val sibling = commentAt(path, line0Based = 2, content = "sibling", lineContent = "l2") // line_number 3
+        store.save(orphan)
+        store.save(sibling)
+        manager.init()
+
+        // Invalidate the sibling's marker (as a both-ends reload would), leaving the orphan's marker valid+drifted.
+        WriteCommandAction.runWriteCommandAction(project) {
+            e1.document.deleteString(e1.document.getLineStartOffset(2), e1.document.getLineStartOffset(3)) // delete "l2\n"
+        }
+        manager.simulateFileContentReloadedForTest(e1.document)
+
+        // Binning the orphan fires a reconcile that recreates the sibling's card from line_number (minting a fresh
+        // valid marker). Because writeBack runs BEFORE the bin (and skips the orphan), that fallback marker must
+        // NOT be persisted — the sibling's durable line_number/line_content stay at their pre-reload values.
+        assertNull(store.get(orphan.uuid)) // orphan binned
+        assertEquals(3, store.get(sibling.uuid)?.lineNumber) // unchanged — not rewritten to the fallback line
+        assertEquals("l2", store.get(sibling.uuid)?.lineContent) // unchanged
     }
 
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
