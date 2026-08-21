@@ -17,7 +17,9 @@ Export JAVA_HOME before every Gradle command:
     export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
 
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
-  the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
+  the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper. NOTE: the Bash
+  shell's cwd can be the parent `~/gh/MarlzRana` (not the repo), so a bare `./gradlew` may 404 — use the
+  absolute wrapper with `-p`: `~/gh/MarlzRana/heview-intellij/gradlew -p ~/gh/MarlzRana/heview-intellij ...`.
 - Commands (run from the repo root):
     ./gradlew test          # 230 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
@@ -311,9 +313,10 @@ Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uui
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
-`41ad48f`; **12 local unpushed commits on top (`f22ca42`..HEAD)** — the external-file-reload +
+`41ad48f`; **17 local unpushed commits on top (`f22ca42`..HEAD, HEAD `e0a9041`)** — the external-file-reload +
 line_number-writeback increments + their 6-cycle `/aeview-loop` + `.aeviewignore` + the docs pointer + the
-orphan-comment-binning increment, all gate-green. The maintainer runs pushes — **do NOT push; ask/wait**.
+orphan-comment-binning increment (5 commits `4c14c13`..`e0a9041`, through a 5-cycle `/aeview-loop`), all
+gate-green (**230 tests**). The maintainer runs pushes — **do NOT push; ask/wait**.
 
 **Shipped + dogfooded + pushed — Phase 1 multi-reply comment threads + per-reply state machine (plan §5),
 through a full 5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field:
