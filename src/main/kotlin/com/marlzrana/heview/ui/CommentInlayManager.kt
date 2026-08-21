@@ -225,11 +225,20 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      * `line_content` in step, so only an *external* change diverges) and **silent**. EDT-confined.
      */
     private fun onFileContentReloaded(document: Document) {
-        val onDoc = anchors.entries.filter { it.value.document === document }
-        if (onDoc.isNotEmpty()) {
+        // Detection is keyed on the durable STORE (via the document's file path), NOT the transient `anchors`
+        // map: a reload can fire for a document whose editors all closed (their anchors were swept) or, later,
+        // for a peer-synced comment never opened here — those have no anchor yet must still be considered.
+        val path = localAbsPath(document)
+        val comments = if (path == null) emptyList() else store.forAbsPath(path)
+        if (comments.isNotEmpty()) {
             val presentLines = document.text.lineSequence().mapTo(HashSet()) { it.trim() }
-            val orphaned = onDoc.filter { isOrphaned(it.key, presentLines) }.map { it.key }.toSet()
-            val invalidated = onDoc.filter { !it.value.isValid && it.key !in orphaned }.map { it.key }.toSet()
+            val orphaned = comments.filter { isOrphaned(it, presentLines) }.map { it.uuid }.toSet()
+            // Markers this reload INVALIDATED whose comment is NOT an orphan (its line survives — a both-ends
+            // edit killed an untouched interior marker): drop the dead anchor + stranded card so reconcile
+            // re-anchors from line_number. (Anchors, not the store, since this is purely about the live marker.)
+            val invalidated = anchors.entries
+                .filter { it.value.document === document && !it.value.isValid && it.key !in orphaned }
+                .map { it.key }.toSet()
 
             writeBackAnchors(document, skip = orphaned)
 
@@ -245,39 +254,48 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         }
 
         rendered.keys.filter { it.document === document }.forEach(::reconcile)
-
-        if (rendered.keys.none { it.document === document }) {
-            anchors.entries.filter { it.value.document === document }
-                .map { it.key }.toList()
-                .forEach { anchors.remove(it)?.dispose() }
-        }
+        sweepEditorlessAnchors(document)
     }
 
     /**
-     * True if the comment [uuid] is orphaned by the reload — the signal for binning. Deliberately
-     * **conservative**, because a mis-fire silently deletes a user's comment for every client, so the test is
-     * **content presence, not marker position**: the comment is orphaned iff its stored `line_content` (trimmed)
-     * is no longer any line in the reloaded file ([presentLines]).
+     * True if [comment] is orphaned by the reload — the signal for binning. Deliberately **conservative**,
+     * because a mis-fire silently deletes a user's comment for every client, so the test is **content presence,
+     * not marker position**: the comment is orphaned iff its stored `line_content` (trimmed) is no longer any
+     * line in the reloaded file ([presentLines]).
      *
      * Why presence and not "the marker drifted": a real reload replays as one `DocumentImpl.replaceString` with
      * a common-affix trim, so whether the *deleted line's own* marker survives-and-shifts or is invalidated
-     * depends on the surrounding text — an unreliable, input-dependent signal. "Is the commented text still in
-     * the file?" is marker-validity-independent and correct for every case: a deleted/rewritten line → text gone
-     * → orphan; a line merely moved (or an interior line a both-ends edit invalidated the marker for) → text
-     * still present → kept; a re-indent → the trimmed text is present → kept. It also means a card re-anchored
-     * from a stale `line_number` isn't re-examined for drift on the next reload (which would bin it a cycle late).
+     * depends on the surrounding text — an unreliable, input-dependent signal — and a comment whose line merely
+     * *moved* would false-bin under a drift check. "Is the commented text still in the file?" is
+     * marker-validity-independent and correct for every case: a deleted/rewritten line → text gone → orphan; a
+     * line moved, or an interior line a both-ends edit invalidated the marker for → text still present → kept; a
+     * re-indent → the trimmed text is present → kept. It also means a card re-anchored from a stale `line_number`
+     * isn't re-examined for drift on the next reload (which would bin it a cycle late).
      *
      * Guards: a **non-pending** (Seen/consumed) comment is never binned (an agent resolving a comment consumes
      * it AND edits the line, so its drift is expected — keep its re-pend + `processed/` tombstone); a **blank**
      * baseline is uncomparable. Accepted false-negative: if the deleted line's trimmed text happens to match a
      * *different* surviving line (blank, `}`, boilerplate), the comment is kept on that line (safe-fail).
      */
-    private fun isOrphaned(uuid: String, presentLines: Set<String>): Boolean {
-        val comment = store.get(uuid) ?: return false
+    private fun isOrphaned(comment: HeviewComment, presentLines: Set<String>): Boolean {
         if (comment.status != CommentStatus.PENDING) return false
         val stored = comment.lineContent.trim()
         if (stored.isEmpty()) return false
         return stored !in presentLines
+    }
+
+    /**
+     * Retire every anchor on [document] once no open editor shows it. A [RangeMarker] pins its `Document`, so a
+     * reload or save that leaves the document editorless (a reload clears unsaved state, so no save-on-close
+     * `beforeDocumentSaving` will run) must drop the document's remaining anchors or leak the `Document`. Also
+     * mops up an anchor whose comment a *peer project's* manager already binned from the shared store (its
+     * reconcile can't sweep an editorless document). Shared by the reload + save paths.
+     */
+    private fun sweepEditorlessAnchors(document: Document) {
+        if (rendered.keys.any { it.document === document }) return
+        anchors.entries.filter { it.value.document === document }
+            .map { it.key }.toList()
+            .forEach { anchors.remove(it)?.dispose() }
     }
 
     /**
@@ -290,14 +308,10 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
      */
     private fun onBeforeDocumentSaving(document: Document) {
         writeBackAnchors(document)
-        // Deferred-close cleanup: if the last editor of this document already closed, `forget` left its
-        // anchors in place (the document was unsaved and this pending save-on-close still needed them for the
-        // writeback above). Retire them now that the write has read them.
-        if (rendered.keys.none { it.document === document }) {
-            anchors.entries.filter { it.value.document === document }
-                .map { it.key }.toList()
-                .forEach { anchors.remove(it)?.dispose() }
-        }
+        // Deferred-close cleanup: if the last editor of this document already closed, `forget` left its anchors
+        // in place (the document was unsaved and this pending save-on-close still needed them for the writeback
+        // above). Retire them now that the write has read them (shared with the reload path).
+        sweepEditorlessAnchors(document)
     }
 
     /**
@@ -455,8 +469,11 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
             localAbsPath(editor) != null
 
     /** This editor's file as an absolute OS path, or null if it isn't a local file. */
-    private fun localAbsPath(editor: Editor): String? =
-        FileDocumentManager.getInstance().getFile(editor.document)
+    private fun localAbsPath(editor: Editor): String? = localAbsPath(editor.document)
+
+    /** [document]'s file as an absolute OS path, or null if it isn't a local file (no open editor needed). */
+    private fun localAbsPath(document: Document): String? =
+        FileDocumentManager.getInstance().getFile(document)
             ?.takeIf { it.isInLocalFileSystem }
             ?.toNioPath()?.toString()
 

@@ -19,7 +19,7 @@ Export JAVA_HOME before every Gradle command:
 - Use the **wrapper only**, pinned to Gradle 8.10.2 (`./gradlew`, or `./gradlew -p <repo>`). Do NOT use
   the machine's brew gradle (9.x) for builds — it was used once only to bootstrap the wrapper.
 - Commands (run from the repo root):
-    ./gradlew test          # 227 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 229 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -277,7 +277,9 @@ context-blind reviewer will keep raising them:
   any `processed/` tombstone** — in the sliver between a hook's consume-move and the watcher's `markProcessed`
   the in-memory status still reads PENDING, so binning must not wipe the tombstone (else a peer reads the vanish
   as a user-delete instead of Seen). Peer semantics: a genuine orphan vanishes with no tombstone → peers
-  `evict` (correct — "gone everywhere", same end state as delete). **Reload flow order:** build the set of
+  `evict` (correct — "gone everywhere", same end state as delete). **Reload flow order:** candidates come from the
+  **durable store** (`store.forAbsPath` on the document's file path), NOT the transient `anchors` map, so a
+  reload of an editorless (or, later, peer-synced-never-opened) document is still handled → build the set of
   present (trimmed) lines → classify orphans + still-valid-line invalidated markers → `writeBackAnchors`
   survivors FIRST (skipping orphans, so `binFromPool`'s synchronous reconcile can't mint a `line_number`-fallback
   marker that writeback then persists) → drop invalidated markers' cards+anchors (reconcile re-anchors) →
@@ -305,7 +307,7 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **227 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **229 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
@@ -322,7 +324,7 @@ reply; the card renders a stack of reply rows (trash/pencil always, clock re-pen
 comment" box, with Cmd/Ctrl+Enter-to-submit and focus landing in the reply box after submit. The
 `/aeview-loop` ran to the 5-cycle cap (findings 17→19→16→15→15); everything it surfaced is fixed or a
 recorded deferral — see `<settled-decisions>` ("Built (Phase 1 …)" + "Phase-1 `/aeview-loop` outcomes").
-Gate: **227 tests**, `buildPlugin` clean.
+Gate: **229 tests**, `buildPlugin` clean.
 
 **Shipped + dogfooded + `/aeview-loop`-hardened — external-file-reload handling** (former cycle-2 #4 gap). An
 agent editing a file to resolve a comment triggers a document reload that can dispose the inlays and — unlike a
@@ -353,11 +355,11 @@ anchor lifecycle was the recurring hot-spot — the panel caught a regression in
 (c3 leak on close → c5 over-retire → c6 conf-1.0 loss of the writeback when an unsaved file's last editor
 closes), which drove the **final, correct retirement model** now documented above (store-absence + document
 has-no-editor, unsaved-deferred; never card-presence). c6 also gave the writeback a replace-only write path.
-Cycle 6's fixes are gate-green (227 tests) but weren't independently re-reviewed (stopped there) — dogfooding
+Cycle 6's fixes are gate-green (229 tests) but weren't independently re-reviewed (stopped there) — dogfooding
 the anchor lifecycle is the better next signal than more cycles. Deferred (recorded): the cross-process
 **generation fence** (a residual writeback-vs-consume TOCTOU + a peer-overwrite window on the shared pool) and
 the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
-Gate: **227 tests**, `buildPlugin` clean.
+Gate: **229 tests**, `buildPlugin` clean.
 
 **Shipped — orphan-comment binning (reload-only, silent)** (LOCAL/unpushed; dogfood- + loop-corrected; a
 sanctioned §5 divergence — see `<settled-decisions>`). After an external reload, a comment whose anchor has
@@ -368,12 +370,14 @@ marker-based signals are input-dependent (a reload may shift OR invalidate a mar
 used `isValid` and was a no-op, the second used marker-drift and mis-fired on both-ends edits). Three
 AskUserQuestions: **reload-only**, **silent**, **trimmed compare**; plus the maintainer accepted that a
 `git checkout`/formatter rewriting a commented line also drops the pending comment. The increment's
-**`/aeview-loop` (in progress; scope `range:7d9757e..HEAD`)** hardened it over 3 cycles: cycle 1 (9) → conservative
-guards (PENDING + non-blank); cycle 2 (8) → removal via `binFromPool` not `store.delete` (preserve the tombstone
-across a raced consume) + write back survivors BEFORE binning (so the bin's reconcile can't mint a fallback
-marker writeback then persists); cycle 3 (8) → switch the signal to **content presence** (fixes the
+**`/aeview-loop` (in progress; scope `range:7d9757e..HEAD`)** hardened it over 4 cycles (findings 9→8→8→5): cycle 1
+→ conservative guards (PENDING + non-blank); cycle 2 → removal via `binFromPool` not `store.delete` (preserve the
+tombstone across a raced consume) + write back survivors BEFORE binning (so the bin's reconcile can't mint a
+fallback marker writeback then persists); cycle 3 → switch the signal to **content presence** (fixes the
 input-dependent deleted-line detection + a deferred mass-delete of a re-anchored both-ends comment) + sweep
-leftover anchors on an editorless reloaded document. Gate: **227 tests**, `buildPlugin` clean.
+leftover anchors on an editorless reloaded document; cycle 4 → detect orphans from the **durable store** (by the
+document's path) not the transient `anchors` map (so a reload of an editorless/peer-synced document still bins)
++ dedupe the editorless sweep. Gate: **229 tests**, `buildPlugin` clean.
 
 **Next — the generation fence** (larger; needs an AskUserQuestion + a SHARED cross-tool contract). Optimistic
    compare-and-swap on a per-file **generation** token (a `generation:int` / mtime / content-hash — the design

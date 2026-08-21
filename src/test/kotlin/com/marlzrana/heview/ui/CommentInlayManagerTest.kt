@@ -693,6 +693,44 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         assertNotNull(store.get(comment.uuid)) // still kept — no deferred mass-delete
     }
 
+    fun testFileContentReloadKeepsACommentWhenItsLineMovedElsewhere() {
+        val (e1, path) = openLocalEditor("MOVED.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+
+        // Relocate "l1" to the end AND change what sits at its old position. Its live marker now sits on
+        // different text, so a marker-drift check would BIN — but content-presence KEEPS it because "l1" is
+        // still a line in the file (just moved). This is the regression a return to marker-line-match introduces.
+        reloadWith(e1, "l0\nl2\nl1\n")
+
+        assertNotNull(store.get(comment.uuid)) // kept — its commented text still exists, merely relocated
+        assertNotNull(manager.cardForTest(e1, comment.uuid))
+    }
+
+    fun testFileContentReloadSweepsAKeptCommentsAnchorWhenItsEditorAlreadyClosed() {
+        val (e1, path) = openLocalEditor("KEEPLESS.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1") // stays present → NOT an orphan
+        store.save(comment)
+        manager.init()
+        val doc = e1.document
+
+        // Unsaved edit so closing DEFERS the anchor, then close the only editor.
+        WriteCommandAction.runWriteCommandAction(project) { doc.insertString(0, "NEW\n") }
+        assertTrue(FileDocumentManager.getInstance().isDocumentUnsaved(doc))
+        EditorFactory.getInstance().releaseEditor(e1)
+        openedEditors.remove(e1)
+        assertEquals(1, manager.anchorCountForTest()) // deferred (unsaved close)
+
+        // A reload where "l1" SURVIVES (not an orphan). The comment stays, but its editor is gone and the reload
+        // cleared unsaved state → no save-on-close sweep. The trailing sweepEditorlessAnchors must retire the
+        // surviving anchor (the orphan bin loop never runs for it), else the RangeMarker leaks its Document.
+        manager.simulateFileContentReloadedForTest(doc)
+
+        assertNotNull(store.get(comment.uuid)) // kept ("l1" still present)
+        assertEquals(0, manager.anchorCountForTest()) // its now-editorless anchor was swept — no leak
+    }
+
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
         val (e1, path) = openLocalEditor("DISP.txt", "l0\nl1\nl2\n")
         val comment = commentAt(path, line0Based = 1, content = "x") // line_number 2
