@@ -231,8 +231,14 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
         val path = localAbsPath(document)
         val comments = if (path == null) emptyList() else store.forAbsPath(path)
         if (comments.isNotEmpty()) {
-            val presentLines = document.text.lineSequence().mapTo(HashSet()) { it.trim() }
-            val orphaned = comments.filter { isOrphaned(it, presentLines) }.map { it.uuid }.toSet()
+            // Build the O(file-size) present-lines set only if some comment is even bin-eligible (PENDING +
+            // non-blank), so a reload whose comments are all Seen/blank skips the scan.
+            val orphaned = if (comments.none { it.status == CommentStatus.PENDING && it.lineContent.isNotBlank() }) {
+                emptySet()
+            } else {
+                val presentLines = document.text.lineSequence().mapTo(HashSet()) { it.trim() }
+                comments.filter { isOrphaned(it, presentLines) }.map { it.uuid }.toSet()
+            }
             // Markers this reload INVALIDATED whose comment is NOT an orphan (its line survives — a both-ends
             // edit killed an untouched interior marker): drop the dead anchor + stranded card so reconcile
             // re-anchors from line_number. (Anchors, not the store, since this is purely about the live marker.)
@@ -247,10 +253,9 @@ internal class CommentInlayManager(private val project: Project) : Disposable {
                 rendered.values.forEach { it.remove(uuid)?.dispose() }
             }
 
-            orphaned.forEach { uuid ->
-                store.binFromPool(uuid)
-                anchors.remove(uuid)?.dispose()
-            }
+            // No explicit anchors.remove: binFromPool fires a synchronous reconcile that retires the now
+            // store-absent anchor when an editor is open, and sweepEditorlessAnchors (below) retires it otherwise.
+            orphaned.forEach { store.binFromPool(it) }
         }
 
         rendered.keys.filter { it.document === document }.forEach(::reconcile)

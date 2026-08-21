@@ -645,17 +645,16 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
         manager.init()
 
         // A both-ends reload: no common affix, so the whole middle is replaced and BOTH markers invalidate. "AAA"
-        // is gone from the file → orphan → binned; "BBB" is still present → survivor kept, but its marker is
-        // invalid, so reconcile re-creates its card from line_number (minting a fresh valid marker).
-        reloadWith(e1, "IMPORT\ntop\nBBB\nbot\nFUNC\n")
+        // is gone → orphan → binned; "BBB" is still present → survivor kept, but its marker is invalid, so
+        // reconcile re-creates its card from its stale line_number=3, which clamps onto 0-based line 2 = "L2" —
+        // deliberately NOT "BBB". So if writeBack ran AFTER the bin's reconcile (the ordering bug), it would
+        // persist line_content "L2"; running it BEFORE (and skipping the invalid marker) leaves "BBB" intact.
+        reloadWith(e1, "L0\nL1\nL2\nBBB\nbot\nFUNC\n")
 
         assertNull(store.get(orphan.uuid)) // orphan binned (its line's text is gone)
-        // The survivor is kept. Its durable line_number/line_content must NOT be rewritten to the freshly-minted
-        // fallback marker's line: writeBack runs BEFORE the bin's reconcile (and skips invalid markers), so the
-        // survivor's stored values stay at their pre-reload state (guards the write-back-first ordering).
         assertNotNull(store.get(survivor.uuid))
-        assertEquals(3, store.get(survivor.uuid)?.lineNumber) // unchanged
-        assertEquals("BBB", store.get(survivor.uuid)?.lineContent) // unchanged
+        assertEquals(3, store.get(survivor.uuid)?.lineNumber) // unchanged (not rewritten to the fallback line)
+        assertEquals("BBB", store.get(survivor.uuid)?.lineContent) // unchanged — NOT "L2" from the re-minted marker
     }
 
     fun testReloadBinningUnlinksTheLivePoolFileButPreservesAConsumedTombstone() {
@@ -729,6 +728,27 @@ class CommentInlayManagerTest : BasePlatformTestCase() {
 
         assertNotNull(store.get(comment.uuid)) // kept ("l1" still present)
         assertEquals(0, manager.anchorCountForTest()) // its now-editorless anchor was swept — no leak
+    }
+
+    fun testFileContentReloadBinsAnOrphanWithNoLiveAnchorAfterASavedClose() {
+        val (e1, path) = openLocalEditor("NOANCHOR.txt", "l0\nl1\nl2\n")
+        val comment = commentAt(path, line0Based = 1, content = "on l1", lineContent = "l1")
+        store.save(comment)
+        manager.init()
+        val doc = e1.document
+
+        // A SAVED close: forget retires the anchor (the document isn't unsaved), so the comment now has NO live
+        // RangeMarker — only its store record.
+        EditorFactory.getInstance().releaseEditor(e1)
+        openedEditors.remove(e1)
+        assertEquals(0, manager.anchorCountForTest())
+
+        // An external edit deletes "l1" and the document reloads. Detection must come from the STORE (by the
+        // document's path), not the empty anchors map, so the anchorless comment is still binned.
+        WriteCommandAction.runWriteCommandAction(project) { doc.replaceString(0, doc.textLength, "l0\nl2\n") }
+        manager.simulateFileContentReloadedForTest(doc)
+
+        assertNull(store.get(comment.uuid)) // binned via store-keyed detection despite having no anchor
     }
 
     fun testDisposedManagerIgnoresFileDocumentManagerEvents() {
