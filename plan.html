@@ -257,7 +257,8 @@
   "replies": [                          // heview superset (a foreign/legacy file omits it → 1 reply from content)
     { "content": "…", "status": "pending" | "processed", "author": "…", "created_at": "&lt;ISO&gt;",
       "id": "…" }                        // stable per-reply identity (heview-internal; edit/delete/re-pend match on it)
-  ]
+  ],
+  "generation": 3                       // heview superset: optimistic-concurrency CAS token, bumped every pool write
 }</code></pre>
 <p class="muted"><b>Why <code>replies[]</code> (heview divergence).</b> A thread is a list of replies, each with
 its own status and its own edit / delete / re-pend actions — reviewa's per-comment UI, which reviewa keeps
@@ -294,6 +295,34 @@ stable <code>id</code> so edit / delete / re-pend target the right one even afte
 its status or edits its text (all its other fields are mutable); an id-less foreign reply is backfilled. <i>Deferred: restoring a
 fully-consumed thread across a restart from its <code>processed/</code> tombstone (in-session it stays visible
 and re-pendable); a dedicated thread-level "delete whole thread" button; multiple authors per reply.</i></p>
+
+<h3>Multi-client concurrency — the generation fence <span class="pill v1">built</span></h3>
+<p>The pool is <b>shared</b> — two heview clients (IntelliJ, a future heview-vscode) and the agent hooks all
+touch <code>~/.heview/comments</code>. Every thread file carries a <code>generation</code> integer (a heview
+superset field, bumped on every durable write) and each writer commits under an <b>optimistic
+compare-and-swap</b>: it commits only if the on-disk generation still equals the base it edited, else it
+re-reads and re-merges. This closes the two multi-client races: <b>(a) claim-vs-write</b> (a hook moves a
+file into <code>processed/</code> in the sliver after a writeback's exists-check — the writeback would
+recreate a consumed comment) and <b>(b) peer-overwrite</b> (a writeback serializes the whole in-memory
+snapshot, clobbering a peer's concurrent reply/status edit on disk).</p>
+<ul>
+  <li><b>Semantic reply mutations</b> (add / edit / re-pend / delete) are a merging read-modify-write: the
+    durable commit re-reads the on-disk thread, re-applies the op <b>by reply-id</b> (idempotent transforms),
+    and writes <code>base+1</code> under the CAS — so a peer's concurrent reply is merged, never clobbered —
+    retrying on a race (bounded).</li>
+  <li><b>The <code>line_number</code> writeback</b> is generation-fenced with <b>no bump</b>: it writes only
+    if the on-disk generation still matches the base it captured, else it <b>skips</b> — so a re-derivable
+    anchor sync never clobbers a peer's newer edit nor resurrects a hook-consumed thread.</li>
+  <li><b>Optimistic &amp; lock-free</b> (a maintainer decision): a microsecond rename-vs-move residual remains
+    (the same class the code already accepts) rather than adding a cross-process lock.</li>
+  <li><b>Cross-tool contract.</b> The injector hooks never write <code>comments/</code> (they claim by an
+    atomic move), so their only role is to carry the token verbatim into the tombstone (the
+    <code>{…comment}</code> spread already does) — and the claim's move-away is exactly the ABSENT signal the
+    IDE's CAS reads. heview-vscode must adopt the same CAS on its writes.</li>
+</ul>
+<p class="muted"><i>Scope: write-side guard only. Proactively loading a peer's on-disk edit into an open
+client (MODIFY-sync) stays a separate deferred increment; the fence prevents clobbering, it does not yet
+propagate peer edits live.</i></p>
 
 <h3>Session lifetime — a deliberate divergence: heview comments are durable</h3>
 <div class="callout warn">

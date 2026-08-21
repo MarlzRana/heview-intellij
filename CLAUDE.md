@@ -21,7 +21,7 @@ Export JAVA_HOME before every Gradle command:
   shell's cwd can be the parent `~/gh/MarlzRana` (not the repo), so a bare `./gradlew` may 404 — use the
   absolute wrapper with `-p`: `~/gh/MarlzRana/heview-intellij/gradlew -p ~/gh/MarlzRana/heview-intellij ...`.
 - Commands (run from the repo root):
-    ./gradlew test          # 230 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 238 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -46,7 +46,9 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   holds `replies: List<HeviewReply>?` (heview superset; a foreign/legacy file omits it → one reply). Each reply
   has a stable `id` (edit/delete/re-pend match on it, surviving a concurrent status/content change; an id-less
   foreign reply is backfilled distinctly). Top-level `content` (PENDING replies joined by a blank line — the
-  only field hooks read) and `status` are DERIVED.
+  only field hooks read) and `status` are DERIVED. A `generation: Int` (heview superset, default 0; a
+  foreign/legacy file omits it → 0) is the optimistic-concurrency CAS token for the shared pool — see the
+  `CommentStore` generation fence.
 - `model/CommentJson.kt` — Gson encode/decode (`disableHtmlEscaping`; nulls omitted).
 - `model/NewComment.kt` — `newFileComment(...)`: pure, testable v1 comment factory (1-based line, side=FILE, logical==abs).
 - `model/CommentEdits.kt` — pure helpers for the reply model: `recomputed(now)` re-derives the thread's
@@ -65,16 +67,22 @@ schema is byte-compatible with reviewa's so the coding-agent hooks read it. Code
   changed; updates the in-memory record for any known uuid (even a not-persisted Seen/in-flight thread, so a
   later re-pend uses the moved line). The disk write is **always queued** on the serial IO executor (never
   short-circuited on the EDT — so a write requested while the create-save is in flight lands *behind* it rather
-  than being dropped), the encode runs off the EDT, and the write is **replace-only** (`writeAtomically(…,
-  replaceOnly = true)` re-checks the dest exists right before the atomic move) so it never recreates a thread a
-  hook has claimed into `processed/` — the residual rename-vs-rename sliver → deferred generation fence; a real
-  write failure reverts the memory update so the next save retries; **fires no change listener** (the card
-  already tracks the live marker). Per-reply state
-  machine (plan §5): `addReply`/`editReply`/`rependReply`/`deleteReply` mutate the reply list, `recompute`
-  the derived fields, and re-persist via a private `revive()` that **first removes the `processed/`
-  tombstone** (a tombstone for an in-index uuid is the watcher's Seen signal — leaving it would let the next
-  reconcile flip the thread straight back); deleting the last reply drops the thread, deleting the last
-  PENDING reply of a mixed thread keeps the Seen replies but unlinks the pool file. `hydrate`/`decodeIfValid`
+  than being dropped), the encode runs off the EDT, and it is **generation-fenced with no bump** (`casWrite`
+  re-reads the on-disk `generation` right before the atomic move and writes only if it still equals the base
+  captured — else SKIP) so a re-derivable anchor sync never clobbers a peer's newer edit nor recreates a thread
+  a hook claimed into `processed/`; the residual rename-vs-move sliver is the accepted optimistic-CAS window; a
+  genuine write failure reverts the memory update so the next save retries; **fires no change listener** (the
+  card already tracks the live marker). **Generation fence** (plan §5): the shared pool carries a per-file
+  `generation` int, bumped on every durable write, that every writer CAS-checks. Per-reply state machine:
+  `addReply`/`editReply`/`rependReply`/`deleteReply` build an **idempotent, content-only transform** and route
+  through `persistMutation` — optimistic in-memory apply + fire, then a durable **merging read-modify-write**
+  on the IO thread (`commitMutation`): re-read the on-disk thread, re-apply the transform **by reply-id**, and
+  write `base+1` under the CAS (`dispatchMerged` shapes it — empty→delete, all-Seen→off-pool, else fenced
+  write), retrying on a race — so a peer's concurrent reply is **merged, not clobbered**. A successful revive
+  **then removes the `processed/` tombstone** (a tombstone for an in-index uuid is the watcher's Seen signal —
+  leaving it would let the next reconcile flip the thread straight back); deleting the last reply drops the
+  thread, deleting the last PENDING reply of a mixed thread keeps the Seen replies but unlinks the pool file.
+  `hydrate`/`decodeIfValid`
   **normalize replies** (drop malformed, synthesize one from `content` if none) via a `defaultAuthor`
   provider so every indexed thread has ≥1 well-formed reply. `whenHydrated(cb)` runs `cb`
   once after hydrate applies (a one-shot for the watcher's post-hydrate reconcile — not an every-change
@@ -291,6 +299,30 @@ context-blind reviewer will keep raising them:
   thread from its own index — tombstone survives) → generation fence; a *false-negative* when a deleted line's
   trimmed text matches a different surviving line (blank, `}`, boilerplate) → kept on unrelated code (safe-fail);
   the pre-existing editorless-anchor leak on `delete`/`evict` (not introduced here — the reload path now sweeps).
+- **Built — the generation fence (optimistic CAS on the shared pool).** Decisions (AskUserQuestion): token =
+  an explicit **`generation:int`** heview-superset field (vs mtime / content-hash — simplest to keep
+  byte-identical across Kotlin/Node/Python, and the hook's `{…comment}` tombstone spread carries it free);
+  **optimistic, lock-free** CAS (vs a cross-process lock — accepts a microsecond rename-vs-move residual, the
+  same class already accepted, over a stale-lock lifecycle in three tools); **write-side guard only** (MODIFY-
+  sync — propagating a peer's on-disk edit into an open client — stays a separate deferred increment). Closes
+  the two deferred multi-client races: **(a) claim-vs-write** (a hook moves a file to `processed/` in the
+  sliver after a writeback's exists-check → it would recreate a consumed comment) and **(b) peer-overwrite** (a
+  whole-snapshot write clobbers a peer's concurrent reply/status edit on disk). Mechanics: every durable write
+  bumps `generation` and commits under a CAS on the base it read. **Semantic reply mutations** are a merging
+  read-modify-write (`persistMutation`→`commitMutation`): optimistic in-memory apply, then re-read the on-disk
+  thread, re-apply the op via an **idempotent, content-only transform matched by reply-`id`**, write `base+1`
+  (`dispatchMerged`: empty→delete, all-Seen→off-pool, else `casWrite`), retrying on a race (bounded
+  `MAX_CAS_ATTEMPTS`) — so a peer's reply is merged, never clobbered; a peer that deleted our target reconciles
+  to disk. **`updateLocation`** (the anchor writeback) is fenced with **no bump** and **skips** on
+  mismatch/absent (a re-derivable sync must never clobber a peer edit nor resurrect a consumed thread — this
+  replaced the `writeAtomically(replaceOnly)` exists-check). `save` (create/upsert) is NOT fenced (a fresh uuid
+  has no peer). **Hooks unchanged** (zero code): they never write `comments/` (claim = atomic move), so their
+  only role is carrying the token verbatim into the tombstone (spread; locked by a `HookScriptTest`) — and the
+  claim's move-away IS the ABSENT signal the IDE CAS reads. **Cross-tool contract:** heview-vscode must adopt
+  the same `generation` CAS on its writes (mirrored in the VS Code hand-off). **Deferred:** MODIFY-sync (peer
+  edits live into open clients); a truly-atomic close of the residual rename-vs-move window; fencing the
+  destructive `delete`/`binFromPool`/`evict` paths (a delete is authoritative — a delete racing a peer edit is
+  not merged).
 </settled-decisions>
 
 <review>
@@ -309,14 +341,14 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **230 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **238 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
-`41ad48f`; **17 local unpushed commits on top (`f22ca42`..HEAD, HEAD `e0a9041`)** — the external-file-reload +
-line_number-writeback increments + their 6-cycle `/aeview-loop` + `.aeviewignore` + the docs pointer + the
-orphan-comment-binning increment (5 commits `4c14c13`..`e0a9041`, through a 5-cycle `/aeview-loop`), all
-gate-green (**230 tests**). The maintainer runs pushes — **do NOT push; ask/wait**.
+`41ad48f`; **~20 local unpushed commits on top** — the external-file-reload + line_number-writeback increments
++ their 6-cycle `/aeview-loop` + `.aeviewignore` + docs pointers + the orphan-comment-binning increment (5
+commits, 5-cycle `/aeview-loop`) + the **generation-fence** increment (impl `d166705` + docs), all gate-green
+(**238 tests**). The maintainer runs pushes — **do NOT push; ask/wait**.
 
 **Shipped + dogfooded + pushed — Phase 1 multi-reply comment threads + per-reply state machine (plan §5),
 through a full 5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field:
@@ -359,10 +391,10 @@ anchor lifecycle was the recurring hot-spot — the panel caught a regression in
 closes), which drove the **final, correct retirement model** now documented above (store-absence + document
 has-no-editor, unsaved-deferred; never card-presence). c6 also gave the writeback a replace-only write path.
 Cycle 6's fixes are gate-green (230 tests) but weren't independently re-reviewed (stopped there) — dogfooding
-the anchor lifecycle is the better next signal than more cycles. Deferred (recorded): the cross-process
-**generation fence** (a residual writeback-vs-consume TOCTOU + a peer-overwrite window on the shared pool) and
-the failed-save / failed-pool-write retry edges — all belong to **multi-client sync / durability hardening**.
-Gate: **230 tests**, `buildPlugin` clean.
+the anchor lifecycle is the better next signal than more cycles. Deferred then, now **BUILT**: the
+cross-process **generation fence** (that residual writeback-vs-consume TOCTOU + the peer-overwrite window on
+the shared pool — see its shipped entry below). Still deferred: the failed-save / failed-pool-write retry
+edges → durability hardening. Gate: **230 tests**, `buildPlugin` clean.
 
 **Shipped — orphan-comment binning (reload-only, silent)** (LOCAL/unpushed; dogfood- + loop-corrected; a
 sanctioned §5 divergence — see `<settled-decisions>`). After an external reload, a comment whose anchor has
@@ -386,15 +418,18 @@ harder write-back-ordering guard). Cycle 5 surfaced only low-severity quality it
 and its fixes are gate-green but weren't independently re-reviewed (stopped at the cap). Gate: **230 tests**,
 `buildPlugin` clean.
 
-**Next — the generation fence** (larger; needs an AskUserQuestion + a SHARED cross-tool contract). Optimistic
-   compare-and-swap on a per-file **generation** token (a `generation:int` / mtime / content-hash — the design
-   fork) to close the two deferred multi-client races: the **claim-vs-write TOCTOU** (hook moves the file to
-   `processed/` in the rename sliver after the replace-only exists-check) and **peer-overwrite** (a writeback
-   serializes the whole snapshot, clobbering a concurrent foreign edit). Every write + every hook claim reads the
-   on-disk generation and commits only on a match; else abort/re-merge (or skip a consumed file). Mirror in
-   `changes_to_be_made_to_vscode_variant.local.md` + the Node/Python injector hooks.
+**Shipped — the generation fence (optimistic CAS on the shared pool)** (LOCAL/unpushed; impl `d166705` + docs).
+Decisions via AskUserQuestion — token = explicit **`generation:int`**, **optimistic lock-free** CAS,
+**write-side guard only**; full mechanics + the deferrals are in `<settled-decisions>` ("Built — the generation
+fence"). In short: every durable write bumps `generation` and CAS-checks the base it read; semantic reply
+mutations become a merging read-modify-write (re-read disk, re-apply by reply-id, retry) so a peer's reply is
+merged not clobbered; `updateLocation` is fenced with no bump and **skips** on mismatch/absent; the hooks are
+unchanged (they carry the token through the tombstone spread — locked by a test — and their claim's move-away
+is the ABSENT signal the CAS reads); heview-vscode must adopt the same CAS (mirrored in the hand-off). Gate:
+**238 tests**, `buildPlugin` clean. NOT yet `/aeview-loop`-reviewed or dogfooded — those are the next signals.
 
-Later: MODIFY-sync (externally-edited *content* into open clients), the visual pass, remaining Phase 3 (tool
-window / status-bar count / settings). Full deferred backlog (`CommentJson.decode` validation, GitHub identity,
+**Next — MODIFY-sync** (externally-edited *content* into open clients — the fence prevents clobbering but does
+not yet propagate a peer's on-disk edit live), then the visual pass, remaining Phase 3 (tool window /
+status-bar count / settings). Full deferred backlog (`CommentJson.decode` validation, GitHub identity,
 restore-from-tombstone, …) is in `implementation_log.local.md`.
 </status>
