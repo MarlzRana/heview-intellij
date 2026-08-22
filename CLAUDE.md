@@ -21,7 +21,7 @@ Export JAVA_HOME before every Gradle command:
   shell's cwd can be the parent `~/gh/MarlzRana` (not the repo), so a bare `./gradlew` may 404 — use the
   absolute wrapper with `-p`: `~/gh/MarlzRana/heview-intellij/gradlew -p ~/gh/MarlzRana/heview-intellij ...`.
 - Commands (run from the repo root):
-    ./gradlew test          # 252 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
+    ./gradlew test          # 253 tests — the gate (JUnit5 unit + a JUnit3/4 BasePlatformTestCase + node/python hook-script tests)
     ./gradlew buildPlugin    # → build/distributions/heview-*.zip
     ./gradlew runIde         # sandbox IDE (GUI; the MAINTAINER runs this to dogfood — don't launch it headless)
     ./gradlew verifyPlugin   # JetBrains Plugin Verifier
@@ -324,8 +324,8 @@ context-blind reviewer will keep raising them:
   destructive `delete`/`binFromPool`/`evict` paths (a delete is authoritative — a delete racing a peer edit is
   not merged).
 - **Fence `/aeview-loop` outcomes (settled; don't re-litigate — the panel re-raises them; scope
-  `range:9f946a4..HEAD`, 5 cycles to the cap, findings 15→1→5→9→11 with 7–17/18 reviews infra-failing per
-  cycle).** Hardened the fence's async/multi-client edges: (a) **deterministic reply-id backfill**
+  `range:9f946a4..HEAD`, 6 cycles, findings 15→1→5→9→11→7 with 7–17/18 reviews infra-failing per cycle).**
+  Hardened the fence's async/multi-client edges: (a) **deterministic reply-id backfill**
   (`<uuid>#<index>`, not a random UUID) so the CAS merge re-reads and matches an id-less/foreign `replies[]`
   file's ids identically on every read (a random backfill silently dropped the durable edit); (b) **never
   resurrect a vanished-but-on-pool file** — the resurrect oracle is `wasOnPool` **snapshotted on the EDT in
@@ -333,14 +333,19 @@ context-blind reviewer will keep raising them:
   independently of the IO task), so a reply commit racing a hook consume can't re-inject a Seen reply or wipe
   the tombstone; (c) **identity-guarded adoption** (`adoptIfUnchanged`/`stillCurrent`) — a durable commit
   adopts its result only if OUR optimistic object (or a same-generation no-bump `updateLocation` variant of it)
-  is still the index entry, carrying the freshest anchor forward, so a newer reply op / location tweak / delete
-  wins (generation alone can't order two independent same-gen bumps); (d) **synchronous** bounded retry inside
-  the one IO task (never re-queued — a re-queued retry could run behind a later mutation and overwrite it);
-  (e) **`fencedDestructive` strict-CAS** so a delete/off-pool unlink never nukes a peer's resurrected file nor
-  a tombstone (no early-exit that skips the disk read); (f) `updateLocation` **reverts on RACED** (not just
-  FAILED) so its no-op early-return can't suppress the next save's retry, leaving the on-disk line stale;
-  (g) `readDisk` maps a mid-read `NoSuchFileException` to **Absent** (a benign consume/delete race), not
-  Unreadable. Test seam `interposeBeforeMoveForTest` exercises the RACED retry / bounded give-up. **Open =
+  is still the index entry, so a newer reply op / location tweak / delete wins (generation alone can't order
+  two independent same-gen bumps). It adopts the value with the **on-disk anchor** (does NOT carry the
+  in-memory line): memory tracks disk so a concurrent `updateLocation`'s line heals disk via its own writeback
+  (or the next save) — carrying it left memory ahead of disk where the no-op early-return stranded the injector
+  on a stale line (cycle-6 fix); (d) **synchronous** bounded retry inside the one IO task (never re-queued — a
+  re-queued retry could run behind a later mutation and overwrite it); (e) **`fencedDestructive` strict-CAS**
+  (via a shared `matchesGeneration`) so a delete/off-pool unlink never nukes a peer's resurrected file nor a
+  tombstone (no early-exit that skips the disk read); (f) `updateLocation` reverts the optimistic move on a
+  non-WROTE **only if the pool file is still present** (peer bump / write failure → the next save retries) —
+  if the file was **consumed** (Absent) it KEEPS the moved line, so `markProcessed` freezes the right anchor
+  for a later re-pend (restores the pre-fence `replaceOnly` semantics; cycle-6 fix); (g) `readDisk` maps a
+  mid-read `NoSuchFileException` to **Absent** (a benign consume/delete race), not Unreadable. Test seam
+  `interposeBeforeMoveForTest` exercises the RACED retry / bounded give-up. **Open =
   deferred / accepted (do NOT fix now):** a **create-in-flight (`!wasOnPool`) racing a consume** can still
   resurrect (the snapshot can't tell a never-persisted create from an off-pool re-pend) — narrow, documented,
   belongs with MODIFY-sync; a **peer edit doesn't surface live** into an open client (that IS MODIFY-sync);
@@ -365,14 +370,14 @@ Phase 0 (scaffold) + Phase 1 foundation + the **`CommentInlayManager`** incremen
 hooks** + **Phase 3 — consumption watcher (processed-dir slice)** are DONE — each dogfooded and taken
 through `/aeview-loop`. The end-to-end loop is **proven live** (a comment left in the IDE is injected into
 Claude Code / Codex on `UserPromptSubmit` in the exact plan-§6 block, its `<uuid>.json` is claimed into
-`processed/`, and the card flips Pending→Seen). Gate green: **252 tests** (JUnit5 unit + a JUnit3/4
+`processed/`, and the card flips Pending→Seen). Gate green: **253 tests** (JUnit5 unit + a JUnit3/4
 `BasePlatformTestCase` + node/python behavioral hook-script tests), `buildPlugin` clean.
 
 **Published**: https://github.com/MarlzRana/heview-intellij (public); `origin` is SSH. Last **pushed** =
 `41ad48f`; **~20 local unpushed commits on top** — the external-file-reload + line_number-writeback increments
 + their 6-cycle `/aeview-loop` + `.aeviewignore` + docs pointers + the orphan-comment-binning increment (5
 commits, 5-cycle `/aeview-loop`) + the **generation-fence** increment (impl `d166705` + docs), all gate-green
-(**252 tests**). The maintainer runs pushes — **do NOT push; ask/wait**.
+(**253 tests**). The maintainer runs pushes — **do NOT push; ask/wait**.
 
 **Shipped + dogfooded + pushed — Phase 1 multi-reply comment threads + per-reply state machine (plan §5),
 through a full 5-cycle `/aeview-loop`.** A thread holds an ordered `replies[]` (heview superset field:
@@ -450,11 +455,13 @@ mutations become a merging read-modify-write (re-read disk, re-apply by reply-id
 merged not clobbered; `updateLocation` is fenced with no bump and **skips** on mismatch/absent; the hooks are
 unchanged (they carry the token through the tombstone spread — locked by a test — and their claim's move-away
 is the ABSENT signal the CAS reads); heview-vscode must adopt the same CAS (mirrored in the hand-off).
-Taken through a **5-cycle `/aeview-loop`** (scope `range:9f946a4..HEAD`; findings 15→1→5→9→11, coverage badly
+Taken through a **6-cycle `/aeview-loop`** (scope `range:9f946a4..HEAD`; findings 15→1→5→9→11→7, coverage badly
 degraded by grok/codex infra failures — 7–17 of 18 reviews failed per cycle — so the counts are noisy). The
-loop hardened the fence's async/multi-client edges (see `<settled-decisions>` "Fence `/aeview-loop` outcomes");
-its cycle-5 fixes are gate-green but weren't independently re-reviewed (stopped at the cap). Gate: **252 tests**,
-`buildPlugin` clean. Still to do: **maintainer dogfood in `runIde`**.
+loop hardened the fence's async/multi-client edges (see `<settled-decisions>` "Fence `/aeview-loop` outcomes"),
+cycle 6 correcting two cycle-5 anchor details (dropped the memory-ahead-of-disk anchor carry; keep the moved
+line when the file was consumed). Its cycle-6 fixes are gate-green but weren't independently re-reviewed
+(stopped there — dogfooding is the better next signal). Gate: **253 tests**, `buildPlugin` clean. Still to do:
+**maintainer dogfood in `runIde`**.
 
 **Next — MODIFY-sync** (externally-edited *content* into open clients — the fence prevents clobbering but does
 not yet propagate a peer's on-disk edit live), then the visual pass, remaining Phase 3 (tool window /
