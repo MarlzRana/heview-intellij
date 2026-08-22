@@ -307,7 +307,7 @@ class CommentStore(
                 CasResult.WROTE -> {
                     unlinkPoolFile(uuid)
                     deleteTombstone(uuid)
-                    runEdt { if (index[uuid] === staged && index.remove(uuid) != null) fireChanged() }
+                    runEdt { if (stillCurrent(uuid, staged) && index.remove(uuid) != null) fireChanged() }
                 }
                 CasResult.RACED -> retryOrGiveUp(uuid, transform, fallback, staged, attemptsLeft)
                 CasResult.FAILED -> {}
@@ -382,15 +382,24 @@ class CommentStore(
     }
 
     /**
-     * Adopt [value] into the index (on the EDT) only if OUR optimistic record [staged] is STILL the current
-     * entry — an identity (`===`) guard, so a durable commit never regresses a fresher in-flight state: a
-     * newer reply mutation, a no-bump [updateLocation], or a delete/bin/evict that replaced or removed the
-     * entry all win (generation alone can't order our optimistic bump against a peer's independent bump, nor
-     * see a same-generation location tweak as newer). Never INSERTs a missing uuid. Fires only on a real
-     * change (the common no-peer path already shows the optimistic value → no extra fire).
+     * Is OUR optimistic record still the current index entry — i.e. no newer reply mutation, no-bump
+     * [updateLocation], or delete/bin/evict has superseded it? An identity (`===`) guard, since generation
+     * alone can't order our optimistic bump against a peer's independent bump nor see a same-generation
+     * location tweak as newer. [staged] == null means this op optimistically REMOVED the thread (a delete of
+     * its last reply), so "still current" means it is still absent.
+     */
+    private fun stillCurrent(uuid: String, staged: HeviewComment?): Boolean =
+        if (staged == null) index[uuid] == null else index[uuid] === staged
+
+    /**
+     * Adopt [value] into the index (on the EDT) only if [stillCurrent] — so a durable commit never regresses
+     * a fresher in-flight state. When our op emptied the thread ([staged] == null) but the on-disk merge came
+     * back non-empty (a peer added a reply), this INSERTs the surviving thread so the UI shows the peer's
+     * reply instead of the thread silently vanishing until a restart. Fires only on a real change (the common
+     * no-peer path already shows the optimistic value → no extra fire).
      */
     private fun adoptIfUnchanged(uuid: String, staged: HeviewComment?, value: HeviewComment) {
-        if (staged != null && index[uuid] === staged && index[uuid] != value) {
+        if (stillCurrent(uuid, staged) && index[uuid] != value) {
             index[uuid] = value
             fireChanged()
         }
@@ -402,7 +411,7 @@ class CommentStore(
             when (disk) {
                 // Fold disk back in only if our optimistic record is still current (else a newer edit /
                 // delete wins). The file exists (Valid), so it is persisted.
-                is DiskRead.Valid -> if (staged != null && index[uuid] === staged) {
+                is DiskRead.Valid -> if (stillCurrent(uuid, staged)) {
                     persisted.add(uuid)
                     if (index[uuid] != disk.comment) {
                         index[uuid] = disk.comment
@@ -410,7 +419,7 @@ class CommentStore(
                     }
                 }
                 // Defensive: commitMutation only reaches here with a Valid disk (Absent is handled earlier).
-                DiskRead.Absent -> if (staged != null && index[uuid] === staged && index.remove(uuid) != null) {
+                DiskRead.Absent -> if (stillCurrent(uuid, staged) && index.remove(uuid) != null) {
                     persisted.remove(uuid)
                     fireChanged()
                 }

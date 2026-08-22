@@ -1374,6 +1374,9 @@ class CommentStoreTest {
         val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
         assertEquals(listOf("peer"), onDisk.replies?.map { it.content }) // peer's reply survives — not nuked
         assertEquals(2, onDisk.generation)
+        // …and the thread reappears in the UI (our optimistic removal is superseded by the surviving peer
+        // reply) rather than silently vanishing until a restart.
+        assertEquals(listOf("peer"), store.get("u1")?.replies?.map { it.content })
     }
 
     @Test
