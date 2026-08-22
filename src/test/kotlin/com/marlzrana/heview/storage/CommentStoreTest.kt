@@ -23,6 +23,11 @@ class CommentStoreTest {
     private fun store(dir: Path, author: String = "tester") =
         CommentStore(dir, runIo = { it.run() }, runEdt = { it.run() }, defaultAuthor = { author })
 
+    // A store whose IO runs are queued into [tasks] (EDT inline) so a test can interpose peer writes between
+    // whole IO tasks and drive them deterministically.
+    private fun queuedStore(dir: Path, tasks: ArrayDeque<Runnable>, author: String = "tester") =
+        CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { author })
+
     private fun seed(dir: Path, comment: com.marlzrana.heview.model.HeviewComment) {
         Files.createDirectories(dir)
         Files.writeString(dir.resolve("${comment.uuid}.json"), CommentJson.encode(comment))
@@ -1058,7 +1063,7 @@ class CommentStoreTest {
     @Test
     fun `updateLocation does not recreate a pool file consumed after its write was queued`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1"))
         tasks.removeFirst().run() // complete the create-save → file exists, persisted
 
@@ -1075,7 +1080,7 @@ class CommentStoreTest {
     @Test
     fun `updateLocation does not recreate a pool file that left comments before markProcessed ran`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1"))
         tasks.removeFirst().run() // create → file exists, persisted
 
@@ -1093,7 +1098,7 @@ class CommentStoreTest {
     @Test
     fun `updateLocation failure rollback does not clobber a newer queued update`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1"))
         tasks.removeFirst().run() // create → persisted, file exists
 
@@ -1113,7 +1118,7 @@ class CommentStoreTest {
     @Test
     fun `updateLocation queued during an in-flight create still writes the moved line`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1")) // queues the create write (line 42); NOT persisted yet
 
         store.updateLocation("u1", 7, "moved") // called while the create is in flight → must still queue a write
@@ -1232,7 +1237,7 @@ class CommentStoreTest {
     @Test
     fun `addReply merges onto a peer's concurrent reply instead of clobbering it`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         val a = sampleReply(content = "a")
         store.save(sampleComment(uuid = "u1", replies = listOf(a)))
         tasks.removeFirst().run() // create → disk gen 0, [a]
@@ -1257,7 +1262,7 @@ class CommentStoreTest {
     @Test
     fun `editing a reply a peer already deleted reconciles to the peer's thread`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         val a = sampleReply(content = "a")
         val b = sampleReply(content = "b")
         store.save(sampleComment(uuid = "u1", replies = listOf(a, b)))
@@ -1339,7 +1344,7 @@ class CommentStoreTest {
     @Test
     fun `a delete racing an in-flight reply mutation is not resurrected`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
         tasks.removeFirst().run() // create → disk gen 0
 
@@ -1355,7 +1360,7 @@ class CommentStoreTest {
     @Test
     fun `deleteReply keeps a peer's concurrent reply instead of nuking the pool file`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         val only = sampleReply(content = "only")
         store.save(sampleComment(uuid = "u1", replies = listOf(only)))
         tasks.removeFirst().run() // create → disk gen 0, [only]
@@ -1382,7 +1387,7 @@ class CommentStoreTest {
     @Test
     fun `a reply mutation does not resurrect a hook-claimed pool file`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
         tasks.removeFirst().run() // create → disk gen 0, persisted
 
@@ -1403,7 +1408,7 @@ class CommentStoreTest {
     @Test
     fun `a location writeback does not regress a concurrent reply mutation`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a")))) // line 42
         tasks.removeFirst().run() // create → disk gen 0
 
@@ -1421,7 +1426,7 @@ class CommentStoreTest {
     @Test
     fun `a reply mutation over an unreadable pool file is skipped without clobbering it`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
         tasks.removeFirst().run() // create → disk gen 0
 
@@ -1452,7 +1457,7 @@ class CommentStoreTest {
     @Test
     fun `a reply mutation re-merges when a peer writes inside the CAS window`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         val a = sampleReply(content = "a")
         store.save(sampleComment(uuid = "u1", replies = listOf(a)))
         tasks.removeFirst().run() // create → disk gen 0, [a]
@@ -1479,9 +1484,9 @@ class CommentStoreTest {
     }
 
     @Test
-    fun `a reply mutation gives up after repeated CAS races without looping forever`(@TempDir dir: Path) {
+    fun `a reply mutation gives up after exactly MAX_CAS_ATTEMPTS repeated CAS races`(@TempDir dir: Path) {
         val tasks = ArrayDeque<Runnable>()
-        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val store = queuedStore(dir, tasks)
         val a = sampleReply(content = "a")
         store.save(sampleComment(uuid = "u1", replies = listOf(a)))
         tasks.removeFirst().run() // create → disk gen 0
@@ -1489,25 +1494,77 @@ class CommentStoreTest {
         store.addReply("u1", "mine", "me", laterTs)
 
         // A relentless peer bumps the generation in EVERY CAS window, so every attempt RACES.
-        var peerGen = 0
+        var attempts = 0
         store.interposeBeforeMoveForTest = {
-            peerGen += 1
+            attempts += 1
             Files.writeString(
                 dir.resolve("u1.json"),
-                CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a)).copy(generation = peerGen + 1)),
+                CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a)).copy(generation = attempts + 1)),
             )
         }
 
-        var runs = 0
-        while (tasks.isNotEmpty()) {
-            tasks.removeFirst().run()
-            if (++runs > 12) break // safety net: the retry MUST be bounded (no unbounded re-queue)
-        }
+        tasks.removeFirst().run() // ONE commit task; the bounded synchronous retry loop runs inside it
 
-        assertTrue(tasks.isEmpty()) // terminated — the give-up path fired, no runaway recursion
-        assertTrue(runs <= 6) // a small bounded number of attempts (MAX_CAS_ATTEMPTS)
+        assertTrue(tasks.isEmpty()) // no re-queue — the retry is synchronous, so it can't be reordered
+        assertEquals(CommentStore.MAX_CAS_ATTEMPTS, attempts) // exactly the bound, then give up
         assertEquals("mine", store.get("u1")?.replies?.last()?.content) // optimistic state left in memory
         assertFalse(CommentJson.decode(Files.readString(dir.resolve("u1.json"))).replies!!.any { it.content == "mine" })
+    }
+
+    @Test
+    fun `deleting the last pending reply keeps a peer's fresh reply on the injectable pool`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = queuedStore(dir, tasks)
+        val todo = sampleReply(content = "todo", status = CommentStatus.PENDING)
+        val seen = sampleReply(content = "seen", status = CommentStatus.PROCESSED)
+        store.save(sampleComment(uuid = "u1", replies = listOf(todo, seen)))
+        tasks.removeFirst().run() // create → disk gen 0, [todo PENDING, seen PROCESSED]
+
+        store.deleteReply("u1", todo) // optimistic → [seen] all-Seen (the off-pool arm); queues the commit
+
+        // A peer adds a fresh PENDING reply before the off-pool commit runs, so the merged thread is actionable
+        // again → it must route to the fenced-WRITE arm and stay ON the injectable pool, not be off-pooled.
+        val peer = sampleReply(content = "peer todo", author = "peer", status = CommentStatus.PENDING)
+        Files.writeString(
+            dir.resolve("u1.json"),
+            CommentJson.encode(
+                sampleComment(uuid = "u1", replies = listOf(todo, seen, peer), status = CommentStatus.PENDING).copy(generation = 1),
+            ),
+        )
+
+        tasks.removeFirst().run() // commit re-reads [todo, seen, peer]; removing todo leaves [seen, peer PENDING]
+
+        assertTrue(Files.exists(dir.resolve("u1.json"))) // KEPT on the pool — a peer's actionable reply remains
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(listOf("seen", "peer todo"), onDisk.replies?.map { it.content })
+        assertEquals(CommentStatus.PENDING, onDisk.status)
+        assertEquals(2, onDisk.generation)
+        assertTrue(store.isPersisted("u1"))
+        assertEquals(listOf("seen", "peer todo"), store.get("u1")?.replies?.map { it.content }) // reappears in the UI
+    }
+
+    @Test
+    fun `hydrate disambiguates a backfilled id that clashes with a kept real id`(@TempDir dir: Path) {
+        Files.createDirectories(dir)
+        // reply0 carries a real id that equals reply1's would-be position key "d#1"; reply1 has no id, so the
+        // backfill must disambiguate (the `while (!seenIds.add(...))` clash loop) rather than collapse the rows.
+        Files.writeString(
+            dir.resolve("d.json"),
+            """
+            {"uuid":"d","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+             "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":42,
+             "line_content":"x","side":"file","content":"a\n\nb",
+             "replies":[{"content":"a","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z","id":"d#1"},
+                        {"content":"b","status":"pending","author":"x","created_at":"2026-08-15T00:00:00.000Z"}]}
+            """.trimIndent(),
+        )
+        val store = store(dir)
+        store.hydrate()
+
+        val replies = store.get("d")!!.replies!!
+        assertEquals(2, replies.size)
+        assertEquals("d#1", replies[0].id) // reply0 kept its real id
+        assertTrue(replies[0].id != replies[1].id) // …and the clash was disambiguated, not collapsed
     }
 
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */

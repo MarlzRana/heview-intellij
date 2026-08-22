@@ -99,6 +99,22 @@ class CommentJsonTest {
     }
 
     @Test
+    fun `encodes the generation fence token and decodes an absent one as 0`() {
+        // The generation CAS token is a heview superset field: always emitted, round-trips, and a
+        // foreign/legacy payload without the key decodes to 0 (the pre-fence baseline).
+        val json = CommentJson.encode(sampleComment().copy(generation = 3))
+        assertTrue(json.contains("\"generation\""), json)
+        assertEquals(3, CommentJson.decode(json).generation)
+
+        val legacy = """
+            {"uuid":"t","status":"pending","created_at":"2026-08-15T00:00:00.000Z","workspace":"/repo",
+             "abs_path":"/repo/src/Foo.kt","logical_abs_path":"/repo/src/Foo.kt","line_number":7,
+             "line_content":"x","side":"file","content":"hi"}
+        """.trimIndent()
+        assertEquals(0, CommentJson.decode(legacy).generation)
+    }
+
+    @Test
     fun `decodes a reviewa-style payload written by a shared hook`() {
         val payload = """
             {

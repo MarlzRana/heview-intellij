@@ -240,113 +240,101 @@ class CommentStore(
         val staged = if (optimistic.replies.isNullOrEmpty()) null else optimistic.copy(generation = current.generation + 1)
         if (staged == null) index.remove(uuid) else index[uuid] = staged
         fireChanged()
-        commitMutation(uuid, transform, current, staged, MAX_CAS_ATTEMPTS)
+        commitMutation(uuid, transform, current, staged)
     }
 
     /**
-     * The durable half of [persistMutation], on the IO thread. Reads the on-disk thread, re-applies
-     * [transform] to it (merging a peer's edit) and — by the merged result's shape ([dispatchMerged]) —
-     * writes it back under a generation CAS, or drops / off-pools the thread. [fallback] is the in-memory
-     * base used when the pool file is absent (a revive that legitimately resurrects a consumed/never-persisted
-     * thread). Retries on a CAS race (a peer wrote between our read and our move) up to [attemptsLeft].
+     * The durable half of [persistMutation], on the IO thread. In a bounded **synchronous** loop it reads the
+     * on-disk thread, re-applies [transform] to it (merging a peer's edit) and — by the merged result's shape
+     * ([dispatchMerged]) — writes it back under a generation CAS, or drops / off-pools the thread. On a CAS
+     * race (a peer wrote between our read and our move) it re-reads + re-applies IN PLACE, up to
+     * [MAX_CAS_ATTEMPTS]. The retry stays inside this single serial-IO task ON PURPOSE: re-queueing it would
+     * let it run behind a later mutation on the same uuid, so a stale re-merge could overwrite the newer
+     * write. [fallback] is the in-memory base used when the pool file is absent (a legitimate resurrect of a
+     * consumed/never-persisted off-pool thread).
      */
     private fun commitMutation(
         uuid: String,
         transform: (HeviewComment) -> HeviewComment?,
         fallback: HeviewComment,
         staged: HeviewComment?,
-        attemptsLeft: Int,
     ) {
         runIo {
-            val disk = readDisk(uuid)
-            if (disk is DiskRead.Unreadable) {
-                // A foreign writer left an unparseable file — never clobber it. Leave the optimistic memory
-                // state; the next mutation retries against whatever is then on disk.
-                LOG.warn("heview: skipping a fenced write over an unreadable pool file $uuid")
-                return@runIo
+            for (attempt in 1..MAX_CAS_ATTEMPTS) {
+                val disk = readDisk(uuid)
+                if (disk is DiskRead.Unreadable) {
+                    // A foreign writer left an unparseable file — never clobber it. Leave the optimistic memory
+                    // state; the next mutation retries against whatever is then on disk.
+                    LOG.warn("heview: skipping a fenced write over an unreadable pool file $uuid")
+                    return@runIo
+                }
+                if (disk is DiskRead.Absent && isPersisted(uuid)) {
+                    // The pool file was on disk (we still believe it persisted) but vanished under us — a hook
+                    // claimed it into processed/, or a peer/local delete unlinked it. NEVER resurrect it: that
+                    // would recreate an injectable duplicate (and deleteTombstone would wipe the watcher's
+                    // "Seen" signal) or undo the delete — the same hole updateLocation skips. Leave the
+                    // optimistic in-memory state; the watcher reconciles it (markProcessed → Seen for a consume,
+                    // evict for a delete). Only an already-off-pool thread (!isPersisted — e.g. a re-pend of a
+                    // Seen thread) legitimately resurrects on Absent below.
+                    return@runIo
+                }
+                val onDisk = (disk as? DiskRead.Valid)?.comment
+                val base = onDisk ?: fallback
+                val merged = transform(base)
+                if (merged == null || (onDisk != null && merged === base)) {
+                    // The target reply is gone on disk, or the op is already reflected there (idempotent
+                    // re-apply) — adopt the on-disk truth (also folds in any peer edit to other replies).
+                    reconcileToDisk(uuid, staged, disk)
+                    return@runIo
+                }
+                when (dispatchMerged(uuid, staged, merged, base.generation, onDisk?.generation)) {
+                    CasResult.WROTE, CasResult.FAILED -> return@runIo // done, or leave optimistic for the next save
+                    CasResult.RACED -> Unit // a peer wrote in our CAS window → loop: re-read + re-merge
+                }
             }
-            if (disk is DiskRead.Absent && isPersisted(uuid)) {
-                // The pool file was on disk (we still believe it persisted) but vanished under us — a hook
-                // claimed it into processed/, or a peer/local delete unlinked it. NEVER resurrect it: that
-                // would recreate an injectable duplicate (and deleteTombstone would wipe the watcher's "Seen"
-                // signal) or undo the delete — the same hole updateLocation already skips. Leave the optimistic
-                // in-memory state; the watcher reconciles it (markProcessed → Seen for a consume, evict for a
-                // delete). Only an already-off-pool thread (!isPersisted — e.g. a re-pend of a Seen thread)
-                // legitimately resurrects on Absent below.
-                return@runIo
-            }
-            val onDisk = (disk as? DiskRead.Valid)?.comment
-            val base = onDisk ?: fallback
-            val merged = transform(base)
-            if (merged == null || (onDisk != null && merged === base)) {
-                // The target reply is gone on disk, or the op is already reflected there (idempotent
-                // re-apply) — adopt the on-disk truth (also folds in any peer edit to other replies).
-                reconcileToDisk(uuid, staged, disk)
-                return@runIo
-            }
-            dispatchMerged(uuid, transform, fallback, staged, merged, base.generation, onDisk?.generation, attemptsLeft)
+            LOG.warn("heview: gave up a fenced write for $uuid after $MAX_CAS_ATTEMPTS attempts")
         }
     }
 
-    /** On the IO thread: give the merged thread its durable shape — delete, off-pool, or a fenced write. */
+    /**
+     * On the IO thread: give the merged thread its durable shape — delete, off-pool, or a fenced write —
+     * returning the [CasResult] so [commitMutation] can re-merge a RACED write in its synchronous loop.
+     */
     private fun dispatchMerged(
         uuid: String,
-        transform: (HeviewComment) -> HeviewComment?,
-        fallback: HeviewComment,
         staged: HeviewComment?,
         merged: HeviewComment,
         baseGeneration: Int,
         expectedGeneration: Int?,
-        attemptsLeft: Int,
-    ) {
-        when {
-            merged.replies.isNullOrEmpty() -> when (fencedDestructive(uuid, expectedGeneration)) {
+    ): CasResult = when {
+        merged.replies.isNullOrEmpty() -> fencedDestructive(uuid, expectedGeneration).also {
+            if (it == CasResult.WROTE) {
                 // No replies remain → drop the thread + its pool file + any tombstone (an explicit delete
-                // leaves no restorable copy). The unlink is generation-fenced (below), so a peer's reply that
-                // landed since our read forces a re-merge that keeps the file rather than nuking it.
-                CasResult.WROTE -> {
-                    unlinkPoolFile(uuid)
-                    deleteTombstone(uuid)
-                    runEdt { if (stillCurrent(uuid, staged) && index.remove(uuid) != null) fireChanged() }
-                }
-                CasResult.RACED -> retryOrGiveUp(uuid, transform, fallback, staged, attemptsLeft)
-                CasResult.FAILED -> {}
+                // leaves no restorable copy). The unlink is generation-fenced, so a peer's reply that landed
+                // since our read RACES and re-merges (keeping the file) rather than being nuked.
+                unlinkPoolFile(uuid)
+                deleteTombstone(uuid)
+                runEdt { if (stillCurrent(uuid, staged) && index.remove(uuid) != null) fireChanged() }
             }
-            merged.status == CommentStatus.PROCESSED -> when (fencedDestructive(uuid, expectedGeneration)) {
+        }
+        merged.status == CommentStatus.PROCESSED -> fencedDestructive(uuid, expectedGeneration).also {
+            if (it == CasResult.WROTE) {
                 // Only Seen replies remain → keep them visible but off the injectable pool (reviewa's
                 // deleteComment-with-no-actionable). No tombstone is written, so it is not restored on restart.
-                CasResult.WROTE -> {
-                    unlinkPoolFile(uuid)
-                    runEdt { adoptIfUnchanged(uuid, staged, merged) }
-                }
-                CasResult.RACED -> retryOrGiveUp(uuid, transform, fallback, staged, attemptsLeft)
-                CasResult.FAILED -> {}
+                unlinkPoolFile(uuid)
+                runEdt { adoptIfUnchanged(uuid, staged, merged) }
             }
-            else -> {
-                val toWrite = merged.copy(generation = baseGeneration + 1)
-                when (casWrite(uuid, CommentJson.encode(toWrite), expectedGeneration)) {
-                    CasResult.WROTE -> {
-                        persisted.add(uuid)
-                        deleteTombstone(uuid) // revived back into the pool → clear the watcher's "Seen" signal
-                        runEdt { adoptIfUnchanged(uuid, staged, toWrite) }
-                    }
-                    CasResult.RACED -> retryOrGiveUp(uuid, transform, fallback, staged, attemptsLeft)
-                    CasResult.FAILED -> {} // leave the optimistic memory state; the next mutation retries
+        }
+        else -> {
+            val toWrite = merged.copy(generation = baseGeneration + 1)
+            casWrite(uuid, CommentJson.encode(toWrite), expectedGeneration).also {
+                if (it == CasResult.WROTE) {
+                    persisted.add(uuid)
+                    deleteTombstone(uuid) // revived back into the pool → clear the watcher's "Seen" signal
+                    runEdt { adoptIfUnchanged(uuid, staged, toWrite) }
                 }
             }
         }
-    }
-
-    /** Re-run the whole read-merge-commit (a peer wrote between our read and our move) unless out of attempts. */
-    private fun retryOrGiveUp(
-        uuid: String,
-        transform: (HeviewComment) -> HeviewComment?,
-        fallback: HeviewComment,
-        staged: HeviewComment?,
-        attemptsLeft: Int,
-    ) {
-        if (attemptsLeft > 1) commitMutation(uuid, transform, fallback, staged, attemptsLeft - 1)
-        else LOG.warn("heview: gave up a fenced write for $uuid after $MAX_CAS_ATTEMPTS attempts")
     }
 
     /**
@@ -422,22 +410,19 @@ class CommentStore(
         }
     }
 
-    /** Reconcile the in-memory record to the on-disk truth (a peer removed our target, or already applied it). */
+    /**
+     * Reconcile the in-memory record to the on-disk truth (a peer removed our target, or already applied our
+     * op). commitMutation only reaches here with a **Valid** disk — Unreadable returns early, and an Absent
+     * disk can't produce a null/idempotent merge (the optimistic transform already succeeded on the same
+     * base) — so anything else is a defensive no-op. Folds disk back in only if our optimistic record is
+     * still current (else a newer edit / delete wins).
+     */
     private fun reconcileToDisk(uuid: String, staged: HeviewComment?, disk: DiskRead) {
+        val onDisk = (disk as? DiskRead.Valid)?.comment ?: return
         runEdt {
-            when (disk) {
-                // Fold disk back in only if our optimistic record is still current (else a newer edit /
-                // delete wins). The file exists (Valid), so it is persisted.
-                is DiskRead.Valid -> if (stillCurrent(uuid, staged)) {
-                    persisted.add(uuid)
-                    adoptIfUnchanged(uuid, staged, disk.comment)
-                }
-                // Defensive: commitMutation only reaches here with a Valid disk (Absent is handled earlier).
-                DiskRead.Absent -> if (stillCurrent(uuid, staged) && index.remove(uuid) != null) {
-                    persisted.remove(uuid)
-                    fireChanged()
-                }
-                DiskRead.Unreadable -> {}
+            if (stillCurrent(uuid, staged)) {
+                persisted.add(uuid)
+                adoptIfUnchanged(uuid, staged, onDisk)
             }
         }
     }
@@ -806,8 +791,8 @@ class CommentStore(
         // How many times a fenced reply mutation re-reads + re-merges when a peer writes between our read
         // and our atomic move. A tiny bound — real contention on one thread's file is microsecond-narrow —
         // that stops a pathological write storm from looping forever; giving up just leaves the optimistic
-        // in-memory state, which the next mutation retries.
-        private const val MAX_CAS_ATTEMPTS = 4
+        // in-memory state, which the next mutation retries. `internal` so the give-up test asserts the exact bound.
+        internal const val MAX_CAS_ATTEMPTS = 4
 
         // Single-threaded so disk writes/deletes for the same comment can't race. The platform
         // requires a capitalized pool name (BoundedTaskExecutor asserts this).
