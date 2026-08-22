@@ -382,25 +382,42 @@ class CommentStore(
     }
 
     /**
-     * Is OUR optimistic record still the current index entry — i.e. no newer reply mutation, no-bump
-     * [updateLocation], or delete/bin/evict has superseded it? An identity (`===`) guard, since generation
-     * alone can't order our optimistic bump against a peer's independent bump nor see a same-generation
-     * location tweak as newer. [staged] == null means this op optimistically REMOVED the thread (a delete of
-     * its last reply), so "still current" means it is still absent.
+     * Is OUR optimistic record still the current index entry — i.e. no newer reply mutation, delete, or
+     * bin/evict has superseded it? Primarily an identity (`===`) guard, since generation alone can't order
+     * our optimistic bump against a peer's independent bump. It ALSO accepts a same-generation
+     * location-variant of [staged]: a no-bump [updateLocation] that ran on the EDT between our optimistic
+     * apply and our commit replaces the index object in place (identical but for `line_number`/`line_content`
+     * at the same generation) — that is still "ours", and [adoptIfUnchanged] carries the moved anchor onto the
+     * durable value so neither the location nor the reply-merge/generation is stranded. [staged] == null means
+     * this op optimistically REMOVED the thread (a delete of its last reply), so "still current" = still absent.
      */
-    private fun stillCurrent(uuid: String, staged: HeviewComment?): Boolean =
-        if (staged == null) index[uuid] == null else index[uuid] === staged
+    private fun stillCurrent(uuid: String, staged: HeviewComment?): Boolean {
+        val current = index[uuid]
+        return when {
+            staged == null -> current == null
+            current == null -> false
+            current === staged -> true
+            else -> current.generation == staged.generation &&
+                current == staged.copy(lineNumber = current.lineNumber, lineContent = current.lineContent)
+        }
+    }
 
     /**
      * Adopt [value] into the index (on the EDT) only if [stillCurrent] — so a durable commit never regresses
-     * a fresher in-flight state. When our op emptied the thread ([staged] == null) but the on-disk merge came
-     * back non-empty (a peer added a reply), this INSERTs the surviving thread so the UI shows the peer's
-     * reply instead of the thread silently vanishing until a restart. Fires only on a real change (the common
-     * no-peer path already shows the optimistic value → no extra fire).
+     * a fresher in-flight state. The FRESHEST anchor (a concurrent no-bump [updateLocation]'s moved line, held
+     * in the current entry) is carried onto [value], so the reply-merge/generation and the moved line both
+     * survive. When our op emptied the thread ([staged] == null) but the on-disk merge came back non-empty (a
+     * peer added a reply), this INSERTs the surviving thread so the UI shows the peer's reply instead of the
+     * thread silently vanishing until a restart. Fires only on a real change (the common no-peer path already
+     * shows the optimistic value → no extra fire).
      */
     private fun adoptIfUnchanged(uuid: String, staged: HeviewComment?, value: HeviewComment) {
-        if (stillCurrent(uuid, staged) && index[uuid] != value) {
-            index[uuid] = value
+        if (!stillCurrent(uuid, staged)) return
+        val current = index[uuid]
+        val adopted =
+            if (current != null) value.copy(lineNumber = current.lineNumber, lineContent = current.lineContent) else value
+        if (current != adopted) {
+            index[uuid] = adopted
             fireChanged()
         }
     }
@@ -413,10 +430,7 @@ class CommentStore(
                 // delete wins). The file exists (Valid), so it is persisted.
                 is DiskRead.Valid -> if (stillCurrent(uuid, staged)) {
                     persisted.add(uuid)
-                    if (index[uuid] != disk.comment) {
-                        index[uuid] = disk.comment
-                        fireChanged()
-                    }
+                    adoptIfUnchanged(uuid, staged, disk.comment)
                 }
                 // Defensive: commitMutation only reaches here with a Valid disk (Absent is handled earlier).
                 DiskRead.Absent -> if (stillCurrent(uuid, staged) && index.remove(uuid) != null) {
@@ -670,6 +684,13 @@ class CommentStore(
         }
     }
 
+    // @TestOnly seam: invoked inside stagedWrite right before the pre-move accept check, so a test can
+    // interpose a concurrent peer write into the CAS window and exercise the RACED retry / give-up path —
+    // that window lives inside one serial IO task, so the runIo task-queue seam alone can't reach it. Null in
+    // production.
+    @org.jetbrains.annotations.TestOnly
+    internal var interposeBeforeMoveForTest: (() -> Unit)? = null
+
     /**
      * Stage [json] to a temp file in the pool dir and atomically move it over `comments/<uuid>.json`, but only
      * if [acceptMove] — evaluated as close to the move as possible — returns true. Returns [CasResult.WROTE]
@@ -683,6 +704,7 @@ class CommentStore(
             val tmp = Files.createTempFile(commentsDir, uuid, ".json.tmp")
             try {
                 Files.writeString(tmp, json)
+                interposeBeforeMoveForTest?.invoke()
                 if (!acceptMove()) {
                     Files.deleteIfExists(tmp) // predicate rejected the move — don't clobber; don't leak the tmp
                     return CasResult.RACED
@@ -750,6 +772,11 @@ class CommentStore(
             val c: HeviewComment? = CommentJson.decode(Files.readString(path))
             if (c != null && isWellFormed(c, uuid)) DiskRead.Valid(c.copy(replies = sanitizedReplies(c)))
             else DiskRead.Unreadable
+        } catch (e: java.nio.file.NoSuchFileException) {
+            // The file vanished between the exists-check and the read — the exact, benign event the fence
+            // targets (a hook moving it into processed/, or a peer delete). Classify as Absent, not Unreadable,
+            // so the caller takes the clean consume/delete path rather than a spurious "corrupt file" retry.
+            DiskRead.Absent
         } catch (e: Exception) {
             DiskRead.Unreadable
         }

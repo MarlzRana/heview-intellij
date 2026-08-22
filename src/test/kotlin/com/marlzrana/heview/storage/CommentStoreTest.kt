@@ -1434,6 +1434,82 @@ class CommentStoreTest {
         assertEquals("{ not valid json", Files.readString(dir.resolve("u1.json"))) // untouched
     }
 
+    @Test
+    fun `editReply is a no-op when the text and status are unchanged`(@TempDir dir: Path) {
+        val store = store(dir)
+        val r0 = sampleReply(content = "same", status = CommentStatus.PENDING)
+        store.save(sampleComment(uuid = "u1", replies = listOf(r0)))
+        val before = store.get("u1")
+        var fires = 0
+        store.addChangeListener { fires++ }
+
+        store.editReply("u1", r0, "same", laterTs) // identical text on an already-PENDING reply → idempotent
+
+        assertEquals(0, fires) // no fire, no write…
+        assertEquals(before, store.get("u1")) // …and created_at is NOT bumped (matches rependReply's no-op)
+    }
+
+    @Test
+    fun `a reply mutation re-merges when a peer writes inside the CAS window`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val a = sampleReply(content = "a")
+        store.save(sampleComment(uuid = "u1", replies = listOf(a)))
+        tasks.removeFirst().run() // create → disk gen 0, [a]
+
+        store.addReply("u1", "mine", "me", laterTs) // base read will see gen 0; queues the commit
+
+        // Interpose a peer write EXACTLY in the CAS window (after our base read + tmp write, before the pre-move
+        // generation re-check) so the first attempt RACES and the store must re-read + re-merge — the only way
+        // to reach the RACED arm (the window is inside one serial IO task).
+        val peer = sampleReply(content = "peer", author = "peer")
+        store.interposeBeforeMoveForTest = {
+            store.interposeBeforeMoveForTest = null // fire exactly once
+            Files.writeString(
+                dir.resolve("u1.json"),
+                CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a, peer)).copy(generation = 1)),
+            )
+        }
+
+        while (tasks.isNotEmpty()) tasks.removeFirst().run() // attempt 1 RACES → re-queued attempt 2 re-merges
+
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(listOf("a", "peer", "mine"), onDisk.replies?.map { it.content }) // peer survived the race
+        assertEquals(2, onDisk.generation) // base gen 1 (peer) + 1
+    }
+
+    @Test
+    fun `a reply mutation gives up after repeated CAS races without looping forever`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = CommentStore(dir, runIo = { tasks.add(it) }, runEdt = { it.run() }, defaultAuthor = { "tester" })
+        val a = sampleReply(content = "a")
+        store.save(sampleComment(uuid = "u1", replies = listOf(a)))
+        tasks.removeFirst().run() // create → disk gen 0
+
+        store.addReply("u1", "mine", "me", laterTs)
+
+        // A relentless peer bumps the generation in EVERY CAS window, so every attempt RACES.
+        var peerGen = 0
+        store.interposeBeforeMoveForTest = {
+            peerGen += 1
+            Files.writeString(
+                dir.resolve("u1.json"),
+                CommentJson.encode(sampleComment(uuid = "u1", replies = listOf(a)).copy(generation = peerGen + 1)),
+            )
+        }
+
+        var runs = 0
+        while (tasks.isNotEmpty()) {
+            tasks.removeFirst().run()
+            if (++runs > 12) break // safety net: the retry MUST be bounded (no unbounded re-queue)
+        }
+
+        assertTrue(tasks.isEmpty()) // terminated — the give-up path fired, no runaway recursion
+        assertTrue(runs <= 6) // a small bounded number of attempts (MAX_CAS_ATTEMPTS)
+        assertEquals("mine", store.get("u1")?.replies?.last()?.content) // optimistic state left in memory
+        assertFalse(CommentJson.decode(Files.readString(dir.resolve("u1.json"))).replies!!.any { it.content == "mine" })
+    }
+
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
     private fun tombstone(dir: Path, uuid: String): Path {
         val processed = Files.createDirectories(dir.resolve("processed"))
