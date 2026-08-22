@@ -1294,7 +1294,9 @@ class CommentStoreTest {
         store.updateLocation("u1", 7, "moved") // our base gen is 0 but disk is gen 1 → must skip, not clobber
 
         assertEquals(peerThread, CommentJson.decode(Files.readString(dir.resolve("u1.json")))) // untouched
-        assertEquals(7, store.get("u1")?.lineNumber) // the line still moved in memory (a race doesn't revert it)
+        // The optimistic move is reverted on the race, so the no-op early-return can't suppress the next save
+        // from re-attempting the anchor sync against the peer's new generation.
+        assertEquals(42, store.get("u1")?.lineNumber)
     }
 
     @Test
@@ -1509,6 +1511,8 @@ class CommentStoreTest {
         assertEquals(CommentStore.MAX_CAS_ATTEMPTS, attempts) // exactly the bound, then give up
         assertEquals("mine", store.get("u1")?.replies?.last()?.content) // optimistic state left in memory
         assertFalse(CommentJson.decode(Files.readString(dir.resolve("u1.json"))).replies!!.any { it.content == "mine" })
+        // Each raced attempt staged a temp file; none must leak into the shared pool.
+        Files.list(dir).use { entries -> assertTrue(entries.noneMatch { it.fileName.toString().endsWith(".json.tmp") }) }
     }
 
     @Test
@@ -1565,6 +1569,51 @@ class CommentStoreTest {
         assertEquals(2, replies.size)
         assertEquals("d#1", replies[0].id) // reply0 kept its real id
         assertTrue(replies[0].id != replies[1].id) // …and the clash was disambiguated, not collapsed
+
+        // The disambiguated id must be STABLE across hydrate→readDisk, or the CAS re-apply on commit would miss
+        // and the edit would never reach disk (only the optimistic in-memory).
+        store.editReply("d", replies[1], "b-edited", laterTs)
+        assertEquals("b-edited", CommentJson.decode(Files.readString(dir.resolve("d.json"))).replies?.get(1)?.content)
+    }
+
+    @Test
+    fun `a reply mutation does not resurrect a thread consumed and marked Seen before the commit`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = queuedStore(dir, tasks)
+        store.save(sampleComment(uuid = "u1", replies = listOf(sampleReply(content = "a"))))
+        tasks.removeFirst().run() // create → disk gen 0, persisted
+
+        store.addReply("u1", "b", "me", laterTs) // wasOnPool snapshotted true; queues the commit
+
+        // A hook claims the thread AND the watcher marks it Seen (clearing isPersisted) BEFORE the commit runs —
+        // the exact race the live-isPersisted guard missed. The snapshotted wasOnPool must still block resurrect.
+        val processed = Files.createDirectories(dir.resolve("processed"))
+        Files.move(dir.resolve("u1.json"), processed.resolve("u1.json"))
+        store.markProcessed("u1") // clears isPersisted
+
+        tasks.removeFirst().run() // commit: wasOnPool == true → do NOT resurrect the hook-claimed thread
+
+        assertFalse(Files.exists(dir.resolve("u1.json")))      // not re-injected into the pool
+        assertTrue(Files.exists(processed.resolve("u1.json"))) // the Seen tombstone is preserved
+        assertFalse(store.isPersisted("u1"))
+    }
+
+    @Test
+    fun `deleting the last reply of an off-pool thread removes it without a pool file`(@TempDir dir: Path) {
+        val store = store(dir)
+        val todo = sampleReply(content = "todo", status = CommentStatus.PENDING)
+        val seen = sampleReply(content = "seen", status = CommentStatus.PROCESSED)
+        store.save(sampleComment(uuid = "u1", replies = listOf(todo, seen)))
+        store.deleteReply("u1", todo) // → [seen] all-Seen, off the pool (file unlinked, isPersisted false)
+        assertFalse(Files.exists(dir.resolve("u1.json")))
+        val remaining = store.get("u1")!!.replies!![0]
+
+        // Deleting the last reply of an already-off-pool thread drives fencedDestructive's null-generation arm
+        // (disk Absent, expectedGeneration null) → unlink no-op + drop the thread.
+        store.deleteReply("u1", remaining)
+
+        assertNull(store.get("u1"))
+        assertFalse(Files.exists(dir.resolve("u1.json")))
     }
 
     /** Write a consumption tombstone under comments/processed/ for [uuid] and return its path. */
