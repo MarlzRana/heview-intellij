@@ -116,9 +116,12 @@ class CommentStore(
      *   **generation-fenced with no bump** (`casWrite` against the current generation): it commits the moved
      *   anchor only if the on-disk generation still matches, so it never clobbers a peer's newer edit nor
      *   recreates a pool file a hook has claimed into `processed/` (that shows as Absent → a CAS miss).
-     * - A CAS miss (`RACED`) is a peer/consume winning: leave the moved line in memory (it did move) without
-     *   resurrecting the file. A genuine write `FAILED` reverts the optimistic update — identity-guarded so it
-     *   can't undo a newer queued update — so the next save differs from the index and retries.
+     * - On a non-WROTE result, revert the optimistic move (identity-guarded so it can't undo a newer queued
+     *   update) ONLY IF the pool file is still present — a peer bumped the generation, or a genuine write
+     *   failure — so the no-op early-return above can't see memory already matching the marker and suppress the
+     *   next save's retry, which would strand the on-disk line. If the file is GONE (a hook consumed it into
+     *   `processed/`, or a peer deleted it), KEEP the moved line: there is no disk to heal, and `markProcessed`
+     *   then freezes THIS anchor onto the Seen thread so a later re-pend injects the line the marker moved to.
      * - Does NOT fire the change listener: every open card already sits on the live [RangeMarker], so only
      *   the durable copy the injector/reopen reads needs updating — not what any card shows.
      * - Touches only these two fields (never `status`/`replies`/`created_at`), so it can't reorder injection.
@@ -135,12 +138,12 @@ class CommentStore(
             // still exactly the generation this update was based on. A mismatch means a peer edited it, OR a
             // hook claimed the file into processed/ (now absent) — either way SKIP, never clobbering a newer
             // thread or resurrecting a consumed one. Encode happens off the EDT inside casWrite (this runs in
-            // FileDocumentManager's save write-action; a large thread would otherwise stall the save).
-            // WROTE: done. RACED (a peer bumped the generation, or the file was consumed) or FAILED: revert the
-            // optimistic memory update (identity-guarded so it can't undo a newer queued update). Reverting on
-            // RACED is required — the no-op early-return above would otherwise see memory already matching the
-            // marker and never retry, leaving the on-disk line_number permanently stale for the injector.
-            if (casWrite(uuid, CommentJson.encode(updated), expectedGeneration = baseGeneration) != CasResult.WROTE) {
+            // FileDocumentManager's save write-action; a large thread would otherwise stall the save). Revert
+            // the optimistic move only if the write didn't land AND the file is still present (peer/failure) —
+            // so the next save retries; a consumed/deleted file (now Absent) keeps the moved line (see KDoc).
+            if (casWrite(uuid, CommentJson.encode(updated), expectedGeneration = baseGeneration) != CasResult.WROTE &&
+                Files.exists(fileFor(uuid))
+            ) {
                 runEdt { if (index[uuid] === updated) index[uuid] = current }
             }
         }
@@ -168,8 +171,7 @@ class CommentStore(
      */
     fun addReply(uuid: String, text: String, author: String, now: String) {
         if (text.isBlank()) return
-        if (index[uuid] == null) return
-        val newReply = HeviewReply(text, CommentStatus.PENDING, author, now)
+        val newReply = HeviewReply(text, CommentStatus.PENDING, author, now) // persistMutation no-ops an unknown uuid
         persistMutation(uuid) { base ->
             val replies = base.normalizedReplies(author)
             if (replies.any { it.id == newReply.id }) base // already appended (an idempotent re-apply on disk)
@@ -351,16 +353,23 @@ class CommentStore(
      * microsecond residual as [casWrite] remains (the accepted optimistic-CAS window).
      */
     private fun fencedDestructive(uuid: String, expectedGeneration: Int?): CasResult =
-        when (val onDisk = readDisk(uuid)) {
-            // Strict CAS on the current disk state (no early-exit that skips the read): unlink only if the file
-            // matches what we merged from. A peer that resurrected an off-pool file (was absent, now present) or
-            // bumped a present one → RACED → re-merge, not a blind unlink. A file expected present but now Absent
-            // (a hook claimed it) → RACED, so we never deleteTombstone away the "Seen" signal.
-            DiskRead.Absent -> if (expectedGeneration == null) CasResult.WROTE else CasResult.RACED
-            is DiskRead.Valid ->
-                if (expectedGeneration != null && onDisk.comment.generation == expectedGeneration) CasResult.WROTE else CasResult.RACED
-            DiskRead.Unreadable -> CasResult.RACED
-        }
+        // Strict CAS on the current disk state (no early-exit that skips the read): unlink only if the file
+        // matches what we merged from. A peer that resurrected an off-pool file (was absent, now present) or
+        // bumped a present one → RACED → re-merge, not a blind unlink. A file expected present but now Absent
+        // (a hook claimed it) → RACED, so we never deleteTombstone away the "Seen" signal.
+        if (matchesGeneration(readDisk(uuid), expectedGeneration)) CasResult.WROTE else CasResult.RACED
+
+    /**
+     * Does the current on-disk state match the generation a fenced write/unlink expects? A null
+     * [expectedGeneration] means "expect the file ABSENT" (a resurrecting revive, or an already-off-pool
+     * destructive op); a non-null one must match a present file's generation exactly. An unreadable file never
+     * matches (never clobber a foreign writer's file).
+     */
+    private fun matchesGeneration(onDisk: DiskRead, expectedGeneration: Int?): Boolean = when (onDisk) {
+        DiskRead.Absent -> expectedGeneration == null
+        is DiskRead.Valid -> expectedGeneration != null && onDisk.comment.generation == expectedGeneration
+        DiskRead.Unreadable -> false
+    }
 
     /**
      * Unlink only the live pool file `comments/<uuid>.json` (never a tombstone). On the IO thread. Clears
@@ -399,21 +408,18 @@ class CommentStore(
     }
 
     /**
-     * Adopt [value] into the index (on the EDT) only if [stillCurrent] — so a durable commit never regresses
-     * a fresher in-flight state. The FRESHEST anchor (a concurrent no-bump [updateLocation]'s moved line, held
-     * in the current entry) is carried onto [value], so the reply-merge/generation and the moved line both
-     * survive. When our op emptied the thread ([staged] == null) but the on-disk merge came back non-empty (a
-     * peer added a reply), this INSERTs the surviving thread so the UI shows the peer's reply instead of the
-     * thread silently vanishing until a restart. Fires only on a real change (the common no-peer path already
-     * shows the optimistic value → no extra fire).
+     * Adopt [value] into the index (on the EDT) only if [stillCurrent] — so a durable commit never regresses a
+     * fresher in-flight state. [value] keeps the on-disk anchor it was merged from, NOT the current in-memory
+     * line: memory tracks disk, so a concurrent [updateLocation] that moved the line heals disk via its own
+     * writeback (or the next save's), rather than this leaving memory ahead of disk where the no-op
+     * early-return would suppress the heal and strand the injector on a stale line. When our op emptied the
+     * thread ([staged] == null) but the on-disk merge came back non-empty (a peer added a reply), this INSERTs
+     * the surviving thread so the UI shows the peer's reply instead of the thread vanishing until a restart.
+     * Fires only on a real change (the common no-peer path already shows the optimistic value → no extra fire).
      */
     private fun adoptIfUnchanged(uuid: String, staged: HeviewComment?, value: HeviewComment) {
-        if (!stillCurrent(uuid, staged)) return
-        val current = index[uuid]
-        val adopted =
-            if (current != null) value.copy(lineNumber = current.lineNumber, lineContent = current.lineContent) else value
-        if (current != adopted) {
-            index[uuid] = adopted
+        if (stillCurrent(uuid, staged) && index[uuid] != value) {
+            index[uuid] = value
             fireChanged()
         }
     }
@@ -731,13 +737,7 @@ class CommentStore(
      * this re-check and the move is the accepted optimistic-CAS sliver (plan.html §5 "generation fence").
      */
     private fun casWrite(uuid: String, json: String, expectedGeneration: Int?): CasResult =
-        stagedWrite(uuid, json) {
-            when (val onDisk = readDisk(uuid)) {
-                DiskRead.Absent -> expectedGeneration == null
-                is DiskRead.Valid -> expectedGeneration != null && onDisk.comment.generation == expectedGeneration
-                DiskRead.Unreadable -> false
-            }
-        }
+        stagedWrite(uuid, json) { matchesGeneration(readDisk(uuid), expectedGeneration) }
 
     /** Atomic move of [tmp] over `comments/<uuid>.json`, falling back to a non-atomic replace off-POSIX. */
     private fun moveOntoTarget(tmp: Path, uuid: String) {

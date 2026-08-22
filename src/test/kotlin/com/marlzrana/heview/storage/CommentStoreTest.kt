@@ -1420,9 +1420,34 @@ class CommentStoreTest {
         while (tasks.isNotEmpty()) tasks.removeFirst().run() // reply commit first, then the location writeback
 
         val after = store.get("u1")!!
-        assertEquals(listOf("a", "b"), after.replies?.map { it.content }) // the reply survived
-        assertEquals(7, after.lineNumber) // …and the same-generation commit did NOT regress the moved line
-        assertEquals(7, CommentJson.decode(Files.readString(dir.resolve("u1.json"))).lineNumber)
+        assertEquals(listOf("a", "b"), after.replies?.map { it.content }) // the reply survived the merge
+        val onDisk = CommentJson.decode(Files.readString(dir.resolve("u1.json")))
+        assertEquals(listOf("a", "b"), onDisk.replies?.map { it.content })
+        assertEquals(7, onDisk.lineNumber) // the moved line reached disk (what the injector reads) via the writeback
+        // The same-generation location-variant of `staged` is still recognized as "ours", so memory adopts the
+        // reply commit's bumped generation instead of stranding it (the card tracks the live marker, and the
+        // stored line heals on the next save).
+        assertEquals(onDisk.generation, after.generation)
+    }
+
+    @Test
+    fun `updateLocation keeps the moved line when the file was consumed mid-write`(@TempDir dir: Path) {
+        val tasks = ArrayDeque<Runnable>()
+        val store = queuedStore(dir, tasks)
+        store.save(sampleComment(uuid = "u1")) // line 42
+        tasks.removeFirst().run() // create → disk gen 0, persisted
+
+        store.updateLocation("u1", 7, "moved") // optimistic memory → line 7; queues the write (base gen 0)
+
+        // A hook consumes the thread (moves the file out of comments/) before the queued write runs. isPersisted
+        // is still true (watcher lag), so the write is attempted, sees Absent → RACED. The file is gone, so the
+        // moved line must be KEPT (markProcessed will freeze it; a later re-pend uses it), not reverted.
+        Files.move(dir.resolve("u1.json"), Files.createDirectories(dir.resolve("processed")).resolve("u1.json"))
+
+        tasks.removeFirst().run()
+
+        assertEquals(7, store.get("u1")?.lineNumber) // moved line kept (nothing to heal; reverting would strand re-pend)
+        assertFalse(Files.exists(dir.resolve("u1.json"))) // and not resurrected
     }
 
     @Test
